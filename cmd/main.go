@@ -85,6 +85,7 @@ func Main(args []string) error {
 			cmdClone(),
 			cmdSummary(),
 			cmdCompact(),
+			cmdPantheon(),
 		},
 	}
 
@@ -244,6 +245,12 @@ func reorderOptions(app *cli.App, args []string) []string {
 
 	newArgs = append(newArgs, cmdName)
 	args, others = others[1:], nil
+	
+	// Special handling for pantheon command - let it handle subcommand parsing
+	if cmdName == "pantheon" {
+		return append(newArgs, args...)
+	}
+	
 	// -h is valid for all the commands
 	cmdFlags := append(cmd.Flags, cli.HelpFlag)
 	for i := 0; i < len(args); i++ {
