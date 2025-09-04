@@ -343,6 +343,7 @@ func shareInfoFlags() []cli.Flag {
 		},
 		&cli.BoolFlag{
 			Name:  "no-usage-report",
+			Value: true,
 			Usage: "do not send usage report",
 		},
 	})
