@@ -135,27 +135,12 @@ func validateAbsolutePath(path string, shouldExist bool) {
 func buildFlagArgs(c *cli.Context) []string {
 	var args []string
 	
-	// Iterate through all set flags and add them to args
-	for _, flagName := range c.FlagNames() {
+	// Iterate through command flags to avoid processing the same flag multiple times
+	for _, flag := range c.Command.Flags {
+		// Use the primary name (first name in the list)
+		flagName := flag.Names()[0]
+		
 		if c.IsSet(flagName) {
-			// Find the flag definition to determine its type
-			var flag cli.Flag
-			for _, f := range c.Command.Flags {
-				for _, name := range f.Names() {
-					if name == flagName {
-						flag = f
-						break
-					}
-				}
-				if flag != nil {
-					break
-				}
-			}
-			
-			if flag == nil {
-				logger.Fatalf("unknown flag: %s", flagName)
-			}
-			
 			switch flag.(type) {
 			case *cli.BoolFlag:
 				if c.Bool(flagName) {

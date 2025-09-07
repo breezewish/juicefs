@@ -39,4 +39,5 @@ pkg/meta/testdata
 /juicefs.exe~
 /juicefsd.exe~
 /juicefs.lite
+/juicefs-pantheon
 dist/
