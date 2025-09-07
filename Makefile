@@ -32,7 +32,7 @@ juicefs.lite: Makefile cmd/*.go pkg/*/*.go
 		-ldflags="$(LDFLAGS)" -o juicefs.lite .
 
 juicefs.pantheon: Makefile cmd/*.go pkg/*/*.go
-	CGO_ENABLED=1 go build -tags nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,noetcd \
+	CGO_ENABLED=1 go build -tags nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,noetcd \
 		-ldflags="$(LDFLAGS)" -o juicefs-pantheon .
 
 juicefs.ceph: Makefile cmd/*.go pkg/*/*.go
