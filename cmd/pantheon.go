@@ -134,12 +134,12 @@ func validateAbsolutePath(path string, shouldExist bool) {
 // Helper function to build flag arguments from CLI context
 func buildFlagArgs(c *cli.Context) []string {
 	var args []string
-	
+
 	// Iterate through command flags to avoid processing the same flag multiple times
 	for _, flag := range c.Command.Flags {
 		// Use the primary name (first name in the list)
 		flagName := flag.Names()[0]
-		
+
 		if c.IsSet(flagName) {
 			switch flag.(type) {
 			case *cli.BoolFlag:
@@ -163,7 +163,7 @@ func buildFlagArgs(c *cli.Context) []string {
 			}
 		}
 	}
-	
+
 	return args
 }
 
@@ -200,6 +200,16 @@ func executeJuicefsCommand(args []string) error {
 	return err
 }
 
+func metaDirWithoutQuery(metaDir string) string {
+	// Strip all things after '?' in metaDir
+	for i, ch := range metaDir {
+		if ch == '?' {
+			return metaDir[:i]
+		}
+	}
+	return metaDir
+}
+
 func pantheonFormat(c *cli.Context) error {
 	setup(c, 2)
 
@@ -207,7 +217,7 @@ func pantheonFormat(c *cli.Context) error {
 	name := c.Args().Get(1)
 
 	// Validate meta-dir is absolute and doesn't exist
-	validateAbsolutePath(metaDir, false)
+	validateAbsolutePath(metaDirWithoutQuery(metaDir), false)
 
 	// Build arguments for juicefs format command
 	args := []string{"format", fmt.Sprintf("badger://%s", metaDir), name, "--trash-days=999"}
@@ -223,7 +233,7 @@ func pantheonMount(c *cli.Context) error {
 	mountPoint := c.Args().Get(1)
 
 	// Validate meta-dir is absolute and exists
-	validateAbsolutePath(metaDir, true)
+	validateAbsolutePath(metaDirWithoutQuery(metaDir), true)
 
 	// Build arguments for juicefs mount command
 	args := []string{"mount", fmt.Sprintf("badger://%s", metaDir), mountPoint}

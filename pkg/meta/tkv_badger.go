@@ -22,6 +22,9 @@ package meta
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -212,7 +215,14 @@ func (c *badgerClient) close() error {
 func (c *badgerClient) gc() {}
 
 func newBadgerClient(addr string) (tkvClient, error) {
-	opt := badger.DefaultOptions(addr)
+	tUrl, err := url.Parse("badger://" + addr)
+	if err != nil {
+		return nil, err
+	}
+	query := tUrl.Query()
+
+	// What we pass to badger is a directory path (exclude our query part)
+	opt := badger.DefaultOptions(fmt.Sprintf("%s%s", tUrl.Host, tUrl.Path))
 	opt.Logger = utils.GetLogger("badger")
 	opt.MetricsEnabled = false
 	client, err := badger.Open(opt)
@@ -226,6 +236,21 @@ func newBadgerClient(addr string) (tkvClient, error) {
 			}
 		}
 	}()
+
+	if query.Has("nextchunk") {
+		nextChunkValue, err := strconv.ParseInt(query.Get("nextchunk"), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid nextchunk value: %s", query.Get("nextchunk"))
+		}
+		err = client.Update(func(txn *badger.Txn) error {
+			txn.Set([]byte("CnextChunk"), packCounter(int64(nextChunkValue)))
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to set nextchunk: %v", err)
+		}
+	}
+
 	return &badgerClient{client, ticker}, err
 }
 
