@@ -571,18 +571,29 @@ func mount(c *cli.Context) error {
 	// stage 0: check the connection to fail fast
 	// stage 2: need the volume name to check if it's already mounted
 	// stage 3: the real service process
-	if stage != 1 {
+	skipFastFail := os.Getenv("JFS_SKIP_FAST_FAIL") != ""
+	if stage != 1 && !(stage == 0 && skipFastFail) {
 		metaCli = meta.NewClient(addr, metaConf)
 		format, err = metaCli.Load(true)
 		if err != nil {
 			return err
+		}
+	} else if stage == 0 && skipFastFail {
+		// Create minimal dummy format for stage 0 to avoid badger init
+		// Real format will be loaded in stage 3
+		logger.Infof("JFS_SKIP_FAST_FAIL enabled: skipping connection check in supervisor process")
+		format = &meta.Format{
+			Name:        "dummy-stage0", // Will be overridden in stage 3
+			BlockSize:   4096,           // Default block size
+			Compression: "",             // No compression by default
+			HashPrefix:  false,          // No hash prefix by default
 		}
 	}
 
 	chunkConf := getChunkConf(c, format)
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
-	if stage == 0 || stage == 3 {
+	if stage == 3 || (stage == 0 && !skipFastFail) {
 		blob, err = NewReloadableStorage(format, metaCli, updateFormat(c))
 		if err != nil {
 			return fmt.Errorf("object storage: %s", err)
