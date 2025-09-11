@@ -225,6 +225,7 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	opt := badger.DefaultOptions(fmt.Sprintf("%s%s", tUrl.Host, tUrl.Path))
 	opt.Logger = utils.GetLogger("badger")
 	opt.MetricsEnabled = false
+	opt.SkipWAL = true
 	client, err := badger.Open(opt)
 	if err != nil {
 		return nil, err
