@@ -665,6 +665,7 @@ func mount(c *cli.Context) error {
 	}
 	err = metaCli.CloseSession()
 	object.Shutdown(blob)
+	err = metaCli.Shutdown()
 	logger.Infof("The juicefs mount process exit successfully, mountpoint: %s", metaConf.MountPoint)
 	return err
 }

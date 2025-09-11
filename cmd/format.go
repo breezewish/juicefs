@@ -563,6 +563,9 @@ func format(c *cli.Context) error {
 		}
 		logger.Fatalf("format: %s", err)
 	}
+	if err = m.Shutdown(); err != nil {
+		logger.Fatalf("shutdown: %s", err)
+	}
 	logger.Infof("Volume is formatted as %s", format)
 	return nil
 }
