@@ -91,11 +91,17 @@ $ juicefs warmup -f /tmp/filelist`,
 const batchMax = 10240
 
 func readControl(cf *os.File, resp []byte) int {
+	sleepTime := 10 // Start with 10ms
+	const maxSleep = 160 // Cap at 160ms
+	
 	for {
 		if n, err := cf.Read(resp); err == nil {
 			return n
 		} else if err == io.EOF {
-			time.Sleep(time.Millisecond * 300)
+			time.Sleep(time.Millisecond * time.Duration(sleepTime))
+			if sleepTime < maxSleep {
+				sleepTime *= 2 // Double the sleep time: 10ms -> 20ms -> 40ms -> 80ms -> 160ms
+			}
 		} else if errors.Is(err, syscall.EBADF) {
 			logger.Fatalf("JuiceFS client was restarted")
 		} else {
