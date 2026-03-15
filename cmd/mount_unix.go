@@ -853,7 +853,9 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 						logger.Fatalf("flush buffered data failed: %s", err)
 					}
 					m.FlushSession()
-					object.Shutdown(blob)
+					if err := shutdownSessionAndResources(m, blob); err != nil {
+						logger.Errorf("shutdown: %s", err)
+					}
 					logger.Warnf("exit with code 1")
 					os.Exit(1)
 				} else {
@@ -872,6 +874,8 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 			go func() { _ = doUmount(mp, true) }()
 		}
 	}()
+
+	installForkFinalizeHandler(m, v, blob)
 }
 func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 	increaseRlimit()
@@ -1066,4 +1070,3 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		logger.Fatalf("fuse: %s", err)
 	}
 }
-

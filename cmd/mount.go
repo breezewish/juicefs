@@ -586,11 +586,28 @@ func mount(c *cli.Context) error {
 	// stage 0: check the connection to fail fast
 	// stage 2: need the volume name to check if it's already mounted
 	// stage 3: the real service process
+	// Fork divergence: allow skipping stage 0 meta.Load to speed up supervisor startup.
+	skipFastFail := stage == 0 && os.Getenv("JFS_SKIP_FAST_FAIL") != ""
 	if stage != 1 {
-		metaCli = meta.NewClient(addr, metaConf)
-		format, err = metaCli.Load(true)
-		if err != nil {
-			return err
+		if skipFastFail {
+			// Fork divergence: create minimal dummy format for stage 0 to avoid badger init.
+			// Real format will be loaded in stage 3.
+			//
+			// NOTE: stage 0 won't know the real volume name, so checks that rely on it
+			// (e.g. graceful upgrade / mountpoint checks) may be skipped in the supervisor process.
+			logger.Infof("JFS_SKIP_FAST_FAIL enabled: skipping connection check in supervisor process")
+			format = &meta.Format{
+				Name:        "dummy-stage0", // Will be overridden in stage 3.
+				BlockSize:   4096,           // Default block size.
+				Compression: "",             // No compression by default.
+				HashPrefix:  false,          // No hash prefix by default.
+			}
+		} else {
+			metaCli = meta.NewClient(addr, metaConf)
+			format, err = metaCli.Load(true)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -598,12 +615,16 @@ func mount(c *cli.Context) error {
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
 	if stage == 0 || stage == 3 {
-		blob, err = NewReloadableStorage(format, metaCli, updateFormat(c))
-		if err != nil {
-			return fmt.Errorf("object storage: %s", err)
+		if stage == 0 && skipFastFail {
+			// Fork divergence: stage 0 intentionally skips creating meta/object clients.
+			// They will be created in stage 3.
+		} else {
+			blob, err = NewReloadableStorage(format, metaCli, updateFormat(c))
+			if err != nil {
+				return fmt.Errorf("object storage: %s", err)
+			}
+			logger.Infof("Data use %s", blob)
 		}
-		logger.Infof("Data use %s", blob)
-
 	}
 
 	if stage < 3 {
@@ -663,6 +684,12 @@ func mount(c *cli.Context) error {
 
 	err = metaCli.NewSession(true)
 	if err != nil {
+		// Fork divergence: always shutdown meta client on fatal exit.
+		// This is critical for badger with SkipWAL enabled (memtables must be flushed).
+		if shutdownErr := metaCli.Shutdown(); shutdownErr != nil {
+			logger.Errorf("shutdown meta: %s", shutdownErr)
+		}
+		object.Shutdown(blob)
 		logger.Fatalf("new session: %s", err)
 	}
 
@@ -678,8 +705,9 @@ func mount(c *cli.Context) error {
 	if err := v.FlushAll(""); err != nil {
 		logger.Errorf("flush all delayed data: %s", err)
 	}
-	err = metaCli.CloseSession()
-	object.Shutdown(blob)
+	// Fork divergence: ensure meta client is fully shut down on mount exit.
+	// This is critical for badger with SkipWAL enabled (memtables must be flushed).
+	err = shutdownSessionAndResources(metaCli, blob)
 	logger.Infof("The juicefs mount process exit successfully, mountpoint: %s", metaConf.MountPoint)
 	return err
 }

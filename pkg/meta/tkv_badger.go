@@ -22,6 +22,10 @@ package meta
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -133,7 +137,8 @@ func (tx *badgerTxn) delete(key []byte) {
 type badgerClient struct {
 	client *badger.DB
 	ticker *time.Ticker
-	done chan struct{}
+	done   chan struct{}
+	gcDone chan struct{}
 }
 
 func (c *badgerClient) name() string {
@@ -205,33 +210,107 @@ func (c *badgerClient) reset(prefix []byte) error {
 func (c *badgerClient) close() error {
 	close(c.done)
 	c.ticker.Stop()
+	<-c.gcDone
 	return c.client.Close()
 }
 
 func (c *badgerClient) gc() {}
 
+type badgerAddrOptions struct {
+	dir string
+
+	overrideNextChunk bool
+	nextChunkValue    int64
+}
+
+func parseBadgerAddrOptions(addr string) (badgerAddrOptions, error) {
+	// addr is a filesystem path (may contain Windows backslashes), with optional query.
+	// Avoid url.Parse("badger://"+addr) because it rejects inputs like `C:\data\badger`.
+	dir, rawQuery, hasQuery := strings.Cut(addr, "?")
+	if dir == "" {
+		return badgerAddrOptions{}, fmt.Errorf("invalid badger address %q: empty path", addr)
+	}
+	if !hasQuery || rawQuery == "" {
+		return badgerAddrOptions{dir: dir}, nil
+	}
+
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return badgerAddrOptions{}, fmt.Errorf("parse badger address query %q: %w", rawQuery, err)
+	}
+	for key := range query {
+		if key != "nextchunk" {
+			return badgerAddrOptions{}, fmt.Errorf("unsupported badger address query parameter %q (only nextchunk is supported)", key)
+		}
+	}
+
+	var opts badgerAddrOptions
+	opts.dir = dir
+	if nextChunkValues, ok := query["nextchunk"]; ok {
+		if len(nextChunkValues) != 1 {
+			return badgerAddrOptions{}, fmt.Errorf("badger address nextchunk must be specified once, got %d", len(nextChunkValues))
+		}
+		nextChunkStr := nextChunkValues[0]
+		opts.nextChunkValue, err = strconv.ParseInt(nextChunkStr, 10, 64)
+		if err != nil {
+			return badgerAddrOptions{}, fmt.Errorf("invalid nextchunk value %q: %w", nextChunkStr, err)
+		}
+		opts.overrideNextChunk = true
+	}
+	return opts, nil
+}
+
 func newBadgerClient(addr string) (tkvClient, error) {
-	opt := badger.DefaultOptions(addr)
+	// Fork divergence: allow the query param `nextchunk` in the badger address.
+	// `nextchunk=<n>` overrides the tkv counter "nextChunk" (key "CnextChunk") so forked metadata won't conflict.
+	opts, err := parseBadgerAddrOptions(addr)
+	if err != nil {
+		return nil, err
+	}
+	opt := badger.DefaultOptions(opts.dir)
 	opt.Logger = utils.GetLogger("badger")
 	opt.MetricsEnabled = false
+	// Fork divergence: use customized badger with SkipWAL enabled by default.
+	opt.SkipWAL = true
 	client, err := badger.Open(opt)
 	if err != nil {
 		return nil, err
 	}
+
+	if opts.overrideNextChunk {
+		if err := client.Update(func(txn *badger.Txn) error {
+			return txn.Set([]byte("CnextChunk"), packCounter(opts.nextChunkValue))
+		}); err != nil {
+			_ = client.Close()
+			return nil, fmt.Errorf("failed to set nextchunk to %d: %w", opts.nextChunkValue, err)
+		}
+	}
+
 	ticker := time.NewTicker(time.Hour)
 	done := make(chan struct{})
+	gcDone := make(chan struct{})
 	go func() {
+		defer close(gcDone)
 		for {
 			select {
 			case <-ticker.C:
-				for client.RunValueLogGC(0.7) == nil {
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+					if client.RunValueLogGC(0.7) != nil {
+						break
+					}
 				}
 			case <-done:
 				return
 			}
 		}
 	}()
-	return &badgerClient{client, ticker, done}, nil
+
+	return &badgerClient{client, ticker, done, gcDone}, nil
 }
 
 func init() {

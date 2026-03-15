@@ -362,6 +362,7 @@ func shareInfoFlags() []cli.Flag {
 		},
 		&cli.BoolFlag{
 			Name:  "no-usage-report",
+			Value: true, // Fork divergence: usage reporting is disabled by default.
 			Usage: "do not send usage report",
 		},
 	})

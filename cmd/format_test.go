@@ -21,7 +21,9 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
 
 func TestFixObjectSize(t *testing.T) {
@@ -85,4 +87,28 @@ func TestFormat(t *testing.T) {
 	if f.Capacity != 1<<30 || f.Inodes != 1000 {
 		t.Fatalf("unexpected volume: %+v", f)
 	}
+}
+
+func TestFormatNoUpdateClosesBadgerMeta(t *testing.T) {
+	metaDir := t.TempDir()
+	bucketDir := t.TempDir()
+	metaURI := "badger://" + metaDir
+	volume := "testbadger"
+
+	if err := Main([]string{"", "format", "--bucket", bucketDir, metaURI, volume}); err != nil {
+		t.Fatalf("format error: %s", err)
+	}
+	if err := Main([]string{"", "format", "--no-update", metaURI, volume}); err != nil {
+		t.Fatalf("format error with --no-update: %s", err)
+	}
+
+	opt := badger.DefaultOptions(metaDir)
+	opt.Logger = utils.GetLogger("badger-test")
+	opt.MetricsEnabled = false
+	opt.SkipWAL = true
+	db, err := badger.Open(opt)
+	if err != nil {
+		t.Fatalf("badger should be openable after format: %s", err)
+	}
+	_ = db.Close()
 }

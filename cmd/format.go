@@ -403,8 +403,8 @@ func readKerbConf(file string) string {
 
 func format(c *cli.Context) error {
 	setup(c, 2)
-	removePassword(c.Args().Get(0))
-	m := meta.NewClient(c.Args().Get(0), nil)
+	metaURI := c.Args().Get(0)
+	removePassword(metaURI)
 	name := c.Args().Get(1)
 	validName := regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
 	if !validName.MatchString(name) {
@@ -420,10 +420,25 @@ func format(c *cli.Context) error {
 		logger.Fatalf("too many shards: %d", v)
 	}
 
+	m := meta.NewClient(metaURI, nil)
+	fatalf := func(format string, args ...interface{}) {
+		// Fork divergence: try our best to shutdown meta client before any fatal exit.
+		// This is critical for badger with SkipWAL enabled (memtables must be flushed).
+		if shutdownErr := m.Shutdown(); shutdownErr != nil {
+			logger.Errorf("shutdown: %s", shutdownErr)
+		}
+		logger.Fatalf(format, args...)
+	}
+
 	var create, encrypted bool
 	format, err := m.Load(false)
 	if err == nil {
 		if c.Bool("no-update") {
+			// Fork divergence: always shutdown meta client on early exit.
+			// This is critical for badger with SkipWAL enabled (memtables must be flushed).
+			if err = m.Shutdown(); err != nil {
+				logger.Fatalf("shutdown: %s", err)
+			}
 			return nil
 		}
 		format.Name = name
@@ -523,14 +538,14 @@ func format(c *cli.Context) error {
 			_ = os.Unsetenv("SESSION_TOKEN")
 		}
 	} else {
-		logger.Fatalf("Load metadata: %s", err)
+		fatalf("Load metadata: %s", err)
 	}
 	if format.Storage == "file" || format.Storage == "sqlite3" {
 		p, err := filepath.Abs(format.Bucket)
 		if err == nil {
 			format.Bucket = p
 		} else {
-			logger.Fatalf("Failed to get absolute path of %s: %s", format.Bucket, err)
+			fatalf("Failed to get absolute path of %s: %s", format.Bucket, err)
 		}
 		if format.Storage == "file" {
 			format.Bucket += "/"
@@ -539,12 +554,12 @@ func format(c *cli.Context) error {
 
 	blob, err := createStorage(*format)
 	if err != nil {
-		logger.Fatalf("object storage: %s", err)
+		fatalf("object storage: %s", err)
 	}
 	logger.Infof("Data use %s", blob)
 	if os.Getenv("JFS_NO_CHECK_OBJECT_STORAGE") == "" {
 		if err := test(blob); err != nil {
-			logger.Fatalf("Storage %s is not configured correctly: %s", blob, err)
+			fatalf("Storage %s is not configured correctly: %s", blob, err)
 		}
 		if create {
 			if objs, err := object.ListAll(c.Context, blob, "", "", true, false); err == nil {
@@ -555,7 +570,7 @@ func format(c *cli.Context) error {
 					} else if o.IsDir() || o.Size() == 0 {
 						continue
 					} else if o.Key() != "testing" && !strings.HasPrefix(o.Key(), "testing/") {
-						logger.Fatalf("Storage %s is not empty; please clean it up or pick another volume name", blob)
+						fatalf("Storage %s is not empty; please clean it up or pick another volume name", blob)
 					}
 				}
 			} else {
@@ -569,14 +584,22 @@ func format(c *cli.Context) error {
 
 	if create || encrypted {
 		if err = format.Encrypt(); err != nil {
-			logger.Fatalf("Format encrypt: %s", err)
+			fatalf("Format encrypt: %s", err)
 		}
 	}
 	if err = m.Init(format, c.Bool("force")); err != nil {
 		if create {
 			_ = blob.Delete(ctx, "juicefs_uuid")
 		}
+		if shutdownErr := m.Shutdown(); shutdownErr != nil {
+			logger.Errorf("shutdown: %s", shutdownErr)
+		}
 		logger.Fatalf("format: %s", err)
+	}
+	// Fork divergence: always shutdown meta client after format completes.
+	// This is critical for badger with SkipWAL enabled (memtables must be flushed).
+	if err = m.Shutdown(); err != nil {
+		logger.Fatalf("shutdown: %s", err)
 	}
 	logger.Infof("Volume is formatted as %s", format)
 	return nil

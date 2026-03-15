@@ -40,3 +40,5 @@ pkg/meta/testdata
 /juicefsd.exe~
 /juicefs.lite
 dist/
+
+/juicefs.run9
