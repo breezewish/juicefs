@@ -702,6 +702,13 @@ func mount(c *cli.Context) error {
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
 	mountMain(v, c)
+	if forkFinalizeInProgress.Load() {
+		// A fork-only finalize is in progress (triggered by SIGUSR2 from `juicefs umount-finalize`).
+		//
+		// Do not race with finalize by flushing or shutting down meta/blob here. Also, keep the
+		// main goroutine alive until the finalize handler terminates the process via os.Exit.
+		select {}
+	}
 	if err := v.FlushAll(""); err != nil {
 		logger.Errorf("flush all delayed data: %s", err)
 	}

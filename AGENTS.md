@@ -107,6 +107,8 @@ Related files:
 
 Prefer to use a new file to isolate changed logic from upstream JuiceFS, and keep the original file as a subset of the upstream's file, if the changed logic is significant. In this way, we can easily learn what has changed from upstream, and reduce merge conflicts when syncing from upstream.
 
+Divergences should be committed using `run9: ...` as the commit message prefix, so that they can be easily identified in the commit history.
+
 ## Divergences Engineering Rules
 
 This project requires extremely high code quality and maintainability. Best engineering practices must be followed at all times.

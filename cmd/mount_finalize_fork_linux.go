@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,8 +19,6 @@ import (
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
-
-var forkFinalizeInProgress atomic.Bool
 
 // installForkFinalizeHandler installs the fork-only finalize signal handler for `juicefs umount-finalize`.
 //
