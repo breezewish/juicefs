@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"sync"
 	"strings"
 	"time"
 
@@ -139,6 +140,8 @@ type badgerClient struct {
 	ticker *time.Ticker
 	done   chan struct{}
 	gcDone chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (c *badgerClient) name() string {
@@ -208,10 +211,13 @@ func (c *badgerClient) reset(prefix []byte) error {
 }
 
 func (c *badgerClient) close() error {
-	close(c.done)
-	c.ticker.Stop()
-	<-c.gcDone
-	return c.client.Close()
+	c.closeOnce.Do(func() {
+		close(c.done)
+		c.ticker.Stop()
+		<-c.gcDone
+		c.closeErr = c.client.Close()
+	})
+	return c.closeErr
 }
 
 func (c *badgerClient) gc() {}
@@ -310,7 +316,12 @@ func newBadgerClient(addr string) (tkvClient, error) {
 		}
 	}()
 
-	return &badgerClient{client, ticker, done, gcDone}, nil
+	return &badgerClient{
+		client: client,
+		ticker: ticker,
+		done:   done,
+		gcDone: gcDone,
+	}, nil
 }
 
 func init() {
