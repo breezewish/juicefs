@@ -24,6 +24,8 @@ import (
 
 const forkFinalizeAckMaxBytes = 64 * 1024
 
+var errForkFinalizeAckPending = errors.New("finalize ack pending")
+
 func cmdUmountFinalizeFork() *cli.Command {
 	return &cli.Command{
 		Name:      "umount-finalize",
@@ -183,6 +185,46 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 		return &forkUmountFinalizeResult{
 			Ok:     false,
 			Reason: fmt.Sprintf("failed to send finalize signal to pid %d: %v", pid, err),
+		}, 1
+	}
+
+	startTimeout := 3 * time.Second
+	if finalizeTimeout > 0 && finalizeTimeout < startTimeout {
+		startTimeout = finalizeTimeout
+	}
+	startCtx, cancelStart := context.WithTimeout(ctx.Context, startTimeout)
+	startAck, startErr := waitFinalizeStart(startCtx, ackPath, pid, expectedStarttime, mountEUID)
+	cancelStart()
+	if errors.Is(startErr, errForkFinalizeAckPending) {
+		startErr = nil
+	}
+	if startAck != nil {
+		result := &forkUmountFinalizeResult{
+			Ok:                   false,
+			Finalized:            startAck.Status == "ok",
+			KernelUmountObserved: false,
+			DaemonExitObserved:   false,
+			Ack:                  startAck,
+		}
+		if startAck.Status == "ok" {
+			result.Ok = true
+			result.DaemonExitObserved = waitProcessExit(ctx.Context, pid, expectedStarttime, exitObserveTimeout)
+			if !result.DaemonExitObserved {
+				logger.Warnf("finalize ack is ok but mount daemon didn't exit within %s, killing it best-effort", exitObserveTimeout)
+				killForkMountProcess(conf, pid, expectedStarttime)
+			}
+			return result, 0
+		}
+		if startErr != nil {
+			result.Reason = startErr.Error()
+			killForkMountProcess(conf, pid, expectedStarttime)
+			return result, 1
+		}
+	}
+	if startErr != nil {
+		return &forkUmountFinalizeResult{
+			Ok:     false,
+			Reason: startErr.Error(),
 		}, 1
 	}
 
@@ -364,6 +406,9 @@ func validateFinalizeAck(ack *forkFinalizeAckV1, expectedPid int, expectedStartt
 	if ack.Pid != expectedPid || ack.PidStarttimeTicks != expectedStarttime {
 		return fmt.Errorf("ack pid mismatch (got %d/%d, want %d/%d)", ack.Pid, ack.PidStarttimeTicks, expectedPid, expectedStarttime)
 	}
+	if ack.Status == "pending" {
+		return errForkFinalizeAckPending
+	}
 	if ack.Status == "ok" {
 		return nil
 	}
@@ -371,6 +416,43 @@ func validateFinalizeAck(ack *forkFinalizeAckV1, expectedPid int, expectedStartt
 		return fmt.Errorf("finalize ack status=%s phase=%s: %s", ack.Status, ack.Phase, ack.Error)
 	}
 	return fmt.Errorf("finalize ack status=%s phase=%s", ack.Status, ack.Phase)
+}
+
+func waitFinalizeStart(ctx context.Context, ackPath string, expectedPid int, expectedStarttime uint64, expectedUID uint32) (*forkFinalizeAckV1, error) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		dirReady, err := finalizeAckDirReady(filepath.Dir(ackPath), expectedUID)
+		if err != nil {
+			return nil, err
+		}
+
+		if dirReady {
+			ack, err := readFinalizeAckFile(ackPath)
+			if err == nil {
+				validateErr := validateFinalizeAck(ack, expectedPid, expectedStarttime)
+				if validateErr == nil || errors.Is(validateErr, errForkFinalizeAckPending) {
+					return ack, validateErr
+				}
+				return ack, validateErr
+			}
+			if !os.IsNotExist(err) {
+				return nil, err
+			}
+		}
+
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !processMatches(expectedPid, expectedStarttime) {
+			return nil, fmt.Errorf("mount daemon exited before finalize start ack")
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 func waitFinalizeAck(ctx context.Context, ackPath string, expectedPid int, expectedStarttime uint64, expectedUID uint32) (*forkFinalizeAckV1, error) {
@@ -385,7 +467,11 @@ func waitFinalizeAck(ctx context.Context, ackPath string, expectedPid int, expec
 		if dirReady {
 			ack, err := readFinalizeAckFile(ackPath)
 			if err == nil {
-				return ack, validateFinalizeAck(ack, expectedPid, expectedStarttime)
+				validateErr := validateFinalizeAck(ack, expectedPid, expectedStarttime)
+				if errors.Is(validateErr, errForkFinalizeAckPending) {
+					goto waitNext
+				}
+				return ack, validateErr
 			}
 			if !os.IsNotExist(err) {
 				return nil, err
@@ -401,6 +487,7 @@ func waitFinalizeAck(ctx context.Context, ackPath string, expectedPid int, expec
 		if !processMatches(expectedPid, expectedStarttime) {
 			return nil, fmt.Errorf("mount daemon exited without finalize ack")
 		}
+	waitNext:
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():

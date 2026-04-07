@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/juicedata/juicefs/pkg/fuse"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
@@ -22,9 +21,10 @@ import (
 
 // installForkFinalizeHandler installs the fork-only finalize signal handler for `juicefs umount-finalize`.
 //
-// On SIGUSR2, it triggers a one-shot correctness-critical finalize inside the mount daemon and writes a
-// finalize ack file for the caller to observe.
-func installForkFinalizeHandler(metaCli meta.Meta, v *vfs.VFS, blob object.ObjectStorage) {
+// On SIGUSR2, it requests a one-shot correctness-critical finalize. The signal handler only
+// initiates a force umount so `mountMain` can return through the normal mount exit path; the
+// main mount goroutine then performs the actual finalize and writes the ack.
+func installForkFinalizeHandler(_ meta.Meta, v *vfs.VFS, _ object.ObjectStorage) {
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGUSR2)
 	go func() {
@@ -33,18 +33,22 @@ func installForkFinalizeHandler(metaCli meta.Meta, v *vfs.VFS, blob object.Objec
 				logger.Infof("Received SIGUSR2 but finalize is already in progress")
 				continue
 			}
-			logger.Infof("Received SIGUSR2, starting finalize")
-			forkFinalizeMountAndExit(metaCli, v, blob)
+			if err := writeForkFinalizePendingAckForCurrentProcess(); err != nil {
+				logger.Warnf("finalize: write pending ack: %s", err)
+			}
+			logger.Infof("Received SIGUSR2, requesting finalize via force umount")
+			if err := doUmount(v.Conf.Meta.MountPoint, true); err != nil {
+				logger.Warnf("finalize: force umount: %s", err)
+			}
 		}
 	}()
 }
 
-func forkFinalizeMountAndExit(metaCli meta.Meta, v *vfs.VFS, blob object.ObjectStorage) {
+func runForkFinalizeOnMain(metaCli meta.Meta, v *vfs.VFS, blob object.ObjectStorage) (resultErr error) {
 	pid := os.Getpid()
 	starttimeTicks, err := readProcStatStarttimeTicks(pid)
 	if err != nil {
-		logger.Errorf("finalize: read /proc/self/stat: %s", err)
-		os.Exit(meta.UmountCode)
+		return fmt.Errorf("finalize: read /proc/self/stat: %w", err)
 	}
 	ackPath := forkFinalizeAckPath(pid, starttimeTicks)
 
@@ -53,8 +57,6 @@ func forkFinalizeMountAndExit(metaCli meta.Meta, v *vfs.VFS, blob object.ObjectS
 		Pid:               pid,
 		PidStarttimeTicks: starttimeTicks,
 	}
-
-	exitCode := meta.UmountCode
 
 	var firstPhase string
 	var firstErr error
@@ -75,19 +77,31 @@ func forkFinalizeMountAndExit(metaCli meta.Meta, v *vfs.VFS, blob object.ObjectS
 			ack.Status = "panic"
 			ack.Phase = ""
 			ack.Error = fmt.Sprintf("panic: %v", r)
+			resultErr = fmt.Errorf("finalize panic: %v", r)
 		}
 
+		if ack.Status == "" {
+			if firstErr == nil {
+				ack.Status = "ok"
+				ack.Phase = ""
+				ack.Error = ""
+			} else {
+				ack.Status = "error"
+				ack.Phase = firstPhase
+				ack.Error = firstErr.Error()
+				if resultErr == nil {
+					resultErr = firstErr
+				}
+			}
+		}
 		ack.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 		if err := writeForkFinalizeAck(ackPath, ack); err != nil {
 			logger.Errorf("finalize: write ack: %s", err)
-			exitCode = meta.UmountCode
+			if resultErr == nil {
+				resultErr = fmt.Errorf("finalize: write ack: %w", err)
+			}
 		}
-		os.Exit(exitCode)
 	}()
-
-	if ok := fuse.Shutdown(); !ok {
-		recordErr("fuse_shutdown", errors.New("fuse shutdown returned false"))
-	}
 
 	recordErr("flush_all", v.FlushAll(""))
 
@@ -108,19 +122,27 @@ func forkFinalizeMountAndExit(metaCli meta.Meta, v *vfs.VFS, blob object.ObjectS
 	recordErr("close_session", metaCli.CloseSession())
 
 	recordErr("shutdown", metaCli.Shutdown())
-	object.Shutdown(blob)
+	// Process exit will reclaim object-storage resources. Do not add another
+	// best-effort shutdown after metadata finalize: a late panic or fatal exit
+	// here would suppress the finalize ack and turn a completed finalize into an
+	// unprovable one for the caller.
 
-	if firstErr == nil {
-		ack.Status = "ok"
-		ack.Phase = ""
-		ack.Error = ""
-		exitCode = 0
-		return
+	return resultErr
+}
+
+func writeForkFinalizePendingAckForCurrentProcess() error {
+	pid := os.Getpid()
+	starttimeTicks, err := readProcStatStarttimeTicks(pid)
+	if err != nil {
+		return fmt.Errorf("read /proc/self/stat: %w", err)
 	}
-
-	ack.Status = "error"
-	ack.Phase = firstPhase
-	ack.Error = firstErr.Error()
+	return writeForkFinalizeAck(forkFinalizeAckPath(pid, starttimeTicks), &forkFinalizeAckV1{
+		SchemaVersion:     1,
+		Pid:               pid,
+		PidStarttimeTicks: starttimeTicks,
+		Status:            "pending",
+		Phase:             "signal_received",
+	})
 }
 
 func writeForkFinalizeAck(ackPath string, ack *forkFinalizeAckV1) error {

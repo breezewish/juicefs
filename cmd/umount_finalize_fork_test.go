@@ -224,6 +224,78 @@ func TestWaitFinalizeAck_Ok(t *testing.T) {
 	}
 }
 
+func TestWaitFinalizeStart_PendingAck(t *testing.T) {
+	ackPath := filepath.Join(secureTempDir(t), "ack.json")
+	ack := &forkFinalizeAckV1{
+		SchemaVersion:     1,
+		Pid:               123,
+		PidStarttimeTicks: 456,
+		Status:            "pending",
+		Phase:             "signal_received",
+	}
+	data, err := json.Marshal(ack)
+	if err != nil {
+		t.Fatalf("Marshal ack: %v", err)
+	}
+	if err := os.WriteFile(ackPath, data, 0o600); err != nil {
+		t.Fatalf("WriteFile ack: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := waitFinalizeStart(ctx, ackPath, ack.Pid, ack.PidStarttimeTicks, uint32(os.Geteuid()))
+	if !errors.Is(err, errForkFinalizeAckPending) {
+		t.Fatalf("waitFinalizeStart should report pending, got %v", err)
+	}
+	if got == nil || got.Status != "pending" {
+		t.Fatalf("unexpected ack: %+v", got)
+	}
+}
+
+func TestWaitFinalizeAck_PendingEventuallyOk(t *testing.T) {
+	ackPath := filepath.Join(secureTempDir(t), "ack.json")
+	pending := &forkFinalizeAckV1{
+		SchemaVersion:     1,
+		Pid:               123,
+		PidStarttimeTicks: 456,
+		Status:            "pending",
+		Phase:             "signal_received",
+	}
+	data, err := json.Marshal(pending)
+	if err != nil {
+		t.Fatalf("Marshal pending ack: %v", err)
+	}
+	if err := os.WriteFile(ackPath, data, 0o600); err != nil {
+		t.Fatalf("WriteFile pending ack: %v", err)
+	}
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		finalAck := &forkFinalizeAckV1{
+			SchemaVersion:     1,
+			Pid:               123,
+			PidStarttimeTicks: 456,
+			Status:            "ok",
+			FinishedAt:        time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		finalData, marshalErr := json.Marshal(finalAck)
+		if marshalErr != nil {
+			return
+		}
+		_ = os.WriteFile(ackPath, finalData, 0o600)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := waitFinalizeAck(ctx, ackPath, pending.Pid, pending.PidStarttimeTicks, uint32(os.Geteuid()))
+	if err != nil {
+		t.Fatalf("waitFinalizeAck should succeed, got %v", err)
+	}
+	if got.Status != "ok" {
+		t.Fatalf("unexpected status: %s", got.Status)
+	}
+}
+
 func TestWaitFinalizeAck_StatusError(t *testing.T) {
 	ackPath := filepath.Join(secureTempDir(t), "ack.json")
 	ack := &forkFinalizeAckV1{

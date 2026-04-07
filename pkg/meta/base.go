@@ -870,15 +870,36 @@ func (m *baseMeta) refresh(ctx Context) {
 
 		old := m.getFormat()
 		if format, err := m.Load(false); err != nil {
+			m.sesMu.Lock()
+			umounting := m.umounting
+			m.sesMu.Unlock()
+			if umounting {
+				logger.Warnf("reload setting during shutdown: %s", err)
+				return
+			}
 			if strings.HasPrefix(err.Error(), "database is not formatted") {
 				logger.Errorf("reload setting: %s", err)
 				os.Exit(UmountCode)
 			}
 			logger.Warnf("reload setting: %s", err)
 		} else if format.MetaVersion > MaxVersion {
+			m.sesMu.Lock()
+			umounting := m.umounting
+			m.sesMu.Unlock()
+			if umounting {
+				logger.Warnf("skip incompatible metadata version during shutdown: %d > max version %d", format.MetaVersion, MaxVersion)
+				return
+			}
 			logger.Errorf("incompatible metadata version %d > max version %d", format.MetaVersion, MaxVersion)
 			os.Exit(UmountCode)
 		} else if format.UUID != old.UUID {
+			m.sesMu.Lock()
+			umounting := m.umounting
+			m.sesMu.Unlock()
+			if umounting {
+				logger.Warnf("skip UUID change during shutdown: %s -> %s", old.UUID, format.UUID)
+				return
+			}
 			logger.Errorf("UUID changed from %s to %s", old.UUID, format.UUID)
 			os.Exit(UmountCode)
 		} else if !reflect.DeepEqual(format, old) {
