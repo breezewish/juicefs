@@ -44,7 +44,7 @@ func installForkFinalizeHandler(_ meta.Meta, v *vfs.VFS, _ object.ObjectStorage)
 	}()
 }
 
-func runForkFinalizeOnMain(metaCli meta.Meta, v *vfs.VFS, blob object.ObjectStorage) (resultErr error) {
+func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.ObjectStorage) (resultErr error) {
 	pid := os.Getpid()
 	starttimeTicks, err := readProcStatStarttimeTicks(pid)
 	if err != nil {

@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+var errPendingStagingMissing = errors.New("pending staging file missing")
+
 // WaitForUploadDrain waits until writeback uploads are fully drained.
 //
 // Fork divergence: this is used by the `umount-finalize` flow to provide stronger
@@ -47,9 +49,33 @@ func (store *cachedStore) WaitForUploadDrain(ctx context.Context) error {
 
 func (store *cachedStore) isUploadDrained() (bool, error) {
 	store.pendingMutex.Lock()
-	pending := len(store.pendingKeys)
+	pendingItems := make([]*pendingItem, 0, len(store.pendingKeys))
+	for _, item := range store.pendingKeys {
+		pendingItems = append(pendingItems, item)
+	}
 	store.pendingMutex.Unlock()
-	if pending != 0 {
+
+	if len(pendingItems) != 0 {
+		for _, item := range pendingItems {
+			if item == nil || item.uploading.Load() {
+				continue
+			}
+			if item.fpath == "" {
+				if !store.isCurrentPendingSnapshot(item) {
+					continue
+				}
+				return false, fmt.Errorf("%w: key %s has empty staging path", errPendingStagingMissing, item.key)
+			}
+			if _, err := os.Stat(item.fpath); err != nil {
+				if os.IsNotExist(err) {
+					if !store.isCurrentPendingSnapshot(item) {
+						continue
+					}
+					return false, fmt.Errorf("%w: key %s path %s", errPendingStagingMissing, item.key, item.fpath)
+				}
+				return false, fmt.Errorf("stat pending staging file for key %s path %s: %w", item.key, item.fpath, err)
+			}
+		}
 		return false, nil
 	}
 	if len(store.currentUpload) != 0 {
@@ -73,6 +99,16 @@ func (store *cachedStore) isUploadDrained() (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+func (store *cachedStore) isCurrentPendingSnapshot(item *pendingItem) bool {
+	if item == nil {
+		return false
+	}
+	store.pendingMutex.Lock()
+	current := store.pendingKeys[item.key]
+	store.pendingMutex.Unlock()
+	return current != nil && current == item && !current.uploading.Load() && current.fpath == item.fpath
 }
 
 func (store *cachedStore) listStagingRoots() ([]string, error) {

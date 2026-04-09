@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	. "github.com/bytedance/mockey"
 )
 
 func TestWaitForUploadDrain_AlreadyDrained(t *testing.T) {
@@ -28,11 +30,16 @@ func TestWaitForUploadDrain_AlreadyDrained(t *testing.T) {
 }
 
 func TestWaitForUploadDrain_ContextCanceled(t *testing.T) {
+	stagingPath := filepath.Join(t.TempDir(), "staging")
+	if err := os.WriteFile(stagingPath, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile staging block: %v", err)
+	}
+
 	store := &cachedStore{
 		conf:          Config{Writeback: true},
 		currentUpload: make(chan struct{}, 1),
 		pendingKeys: map[string]*pendingItem{
-			"k": {},
+			"k": {key: "k", fpath: stagingPath},
 		},
 	}
 
@@ -41,6 +48,84 @@ func TestWaitForUploadDrain_ContextCanceled(t *testing.T) {
 	err := store.WaitForUploadDrain(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("WaitForUploadDrain should return context deadline, got %v", err)
+	}
+}
+
+func TestWaitForUploadDrain_FailsWhenPendingStageMissing(t *testing.T) {
+	store := &cachedStore{
+		conf:          Config{Writeback: true},
+		currentUpload: make(chan struct{}, 1),
+		pendingKeys: map[string]*pendingItem{
+			"k": {key: "k", fpath: filepath.Join(t.TempDir(), "missing")},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := store.WaitForUploadDrain(ctx)
+	if !errors.Is(err, errPendingStagingMissing) {
+		t.Fatalf("WaitForUploadDrain should return missing staging error, got %v", err)
+	}
+}
+
+func TestWaitForUploadDrain_IgnoresMissingStageWhileUploading(t *testing.T) {
+	item := &pendingItem{key: "k", fpath: filepath.Join(t.TempDir(), "missing")}
+	item.uploading.Store(true)
+	store := &cachedStore{
+		conf:          Config{Writeback: true},
+		currentUpload: make(chan struct{}, 1),
+		pendingKeys: map[string]*pendingItem{
+			"k": item,
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := store.WaitForUploadDrain(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForUploadDrain should keep waiting while upload is in-flight, got %v", err)
+	}
+}
+
+func TestWaitForUploadDrain_IgnoresStaleMissingStageSnapshot(t *testing.T) {
+	tmpDir := t.TempDir()
+	stagingPath := filepath.Join(tmpDir, "missing")
+	store := &cachedStore{
+		conf:          Config{Writeback: true},
+		currentUpload: make(chan struct{}, 1),
+		pendingKeys: map[string]*pendingItem{
+			"k": {key: "k", fpath: stagingPath},
+		},
+		bcache: &cacheManager{
+			stores: []*cacheStore{{dir: tmpDir}},
+		},
+	}
+
+	statStarted := make(chan struct{}, 1)
+	allowStatReturn := make(chan struct{})
+	mock := Mock(os.Stat).To(func(name string) (os.FileInfo, error) {
+		if name == stagingPath {
+			statStarted <- struct{}{}
+			<-allowStatReturn
+			return nil, os.ErrNotExist
+		}
+		return os.Lstat(name)
+	}).Build()
+	defer mock.UnPatch()
+
+	errCh := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		errCh <- store.WaitForUploadDrain(ctx)
+	}()
+
+	<-statStarted
+	store.removePending("k")
+	close(allowStatReturn)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("WaitForUploadDrain should ignore stale missing-stage snapshot, got %v", err)
 	}
 }
 
