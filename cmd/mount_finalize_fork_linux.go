@@ -42,6 +42,37 @@ func forkFinalizeDaemonTimeout(requested time.Duration) time.Duration {
 	return requested - slack
 }
 
+func forkFinalizePhaseTimeoutErr(finalizeTimeout, requestedTimeout time.Duration, err error) error {
+	return fmt.Errorf("timeout after %s (requested %s): %w", finalizeTimeout, requestedTimeout, err)
+}
+
+type forkFinalizeBlockingPhaseResult struct {
+	err   error
+	panic any
+}
+
+func runForkFinalizeBlockingPhase(ctx context.Context, finalizeTimeout, requestedTimeout time.Duration, fn func() error) error {
+	done := make(chan forkFinalizeBlockingPhaseResult, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- forkFinalizeBlockingPhaseResult{panic: r}
+			}
+		}()
+		done <- forkFinalizeBlockingPhaseResult{err: fn()}
+	}()
+
+	select {
+	case result := <-done:
+		if result.panic != nil {
+			panic(result.panic)
+		}
+		return result.err
+	case <-ctx.Done():
+		return forkFinalizePhaseTimeoutErr(finalizeTimeout, requestedTimeout, ctx.Err())
+	}
+}
+
 // installForkFinalizeHandler installs the fork-only finalize signal handler for `juicefs umount-finalize`.
 //
 // On SIGUSR2, it requests a one-shot correctness-critical finalize. The signal handler only
@@ -156,9 +187,10 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 	}()
 
 	writePendingAck("flush_all")
-	recordErr("flush_all", forkFinalizeFlushAll(v))
+	recordErr("flush_all", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
+		return forkFinalizeFlushAll(v)
+	}))
 	if finalizeCtx.Err() != nil {
-		recordErr("flush_all", fmt.Errorf("timeout after %s (requested %s): %w", finalizeTimeout, requestedTimeout, finalizeCtx.Err()))
 		return resultErr
 	}
 
@@ -173,7 +205,7 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 			writePendingAck("upload_drain")
 			err := drainer.WaitForUploadDrain(finalizeCtx)
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				err = fmt.Errorf("timeout after %s (requested %s): %w", finalizeTimeout, requestedTimeout, err)
+				err = forkFinalizePhaseTimeoutErr(finalizeTimeout, requestedTimeout, err)
 			}
 			recordErr("upload_drain", err)
 		}
@@ -183,14 +215,17 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 	}
 
 	writePendingAck("close_session")
-	recordErr("close_session", metaCli.CloseSession())
+	recordErr("close_session", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
+		return metaCli.CloseSession()
+	}))
 	if finalizeCtx.Err() != nil {
-		recordErr("close_session", fmt.Errorf("timeout after %s (requested %s): %w", finalizeTimeout, requestedTimeout, finalizeCtx.Err()))
 		return resultErr
 	}
 
 	writePendingAck("shutdown")
-	recordErr("shutdown", metaCli.Shutdown())
+	recordErr("shutdown", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
+		return metaCli.Shutdown()
+	}))
 	// Process exit will reclaim object-storage resources. Do not add another
 	// best-effort shutdown after metadata finalize: a late panic or fatal exit
 	// here would suppress the finalize ack and turn a completed finalize into an
