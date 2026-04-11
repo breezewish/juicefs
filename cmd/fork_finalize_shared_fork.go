@@ -17,6 +17,10 @@ func forkFinalizeAckPath(pid int, starttimeTicks uint64) string {
 	return filepath.Join(forkFinalizeAckDir, fmt.Sprintf("%d-%d.json", pid, starttimeTicks))
 }
 
+func forkFinalizeRequestPath(pid int, starttimeTicks uint64) string {
+	return filepath.Join(forkFinalizeAckDir, fmt.Sprintf("%d-%d.req.json", pid, starttimeTicks))
+}
+
 func readProcStatStarttimeTicks(pid int) (uint64, error) {
 	starttime, _, err := readProcStatStarttimeTicksAndPPid(pid)
 	return starttime, err

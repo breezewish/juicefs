@@ -296,6 +296,34 @@ func TestWaitFinalizeAck_PendingEventuallyOk(t *testing.T) {
 	}
 }
 
+func TestWaitFinalizeAck_TimeoutReturnsPendingAck(t *testing.T) {
+	ackPath := filepath.Join(secureTempDir(t), "ack.json")
+	pending := &forkFinalizeAckV1{
+		SchemaVersion:     1,
+		Pid:               123,
+		PidStarttimeTicks: 456,
+		Status:            "pending",
+		Phase:             "upload_drain",
+	}
+	data, err := json.Marshal(pending)
+	if err != nil {
+		t.Fatalf("Marshal pending ack: %v", err)
+	}
+	if err := os.WriteFile(ackPath, data, 0o600); err != nil {
+		t.Fatalf("WriteFile pending ack: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	got, err := waitFinalizeAck(ctx, ackPath, pending.Pid, pending.PidStarttimeTicks, uint32(os.Geteuid()))
+	if got == nil || got.Status != "pending" || got.Phase != "upload_drain" {
+		t.Fatalf("unexpected ack: %+v", got)
+	}
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitFinalizeAck should return context deadline, got %v", err)
+	}
+}
+
 func TestWaitFinalizeAck_StatusError(t *testing.T) {
 	ackPath := filepath.Join(secureTempDir(t), "ack.json")
 	ack := &forkFinalizeAckV1{

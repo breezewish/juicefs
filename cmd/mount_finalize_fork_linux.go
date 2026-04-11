@@ -19,6 +19,29 @@ import (
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
 
+const forkFinalizeDefaultTimeout = 10 * time.Minute
+
+var forkFinalizeFlushAll = func(v *vfs.VFS) error {
+	return v.FlushAll("")
+}
+
+func forkFinalizeDaemonTimeout(requested time.Duration) time.Duration {
+	if requested <= 0 {
+		return forkFinalizeDefaultTimeout
+	}
+
+	// Leave headroom so the daemon can still write the terminal ack before the
+	// caller's --finalize-timeout expires.
+	slack := 5 * time.Second
+	if requested/10 < slack {
+		slack = requested / 10
+	}
+	if slack <= 0 || slack >= requested {
+		return requested
+	}
+	return requested - slack
+}
+
 // installForkFinalizeHandler installs the fork-only finalize signal handler for `juicefs umount-finalize`.
 //
 // On SIGUSR2, it requests a one-shot correctness-critical finalize. The signal handler only
@@ -51,11 +74,40 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 		return fmt.Errorf("finalize: read /proc/self/stat: %w", err)
 	}
 	ackPath := forkFinalizeAckPath(pid, starttimeTicks)
+	reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
+
+	requestedTimeout := forkFinalizeDefaultTimeout
+	req, err := readForkFinalizeRequest(reqPath)
+	if err == nil {
+		requestedTimeout, err = time.ParseDuration(req.FinalizeTimeout)
+		if err != nil || requestedTimeout <= 0 {
+			logger.Warnf("finalize: request has invalid finalize_timeout %q: %v", req.FinalizeTimeout, err)
+			requestedTimeout = forkFinalizeDefaultTimeout
+		}
+		if err := os.Remove(reqPath); err != nil && !os.IsNotExist(err) {
+			logger.Warnf("finalize: remove request: %s", err)
+		}
+	} else if !os.IsNotExist(err) {
+		logger.Warnf("finalize: read request: %s", err)
+	}
+
+	finalizeTimeout := forkFinalizeDaemonTimeout(requestedTimeout)
+	finalizeCtx, cancel := context.WithTimeout(context.Background(), finalizeTimeout)
+	defer cancel()
 
 	ack := &forkFinalizeAckV1{
 		SchemaVersion:     1,
 		Pid:               pid,
 		PidStarttimeTicks: starttimeTicks,
+	}
+
+	writePendingAck := func(phase string) {
+		ack.Status = "pending"
+		ack.Phase = phase
+		ack.Error = ""
+		if err := writeForkFinalizeAck(ackPath, ack); err != nil {
+			logger.Warnf("finalize: write pending ack phase=%s: %s", phase, err)
+		}
 	}
 
 	var firstPhase string
@@ -80,7 +132,7 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 			resultErr = fmt.Errorf("finalize panic: %v", r)
 		}
 
-		if ack.Status == "" {
+		if ack.Status != "panic" {
 			if firstErr == nil {
 				ack.Status = "ok"
 				ack.Phase = ""
@@ -103,24 +155,41 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 		}
 	}()
 
-	recordErr("flush_all", v.FlushAll(""))
+	writePendingAck("flush_all")
+	recordErr("flush_all", forkFinalizeFlushAll(v))
+	if finalizeCtx.Err() != nil {
+		recordErr("flush_all", fmt.Errorf("timeout after %s (requested %s): %w", finalizeTimeout, requestedTimeout, finalizeCtx.Err()))
+		return resultErr
+	}
 
 	if v.Conf != nil && v.Conf.Chunk != nil && v.Conf.Chunk.Writeback {
 		drainer, ok := v.Store.(interface {
 			WaitForUploadDrain(context.Context) error
 		})
 		if !ok {
+			writePendingAck("upload_drain")
 			recordErr("upload_drain", errors.New("chunk store does not support WaitForUploadDrain"))
 		} else {
-			// Intentionally use Background: the mount daemon doesn't know the caller's --finalize-timeout.
-			// Bounded waiting is enforced by the `umount-finalize` caller; the daemon writes a terminal
-			// ack when finalize completes.
-			recordErr("upload_drain", drainer.WaitForUploadDrain(context.Background()))
+			writePendingAck("upload_drain")
+			err := drainer.WaitForUploadDrain(finalizeCtx)
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				err = fmt.Errorf("timeout after %s (requested %s): %w", finalizeTimeout, requestedTimeout, err)
+			}
+			recordErr("upload_drain", err)
+		}
+		if finalizeCtx.Err() != nil {
+			return resultErr
 		}
 	}
 
+	writePendingAck("close_session")
 	recordErr("close_session", metaCli.CloseSession())
+	if finalizeCtx.Err() != nil {
+		recordErr("close_session", fmt.Errorf("timeout after %s (requested %s): %w", finalizeTimeout, requestedTimeout, finalizeCtx.Err()))
+		return resultErr
+	}
 
+	writePendingAck("shutdown")
 	recordErr("shutdown", metaCli.Shutdown())
 	// Process exit will reclaim object-storage resources. Do not add another
 	// best-effort shutdown after metadata finalize: a late panic or fatal exit

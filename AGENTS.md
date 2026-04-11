@@ -86,6 +86,8 @@ Related files:
 
 - Mount daemon handles `SIGUSR2` by quiescing FUSE, flushing VFS, draining writeback uploads, closing metadata session, shutting down metadata/object storage, writing finalize ack atomically, then exiting with `0` on success or `meta.UmountCode` on failure.
 
+- `umount-finalize` writes a request file alongside the ack path to pass `--finalize-timeout` to the mount daemon. The mount daemon uses it to bound `WaitForUploadDrain(ctx)` and always writes a terminal ack (error/panic) before the caller times out (small headroom is reserved).
+
 - `cachedStore.WaitForUploadDrain(ctx)` to wait for pending writeback uploads and empty `rawstaging` across all cache dirs.
 
 Related files:

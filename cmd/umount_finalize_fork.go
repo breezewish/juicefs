@@ -165,6 +165,31 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 
 	ackPath := forkFinalizeAckPath(pid, expectedStarttime)
 
+	reqPath := forkFinalizeRequestPath(pid, expectedStarttime)
+	if err := ensureForkFinalizeAckDirForRequester(filepath.Dir(ackPath), mountEUID); err != nil {
+		// Best-effort: the mount daemon can still finalize without the request file;
+		// it will fall back to its default timeout.
+		logger.Warnf("finalize: ensure ack dir for request: %s", err)
+	} else {
+		if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
+			SchemaVersion:   1,
+			FinalizeTimeout: finalizeTimeout.String(),
+		}); err != nil {
+			// Best-effort: older mount daemons can still work without the request, and
+			// we don't want timeout plumbing to become a new failure mode.
+			logger.Warnf("finalize: write request: %s", err)
+		} else {
+			if os.Geteuid() == 0 && mountEUID != uint32(os.Geteuid()) {
+				if err := os.Chown(reqPath, int(mountEUID), -1); err != nil {
+					logger.Warnf("finalize: chown request to uid %d: %s", mountEUID, err)
+				}
+			}
+			if err := os.Chmod(reqPath, 0o600); err != nil {
+				logger.Warnf("finalize: chmod request: %s", err)
+			}
+		}
+	}
+
 	if _, err := finalizeAckDirReady(filepath.Dir(ackPath), mountEUID); err != nil {
 		return &forkUmountFinalizeResult{
 			Ok:     false,
@@ -491,6 +516,19 @@ func waitFinalizeAck(ctx context.Context, ackPath string, expectedPid int, expec
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
+			// Best-effort: return the latest ack even when timing out, so callers can
+			// see which phase got stuck (the mount daemon updates ack.phase as it
+			// progresses).
+			if dirReady, err := finalizeAckDirReady(filepath.Dir(ackPath), expectedUID); err == nil && dirReady {
+				ack, err := readFinalizeAckFile(ackPath)
+				if err == nil {
+					validateErr := validateFinalizeAck(ack, expectedPid, expectedStarttime)
+					if errors.Is(validateErr, errForkFinalizeAckPending) {
+						return ack, ctx.Err()
+					}
+					return ack, validateErr
+				}
+			}
 			return nil, ctx.Err()
 		}
 	}

@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	mockey "github.com/bytedance/mockey"
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
@@ -28,6 +27,34 @@ func (f *fakeFinalizeChunkStore) WaitForUploadDrain(context.Context) error {
 	f.waitCalls++
 	return f.waitErr
 }
+
+type blockingFinalizeChunkStore struct {
+	waitCalls int
+}
+
+func (b *blockingFinalizeChunkStore) WaitForUploadDrain(ctx context.Context) error {
+	b.waitCalls++
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (b *blockingFinalizeChunkStore) NewReader(uint64, int) chunk.Reader { return fakeFinalizeReader{} }
+
+func (b *blockingFinalizeChunkStore) NewWriter(uint64) chunk.Writer { return &fakeFinalizeWriter{} }
+
+func (b *blockingFinalizeChunkStore) Remove(uint64, int) error { return nil }
+
+func (b *blockingFinalizeChunkStore) FillCache(uint64, uint32) error { return nil }
+
+func (b *blockingFinalizeChunkStore) EvictCache(uint64, uint32) error { return nil }
+
+func (b *blockingFinalizeChunkStore) CheckCache(uint64, uint32, func(bool, string, int)) error {
+	return nil
+}
+
+func (b *blockingFinalizeChunkStore) UsedMemory() int64 { return 0 }
+
+func (b *blockingFinalizeChunkStore) UpdateLimit(int64, int64) {}
 
 func (f *fakeFinalizeChunkStore) NewReader(uint64, int) chunk.Reader { return fakeFinalizeReader{} }
 
@@ -186,10 +213,9 @@ func TestRunForkFinalizeOnMain_WritesUploadDrainErrorAck(t *testing.T) {
 		Store: store,
 	}
 
-	mock := mockey.Mock((*vfs.VFS).FlushAll).To(func(*vfs.VFS, string) error {
-		return nil
-	}).Build()
-	defer mock.UnPatch()
+	origFlushAll := forkFinalizeFlushAll
+	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
+	defer func() { forkFinalizeFlushAll = origFlushAll }()
 
 	err = runForkFinalizeOnMain(metaCli, v, nil)
 	if !errors.Is(err, drainErr) {
@@ -220,6 +246,91 @@ func TestRunForkFinalizeOnMain_WritesUploadDrainErrorAck(t *testing.T) {
 		t.Fatalf("unexpected ack phase: %+v", ack)
 	}
 	if ack.Error != drainErr.Error() {
+		t.Fatalf("unexpected ack error: %+v", ack)
+	}
+	if ack.FinishedAt == "" {
+		t.Fatalf("ack should include finished_at: %+v", ack)
+	}
+}
+
+func TestRunForkFinalizeOnMain_TimesOutUploadDrainWritesAck(t *testing.T) {
+	pid := os.Getpid()
+	starttimeTicks, err := readProcStatStarttimeTicks(pid)
+	if err != nil {
+		t.Fatalf("readProcStatStarttimeTicks: %v", err)
+	}
+
+	ackPath := forkFinalizeAckPath(pid, starttimeTicks)
+	reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
+	_ = os.Remove(ackPath)
+	_ = os.Remove(reqPath)
+	t.Cleanup(func() {
+		_ = os.Remove(ackPath)
+		_ = os.Remove(reqPath)
+	})
+	if err := os.MkdirAll(filepath.Dir(ackPath), 0o700); err != nil {
+		t.Fatalf("MkdirAll ack dir: %v", err)
+	}
+	if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
+		SchemaVersion:   1,
+		FinalizeTimeout: "200ms",
+	}); err != nil {
+		t.Fatalf("writeForkFinalizeRequest: %v", err)
+	}
+
+	metaCli := &fakeFinalizeSessionShutdowner{}
+	store := &blockingFinalizeChunkStore{}
+	v := &vfs.VFS{
+		Conf: &vfs.Config{
+			Chunk: &chunk.Config{Writeback: true},
+		},
+		Store: store,
+	}
+
+	origFlushAll := forkFinalizeFlushAll
+	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
+	defer func() { forkFinalizeFlushAll = origFlushAll }()
+
+	done := make(chan error, 1)
+	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("runForkFinalizeOnMain should fail on timeout")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("runForkFinalizeOnMain blocked")
+	}
+
+	if metaCli.closeCalls != 0 {
+		t.Fatalf("CloseSession should not be called on timeout, got %d", metaCli.closeCalls)
+	}
+	if metaCli.shutdownCalls != 0 {
+		t.Fatalf("Shutdown should not be called on timeout, got %d", metaCli.shutdownCalls)
+	}
+	if store.waitCalls != 1 {
+		t.Fatalf("WaitForUploadDrain should be called once, got %d", store.waitCalls)
+	}
+
+	data, err := os.ReadFile(ackPath)
+	if err != nil {
+		t.Fatalf("ReadFile ack: %v", err)
+	}
+	var ack forkFinalizeAckV1
+	if err := json.Unmarshal(data, &ack); err != nil {
+		t.Fatalf("Unmarshal ack: %v", err)
+	}
+	if ack.Status != "error" {
+		t.Fatalf("unexpected ack status: %+v", ack)
+	}
+	if ack.Phase != "upload_drain" {
+		t.Fatalf("unexpected ack phase: %+v", ack)
+	}
+	if !strings.Contains(ack.Error, "timeout after") {
 		t.Fatalf("unexpected ack error: %+v", ack)
 	}
 	if ack.FinishedAt == "" {
