@@ -29,7 +29,6 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
-	. "github.com/bytedance/mockey"
 	. "github.com/smartystreets/goconvey/convey"
 )
 
@@ -396,11 +395,14 @@ func TestCacheManager(t *testing.T) {
 	s1 := m.getStore(k1)
 	require.NotNil(t, s1)
 
-	PatchConvey("test getDiskUsage", t, func() {
-		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+	Convey("test getDiskUsage", t, func() {
+		origDiskUsage := diskUsageFn
+		diskUsageFn = func(path string) (uint64, uint64, uint64, uint64) {
 			time.Sleep(time.Second * 10)
 			return 1, 1, 1, 1
-		}).Build()
+		}
+		Reset(func() { diskUsageFn = origDiskUsage })
+
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -504,10 +506,12 @@ func TestSetLimitByFreeRatioUnknownInodesKeepExplicitMaxItems(t *testing.T) {
 }
 
 func TestUnknownInodeStatsShouldNotMarkCacheAsRawFull(t *testing.T) {
-	PatchConvey("unknown inode stats should not trigger rawFull", t, func() {
-		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+	Convey("unknown inode stats should not trigger rawFull", t, func() {
+		origDiskUsage := diskUsageFn
+		diskUsageFn = func(path string) (uint64, uint64, uint64, uint64) {
 			return 1 << 30, 1 << 30, 0, 0
-		}).Build()
+		}
+		Reset(func() { diskUsageFn = origDiskUsage })
 
 		conf := defaultConf
 		conf.CacheDir = t.TempDir()
@@ -661,20 +665,34 @@ func TestCooldownAtimeOnWriteFixedOnLoad(t *testing.T) {
 	m := new(cacheManagerMetrics)
 	m.initMetrics()
 	cache := newCacheStore(m, dir, 1<<30, 1000, 1, &conf, nil)
+	defer shutdownStore(cache)
 	key := "0_0_4"
 
-	PatchConvey("mock time.Now to avoid drift", t, func() {
-		fixedTime := time.Date(2025, 1, 28, 12, 0, 0, 0, time.UTC)
-		Mock(time.Now).Return(fixedTime).Build()
-		path, err := cache.stage(key, []byte("test"))
-		require.NoError(t, err)
-		require.NotEmpty(t, path)
-		expectedCooldownAtime := uint32(fixedTime.Add(-conf.CacheExpire / 2).Unix())
-		require.Equal(t, expectedCooldownAtime, cache.keys.peekAtime(cache.getCacheKey(key)))
-		rc, err := cache.load(key)
-		require.NoError(t, err)
-		require.NotNil(t, rc)
-		defer rc.Close()
-		require.Equal(t, uint32(fixedTime.Unix()), cache.keys.peekAtime(cache.getCacheKey(key)))
-	})
+	started := time.Now().UTC()
+	path, err := cache.stage(key, []byte("test"))
+	require.NoError(t, err)
+	require.NotEmpty(t, path)
+
+	expectedCooldownAtime := uint32(started.Add(-conf.CacheExpire / 2).Unix())
+	gotCooldownAtime := cache.keys.peekAtime(cache.getCacheKey(key))
+	diff := int64(gotCooldownAtime) - int64(expectedCooldownAtime)
+	if diff < 0 {
+		diff = -diff
+	}
+	require.LessOrEqual(t, diff, int64(2))
+
+	cache.Lock()
+	cache.scanned = true
+	cache.Unlock()
+
+	loadStart := uint32(time.Now().Unix())
+	rc, err := cache.load(key)
+	require.NoError(t, err)
+	require.NotNil(t, rc)
+	_ = rc.Close()
+	loadEnd := uint32(time.Now().Unix())
+
+	atimeAfterLoad := cache.keys.peekAtime(cache.getCacheKey(key))
+	require.GreaterOrEqual(t, atimeAfterLoad, loadStart)
+	require.LessOrEqual(t, atimeAfterLoad, loadEnd)
 }

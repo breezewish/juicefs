@@ -12,6 +12,8 @@ import (
 
 var errPendingStagingMissing = errors.New("pending staging file missing")
 
+var statPathForUploadDrain = os.Stat
+
 // WaitForUploadDrain waits until writeback uploads are fully drained.
 //
 // Fork divergence: this is used by the `umount-finalize` flow to provide stronger
@@ -66,7 +68,7 @@ func (store *cachedStore) isUploadDrained() (bool, error) {
 				}
 				return false, fmt.Errorf("%w: key %s has empty staging path", errPendingStagingMissing, item.key)
 			}
-			if _, err := os.Stat(item.fpath); err != nil {
+			if _, err := statPathForUploadDrain(item.fpath); err != nil {
 				if os.IsNotExist(err) {
 					if !store.isCurrentPendingSnapshot(item) {
 						continue
@@ -132,7 +134,7 @@ func (store *cachedStore) listStagingRoots() ([]string, error) {
 }
 
 func isDirEmptyRecursive(dir string) (bool, error) {
-	_, err := os.Stat(dir)
+	_, err := statPathForUploadDrain(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return true, nil

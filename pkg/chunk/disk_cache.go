@@ -54,6 +54,7 @@ var (
 	errNotCached        = errors.New("not cached")
 	errStageFull        = errors.New("space not enough on device")
 	errStageConcurrency = errors.New("concurrent staging limit reached")
+	diskUsageFn         = getDiskUsage
 )
 
 type cacheKey struct {
@@ -483,7 +484,7 @@ type DiskFreeRatio struct {
 func (cache *cacheStore) curFreeRatio() DiskFreeRatio {
 	var total, free, files, ffree uint64
 	_ = cache.checkErr(func() error {
-		total, free, files, ffree = getDiskUsage(cache.dir)
+		total, free, files, ffree = diskUsageFn(cache.dir)
 		return nil
 	})
 	usage := DiskFreeRatio{

@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	. "github.com/bytedance/mockey"
 )
 
 func TestWaitForUploadDrain_AlreadyDrained(t *testing.T) {
@@ -103,15 +101,20 @@ func TestWaitForUploadDrain_IgnoresStaleMissingStageSnapshot(t *testing.T) {
 
 	statStarted := make(chan struct{}, 1)
 	allowStatReturn := make(chan struct{})
-	mock := Mock(os.Stat).To(func(name string) (os.FileInfo, error) {
+	origStat := statPathForUploadDrain
+	statPathForUploadDrain = func(name string) (os.FileInfo, error) {
 		if name == stagingPath {
 			statStarted <- struct{}{}
 			<-allowStatReturn
 			return nil, os.ErrNotExist
 		}
-		return os.Lstat(name)
-	}).Build()
-	defer mock.UnPatch()
+		return origStat(name)
+	}
+	t.Cleanup(func() {
+		statPathForUploadDrain = origStat
+		defer func() { _ = recover() }()
+		close(allowStatReturn)
+	})
 
 	errCh := make(chan error, 1)
 	go func() {

@@ -90,6 +90,8 @@ Related files:
 
 - `cachedStore.WaitForUploadDrain(ctx)` to wait for pending writeback uploads and empty `rawstaging` across all cache dirs.
 
+- Chunk unit tests avoid `mockey` (assembly-based monkey patching; Go version/arch sensitive). Instead, tests override small package-level function variables like `diskUsageFn` / `statPathForUploadDrain`.
+
 Related files:
 
 - `cmd/main.go`
