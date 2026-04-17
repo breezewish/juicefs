@@ -236,6 +236,43 @@ func TestUploadStagingFile_FallsBackToCacheCopyWhenStageMissing(t *testing.T) {
 	}
 }
 
+func TestUploadStagingFile_FallsBackToChecksummedCacheCopyWhenStageMissing(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.Writeback = true
+	conf.CacheDir = t.TempDir()
+	conf.CacheChecksum = CsFull
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+
+	key := "chunks/0/0/123_0_4"
+	stagingPath, err := store.bcache.stage(key, []byte("good"))
+	if err != nil {
+		t.Fatalf("stage block: %v", err)
+	}
+	store.pendingKeys[key] = &pendingItem{key: key, fpath: stagingPath}
+	if err := os.Remove(stagingPath); err != nil {
+		t.Fatalf("remove staging path: %v", err)
+	}
+
+	store.uploadStagingFile(key, stagingPath)
+	if store.isPendingValid(key) {
+		t.Fatalf("pending upload should be cleared for %s", key)
+	}
+
+	in, err := mem.Get(ctx, key, 0, -1)
+	if err != nil {
+		t.Fatalf("uploaded object should exist: %v", err)
+	}
+	defer in.Close()
+	data, err := io.ReadAll(in)
+	if err != nil {
+		t.Fatalf("read uploaded object: %v", err)
+	}
+	if string(data) != "good" {
+		t.Fatalf("uploaded data %q != expect good", data)
+	}
+}
+
 func TestForceUpload(t *testing.T) {
 	blob, _ := object.CreateStorage("mem", "", "", "", "")
 	config := defaultConf

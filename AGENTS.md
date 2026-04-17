@@ -90,6 +90,8 @@ Related files:
 
 - `cachedStore.WaitForUploadDrain(ctx)` to wait for pending writeback uploads and empty `rawstaging` across all cache dirs.
 
+- When a pending block still exists in bookkeeping but its `rawstaging` path is gone, both `uploadStagingFile()` and `cachedStore.WaitForUploadDrain(ctx)` recover only if the keyed cache copy can still be fully read and verified with the configured checksum. Missing or corrupt cache copies stay fatal so finalize keeps exposing real data-loss evidence instead of timing out or silently degrading.
+
 - Chunk unit tests avoid `mockey` (assembly-based monkey patching; Go version/arch sensitive). Instead, tests override small package-level function variables like `diskUsageFn` / `statPathForUploadDrain`.
 
 Related files:
@@ -101,7 +103,9 @@ Related files:
 - `cmd/mount_unix.go`
 - `cmd/mount_finalize_fork_linux.go`
 - `cmd/mount_finalize_fork_nonlinux.go`
+- `pkg/chunk/cached_store.go`
 - `pkg/chunk/cached_store_finalize_fork.go`
+- `pkg/chunk/cached_store_test.go`
 - `cmd/umount_finalize_fork_test.go`
 - `cmd/umount_finalize_fork_linux_test.go`
 - `cmd/mount_finalize_fork_linux_test.go`
