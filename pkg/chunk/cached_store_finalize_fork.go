@@ -73,10 +73,11 @@ func (store *cachedStore) isUploadDrained() (bool, error) {
 					if !store.isCurrentPendingSnapshot(item) {
 						continue
 					}
-					if store.pendingBlockStillReadable(item.key) {
+					if err := store.pendingBlockRecoveryError(item.key, item.fpath); err == nil {
 						return false, nil
+					} else {
+						return false, fmt.Errorf("%w: key %s path %s: %v", errPendingStagingMissing, item.key, item.fpath, err)
 					}
-					return false, fmt.Errorf("%w: key %s path %s", errPendingStagingMissing, item.key, item.fpath)
 				}
 				return false, fmt.Errorf("stat pending staging file for key %s path %s: %w", item.key, item.fpath, err)
 			}
@@ -116,12 +117,16 @@ func (store *cachedStore) isCurrentPendingSnapshot(item *pendingItem) bool {
 	return current != nil && current == item && !current.uploading.Load() && current.fpath == item.fpath
 }
 
-func (store *cachedStore) pendingBlockStillReadable(key string) bool {
+func (store *cachedStore) pendingBlockRecoveryError(key, stagingPath string) error {
 	if store == nil || store.bcache == nil {
-		return false
+		return errors.New("cache manager unavailable")
 	}
-	_, ok := store.bcache.exist(key)
-	return ok
+	block, err := store.loadPendingBlockForUpload(key, stagingPath, parseObjOrigSize(key))
+	if err != nil {
+		return err
+	}
+	block.Release()
+	return nil
 }
 
 func (store *cachedStore) listStagingRoots() ([]string, error) {

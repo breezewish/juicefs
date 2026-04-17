@@ -1047,7 +1047,7 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	block, err := store.loadPendingBlockForUpload(key, stagingPath, blen)
 	if err != nil {
 		if store.isPendingValid(key) {
-			logger.Errorf("Open pending upload block %s: %s", stagingPath, err)
+			logger.Errorf("Load pending upload block key %s path %s: %s", key, stagingPath, err)
 		} else {
 			logger.Debugf("Key %s is not needed, drop it", key)
 		}
@@ -1094,7 +1094,7 @@ func (store *cachedStore) loadPendingBlockForUpload(key string, stagingPath stri
 	// entry that will make finalize fail later.
 	reader, cacheErr := store.bcache.load(key)
 	if cacheErr != nil {
-		return nil, err
+		return nil, cacheErr
 	}
 	defer reader.Close()
 
