@@ -34,6 +34,7 @@ func (store *cachedStore) WaitForUploadDrain(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		store.forcePendingUploads()
 		done, err := store.isUploadDrained()
 		if err != nil {
 			return err
@@ -46,6 +47,22 @@ func (store *cachedStore) WaitForUploadDrain(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+}
+
+func (store *cachedStore) forcePendingUploads() {
+	if store == nil || store.pendingCh == nil {
+		return
+	}
+	store.pendingMutex.Lock()
+	pendingItems := make([]*pendingItem, 0, len(store.pendingKeys))
+	for _, item := range store.pendingKeys {
+		pendingItems = append(pendingItems, item)
+	}
+	store.pendingMutex.Unlock()
+
+	for _, item := range pendingItems {
+		store.enqueuePendingUpload(item)
 	}
 }
 
@@ -115,6 +132,20 @@ func (store *cachedStore) isCurrentPendingSnapshot(item *pendingItem) bool {
 	current := store.pendingKeys[item.key]
 	store.pendingMutex.Unlock()
 	return current != nil && current == item && !current.uploading.Load() && current.fpath == item.fpath
+}
+
+func (store *cachedStore) enqueuePendingUpload(item *pendingItem) {
+	if item == nil || item.fpath == "" || !store.isCurrentPendingSnapshot(item) {
+		return
+	}
+	if !item.uploading.CompareAndSwap(false, true) {
+		return
+	}
+	select {
+	case store.pendingCh <- item:
+	default:
+		item.uploading.Store(false)
+	}
 }
 
 func (store *cachedStore) pendingBlockRecoveryError(key, stagingPath string) error {

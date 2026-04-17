@@ -3,11 +3,14 @@ package chunk
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/object"
 )
 
 type finalizeTestCacheManager struct {
@@ -193,6 +196,48 @@ func TestWaitForUploadDrain_IgnoresMissingStageWhenCacheCopyStillExists(t *testi
 	err = store.WaitForUploadDrain(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("WaitForUploadDrain should keep waiting when cache copy still exists, got %v", err)
+	}
+}
+
+func TestWaitForUploadDrain_QueuesRecoverablePendingUpload(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.Writeback = true
+	conf.CacheDir = t.TempDir()
+	conf.UploadDelay = time.Hour
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+
+	key := "chunks/0/0/123_0_4"
+	stagingPath, err := store.bcache.stage(key, []byte("good"))
+	if err != nil {
+		t.Fatalf("stage block: %v", err)
+	}
+	store.pendingKeys[key] = &pendingItem{
+		key:   key,
+		fpath: stagingPath,
+		ts:    time.Now(),
+	}
+	if err := os.Remove(stagingPath); err != nil {
+		t.Fatalf("remove staging path: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := store.WaitForUploadDrain(ctx); err != nil {
+		t.Fatalf("WaitForUploadDrain should force pending upload, got %v", err)
+	}
+
+	in, err := mem.Get(ctx, key, 0, -1)
+	if err != nil {
+		t.Fatalf("uploaded object should exist: %v", err)
+	}
+	defer in.Close()
+	data, err := io.ReadAll(in)
+	if err != nil {
+		t.Fatalf("read uploaded object: %v", err)
+	}
+	if string(data) != "good" {
+		t.Fatalf("uploaded data %q != expect good", data)
 	}
 }
 
