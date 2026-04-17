@@ -73,6 +73,9 @@ func (store *cachedStore) isUploadDrained() (bool, error) {
 					if !store.isCurrentPendingSnapshot(item) {
 						continue
 					}
+					if store.pendingBlockStillReadable(item.key) {
+						return false, nil
+					}
 					return false, fmt.Errorf("%w: key %s path %s", errPendingStagingMissing, item.key, item.fpath)
 				}
 				return false, fmt.Errorf("stat pending staging file for key %s path %s: %w", item.key, item.fpath, err)
@@ -111,6 +114,14 @@ func (store *cachedStore) isCurrentPendingSnapshot(item *pendingItem) bool {
 	current := store.pendingKeys[item.key]
 	store.pendingMutex.Unlock()
 	return current != nil && current == item && !current.uploading.Load() && current.fpath == item.fpath
+}
+
+func (store *cachedStore) pendingBlockStillReadable(key string) bool {
+	if store == nil || store.bcache == nil {
+		return false
+	}
+	_, ok := store.bcache.exist(key)
+	return ok
 }
 
 func (store *cachedStore) listStagingRoots() ([]string, error) {

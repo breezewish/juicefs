@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/object"
 )
 
 func TestWaitForUploadDrain_AlreadyDrained(t *testing.T) {
@@ -82,6 +84,34 @@ func TestWaitForUploadDrain_IgnoresMissingStageWhileUploading(t *testing.T) {
 	err := store.WaitForUploadDrain(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("WaitForUploadDrain should keep waiting while upload is in-flight, got %v", err)
+	}
+}
+
+func TestWaitForUploadDrain_IgnoresMissingStageWhenCacheCopyStillExists(t *testing.T) {
+	blob, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.Writeback = true
+	conf.CacheDir = t.TempDir()
+	store := NewCachedStore(blob, conf, nil).(*cachedStore)
+
+	key := "chunks/0/0/123_0_4"
+	stagingPath, err := store.bcache.stage(key, []byte("good"))
+	if err != nil {
+		t.Fatalf("stage block: %v", err)
+	}
+	store.pendingKeys[key] = &pendingItem{key: key, fpath: stagingPath}
+	if err := os.Remove(stagingPath); err != nil {
+		t.Fatalf("remove staging path: %v", err)
+	}
+	if _, ok := store.bcache.exist(key); !ok {
+		t.Fatalf("cache copy should still exist for %s", key)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err = store.WaitForUploadDrain(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForUploadDrain should keep waiting when cache copy still exists, got %v", err)
 	}
 }
 

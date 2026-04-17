@@ -1044,21 +1044,13 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	}
 
 	blen := parseObjOrigSize(key)
-	f, err := openCacheFile(stagingPath, blen, store.conf.CacheChecksum)
+	block, err := store.loadPendingBlockForUpload(key, stagingPath, blen)
 	if err != nil {
 		if store.isPendingValid(key) {
-			logger.Errorf("Open staging file %s: %s", stagingPath, err)
+			logger.Errorf("Open pending upload block %s: %s", stagingPath, err)
 		} else {
 			logger.Debugf("Key %s is not needed, drop it", key)
 		}
-		return
-	}
-	block := NewOffPage(blen)
-	_, err = f.ReadAt(block.Data, 0)
-	_ = f.Close()
-	if err != nil {
-		block.Release()
-		logger.Errorf("Read staging file %s: %s", stagingPath, err)
 		return
 	}
 	if !store.isPendingValid(key) {
@@ -1080,6 +1072,38 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 			}
 		}
 	}
+}
+
+func (store *cachedStore) loadPendingBlockForUpload(key string, stagingPath string, blen int) (*Page, error) {
+	f, err := openCacheFile(stagingPath, blen, store.conf.CacheChecksum)
+	if err == nil {
+		defer f.Close()
+		block := NewOffPage(blen)
+		if _, err := f.ReadAt(block.Data, 0); err != nil {
+			block.Release()
+			return nil, err
+		}
+		return block, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	// The rawstaging link can disappear while the keyed cache hardlink still preserves
+	// the same bytes. Recover from the cache copy instead of leaving a stale pending
+	// entry that will make finalize fail later.
+	reader, cacheErr := store.bcache.load(key)
+	if cacheErr != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	block := NewOffPage(blen)
+	if _, cacheErr := reader.ReadAt(block.Data, 0); cacheErr != nil {
+		block.Release()
+		return nil, cacheErr
+	}
+	return block, nil
 }
 
 func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.Time, force bool) bool {
