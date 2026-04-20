@@ -25,8 +25,8 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
-	"sync"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -136,10 +136,10 @@ func (tx *badgerTxn) delete(key []byte) {
 }
 
 type badgerClient struct {
-	client *badger.DB
-	ticker *time.Ticker
-	done   chan struct{}
-	gcDone chan struct{}
+	client    *badger.DB
+	ticker    *time.Ticker
+	done      chan struct{}
+	gcDone    chan struct{}
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -229,6 +229,8 @@ type badgerAddrOptions struct {
 	nextChunkValue    int64
 }
 
+const badgerValueLogFileSize = 64 << 20
+
 func parseBadgerAddrOptions(addr string) (badgerAddrOptions, error) {
 	// addr is a filesystem path (may contain Windows backslashes), with optional query.
 	// Avoid url.Parse("badger://"+addr) because it rejects inputs like `C:\data\badger`.
@@ -278,6 +280,12 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	opt.MetricsEnabled = false
 	// Fork divergence: use customized badger with SkipWAL enabled by default.
 	opt.SkipWAL = true
+	// Fork divergence: run9 stores badger metadata inside the shared_meta JuiceFS mount.
+	// The upstream 1 GiB default preallocates 2 GiB *.vlog files, and we've seen
+	// DB.Close surface ENOENT on truncate plus dangling vlog entries on that outer
+	// FUSE/object-storage layer. Keep value logs small enough that create/close stays
+	// on the boring path while preserving badger's normal lifecycle.
+	opt.ValueLogFileSize = badgerValueLogFileSize
 	client, err := badger.Open(opt)
 	if err != nil {
 		return nil, err

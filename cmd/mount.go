@@ -661,6 +661,11 @@ func mount(c *cli.Context) error {
 			daemonRun(c, addr, vfsConf) // only stage 0 needs the vfsConf
 		}
 		os.Setenv("JFS_SUPERVISOR", strconv.Itoa(os.Getppid()))
+		if stage == 2 {
+			if err := writeRun9SupervisorRecordFromEnv(); err != nil {
+				return fmt.Errorf("write run9 supervisor record: %w", err)
+			}
+		}
 		return launchMount(c, mp, vfsConf)
 	} else if runtime.GOOS == "windows" && c.Bool("background") {
 		daemonRun(c, addr, vfsConf)

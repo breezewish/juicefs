@@ -31,10 +31,13 @@ Related files:
 
 - A customized Badger dependency to support SkipWAL.
 
+- run9 forces badger `ValueLogFileSize` down to `64 MiB` when opening metadata. run9 keeps badger directories inside the shared_meta JuiceFS mount, and the upstream `1 GiB` default preallocates `2 GiB` `*.vlog` files. In production this has surfaced as dangling vlog entries and `DB.Close` truncate `ENOENT` on the outer JuiceFS/FUSE layer during finalize, so run9 keeps the value logs small to stay on the boring path.
+
 Related files:
 
 - `pkg/meta/tkv_badger.go`
 - `pkg/meta/tkv_badger_nextchunk_test.go`
+- `pkg/meta/tkv_badger_options_test.go`
 - `go.mod`
 
 ### Meta tests hygiene
@@ -78,6 +81,16 @@ Related files:
 Related files:
 
 - `cmd/mount.go`
+
+### Mount Supervisor Cleanup
+
+- When `JFS_RUN9_SUPERVISOR_RECORD` is set, the background mount supervisor writes its pid + starttime to that record file before launching the child mount process. run9rt uses that identity to kill the supervisor if startup later fails before a normal `umount-finalize` path can prove and clean it up.
+
+Related files:
+
+- `cmd/mount.go`
+- `cmd/mount_run9_supervisor_record_fork.go`
+- `cmd/mount_run9_supervisor_record_fork_test.go`
 
 ### Umount with Finalize Semantics
 
