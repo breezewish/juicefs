@@ -2022,14 +2022,15 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
 	m.freeMu.Lock()
 	defer m.freeMu.Unlock()
-	run9NextChunkLimit, err := m.en.getCounter("run9NextChunkLimit")
-	if err != nil {
-		return errno(err)
-	}
-	if run9NextChunkLimit > 0 && m.freeSlices.next >= uint64(run9NextChunkLimit) {
-		return syscall.ENOSPC
-	}
 	if m.freeSlices.next >= m.freeSlices.maxid {
+		// Fork divergence: run9 clamps each Badger mount with ?nextchunk to one slice-id epoch.
+		run9NextChunkLimit, err := m.en.getCounter("run9NextChunkLimit")
+		if err != nil {
+			return errno(err)
+		}
+		if run9NextChunkLimit > 0 && m.freeSlices.next >= uint64(run9NextChunkLimit) {
+			return syscall.ENOSPC
+		}
 		v, err := m.en.incrCounter("nextChunk", sliceIdBatch)
 		if err != nil {
 			return errno(err)
