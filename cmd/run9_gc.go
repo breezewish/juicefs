@@ -7,11 +7,11 @@ import (
 	"math"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/urfave/cli/v2"
@@ -56,11 +56,7 @@ type run9GCLineageObjectsOutput struct {
 	HasMore        bool   `json:"has_more"`
 }
 
-type run9ParsedObjectBlock struct {
-	SliceID    uint64
-	BlockIndex uint64
-	BlockSize  uint64
-}
+type run9ParsedObjectBlock = chunk.ObjectBlockKey
 
 func cmdRun9ListLiveSlices() *cli.Command {
 	return &cli.Command{
@@ -315,64 +311,14 @@ func parseRun9ObjectBlockKey(key string, layout run9ObjectLayout) (run9ParsedObj
 	if err := layout.validate(); err != nil {
 		return run9ParsedObjectBlock{}, false
 	}
-	parts := strings.Split(key, "/")
-	if layout.HashPrefix {
-		if len(parts) != 4 || parts[0] != "chunks" {
-			return run9ParsedObjectBlock{}, false
-		}
-		sliceID, blockIndex, blockSize, ok := parseRun9ObjectBlockName(parts[3])
-		if !ok {
-			return run9ParsedObjectBlock{}, false
-		}
-		if parts[1] != fmt.Sprintf("%02X", sliceID%256) {
-			return run9ParsedObjectBlock{}, false
-		}
-		if parts[2] != strconv.FormatUint(sliceID/1000/1000, 10) {
-			return run9ParsedObjectBlock{}, false
-		}
-		if blockSize == 0 || blockSize > uint64(layout.BlockSizeBytes) {
-			return run9ParsedObjectBlock{}, false
-		}
-		return run9ParsedObjectBlock{SliceID: sliceID, BlockIndex: blockIndex, BlockSize: blockSize}, true
-	}
-
-	if len(parts) != 4 || parts[0] != "chunks" {
-		return run9ParsedObjectBlock{}, false
-	}
-	sliceID, blockIndex, blockSize, ok := parseRun9ObjectBlockName(parts[3])
+	block, ok := chunk.ParseObjectBlockKey(key, layout.HashPrefix)
 	if !ok {
 		return run9ParsedObjectBlock{}, false
 	}
-	if parts[1] != strconv.FormatUint(sliceID/1000/1000, 10) {
+	if block.BlockSize == 0 || block.BlockSize > uint64(layout.BlockSizeBytes) {
 		return run9ParsedObjectBlock{}, false
 	}
-	if parts[2] != strconv.FormatUint(sliceID/1000, 10) {
-		return run9ParsedObjectBlock{}, false
-	}
-	if blockSize == 0 || blockSize > uint64(layout.BlockSizeBytes) {
-		return run9ParsedObjectBlock{}, false
-	}
-	return run9ParsedObjectBlock{SliceID: sliceID, BlockIndex: blockIndex, BlockSize: blockSize}, true
-}
-
-func parseRun9ObjectBlockName(name string) (sliceID uint64, blockIndex uint64, blockSize uint64, ok bool) {
-	parts := strings.Split(name, "_")
-	if len(parts) != 3 {
-		return 0, 0, 0, false
-	}
-	sliceID, err := strconv.ParseUint(parts[0], 10, 64)
-	if err != nil {
-		return 0, 0, 0, false
-	}
-	blockIndex, err = strconv.ParseUint(parts[1], 10, 64)
-	if err != nil {
-		return 0, 0, 0, false
-	}
-	blockSize, err = strconv.ParseUint(parts[2], 10, 64)
-	if err != nil {
-		return 0, 0, 0, false
-	}
-	return sliceID, blockIndex, blockSize, true
+	return block, true
 }
 
 func run9ObjectBlockProtected(

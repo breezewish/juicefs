@@ -609,11 +609,7 @@ func (cache *cacheStore) getCacheKey(key string) cacheKey {
 }
 
 func (cache *cacheStore) getPathFromKey(k cacheKey) string {
-	if cache.hashPrefix {
-		return fmt.Sprintf("chunks/%02X/%v/%v_%v_%v", k.id%256, k.id/1000/1000, k.id, k.indx, k.size)
-	} else {
-		return fmt.Sprintf("chunks/%v/%v/%v_%v_%v", k.id/1000/1000, k.id/1000, k.id, k.indx, k.size)
-	}
+	return FormatObjectBlockKey(k.id, uint64(k.indx), uint64(k.size), cache.hashPrefix)
 }
 
 func (cache *cacheStore) remove(key string, staging bool) {

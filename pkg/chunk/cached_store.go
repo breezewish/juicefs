@@ -72,10 +72,7 @@ func (s *rSlice) blockSize(indx int) int {
 }
 
 func (s *rSlice) key(indx int) string {
-	if s.store.conf.HashPrefix {
-		return fmt.Sprintf("chunks/%02X/%v/%v_%v_%v", s.id%256, s.id/1000/1000, s.id, indx, s.blockSize(indx))
-	}
-	return fmt.Sprintf("chunks/%v/%v/%v_%v_%v", s.id/1000/1000, s.id/1000, s.id, indx, s.blockSize(indx))
+	return FormatObjectBlockKey(s.id, uint64(indx), uint64(s.blockSize(indx)), s.store.conf.HashPrefix)
 }
 
 func (s *rSlice) index(off int) int {
