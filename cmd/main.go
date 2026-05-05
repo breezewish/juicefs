@@ -84,6 +84,8 @@ func Main(args []string) error {
 			cmdSync(),
 			cmdDebug(),
 			cmdClone(),
+			cmdRun9ListLiveSlices(),
+			cmdRun9GCLineageObjects(),
 			cmdSummary(),
 			cmdCompact(),
 		},

@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -293,7 +294,14 @@ func newBadgerClient(addr string) (tkvClient, error) {
 
 	if opts.overrideNextChunk {
 		if err := client.Update(func(txn *badger.Txn) error {
-			return txn.Set([]byte("CnextChunk"), packCounter(opts.nextChunkValue))
+			if err := txn.Set([]byte("CnextChunk"), packCounter(opts.nextChunkValue)); err != nil {
+				return err
+			}
+			limit := opts.nextChunkValue + (1 << 32)
+			if opts.nextChunkValue > math.MaxInt64-(1<<32) {
+				limit = math.MaxInt64
+			}
+			return txn.Set([]byte("Crun9NextChunkLimit"), packCounter(limit))
 		}); err != nil {
 			_ = client.Close()
 			return nil, fmt.Errorf("failed to set nextchunk to %d: %w", opts.nextChunkValue, err)

@@ -5,6 +5,7 @@ package meta
 
 import (
 	"fmt"
+	"syscall"
 	"testing"
 )
 
@@ -38,6 +39,13 @@ func TestBadgerNextChunkOverride(t *testing.T) {
 	if got != override {
 		t.Fatalf("expected nextChunk %d, got %d", override, got)
 	}
+	limit, err := kv2.getCounter("run9NextChunkLimit")
+	if err != nil {
+		t.Fatalf("get run9NextChunkLimit: %s", err)
+	}
+	if limit != override+(1<<32) {
+		t.Fatalf("expected run9NextChunkLimit %d, got %d", override+(1<<32), limit)
+	}
 	if err := m2.Shutdown(); err != nil {
 		t.Fatalf("shutdown meta: %s", err)
 	}
@@ -58,6 +66,47 @@ func TestBadgerNextChunkOverride(t *testing.T) {
 		t.Fatalf("expected persisted nextChunk %d, got %d", override, got)
 	}
 	if err := m3.Shutdown(); err != nil {
+		t.Fatalf("shutdown meta: %s", err)
+	}
+}
+
+func TestBadgerNextChunkLimitRejectsNewSlicePastLimit(t *testing.T) {
+	dir := t.TempDir()
+
+	m1, err := newKVMeta("badger", dir, testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	if err := m1.Init(testFormat(), false); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+	if err := m1.Shutdown(); err != nil {
+		t.Fatalf("shutdown meta: %s", err)
+	}
+
+	override := int64(12345)
+	m2, err := newKVMeta("badger", fmt.Sprintf("%s?nextchunk=%d", dir, override), testConfig())
+	if err != nil {
+		t.Fatalf("create meta with nextchunk: %s", err)
+	}
+	if _, err := m2.Load(false); err != nil {
+		t.Fatalf("load formatted meta: %s", err)
+	}
+	kv2 := m2.(*kvMeta)
+	if err := kv2.setValue(kv2.counterKey("run9NextChunkLimit"), packCounter(override+1)); err != nil {
+		t.Fatalf("set run9NextChunkLimit: %s", err)
+	}
+	var id uint64
+	if st := m2.NewSlice(Background(), &id); st != 0 {
+		t.Fatalf("first NewSlice: %s", st)
+	}
+	if id != uint64(override) {
+		t.Fatalf("expected first slice %d, got %d", override, id)
+	}
+	if st := m2.NewSlice(Background(), &id); st != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC after crossing epoch range, got %s", st)
+	}
+	if err := m2.Shutdown(); err != nil {
 		t.Fatalf("shutdown meta: %s", err)
 	}
 }

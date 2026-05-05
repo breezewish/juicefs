@@ -29,12 +29,15 @@ Related files:
 
 - Accept `badger://path?nextchunk=<n>` as the metadata address. Only the query param `nextchunk` is supported. When `nextchunk` is set, it overrides the value of `CnextChunk`. Overriding `CnextChunk` is the core of ensuring forked metadata will not conflict with the original metadata when both are mounted. `nextchunk` is allowed to be set to any value. The caller is responsible for ensuring the value is properly set to avoid conflicts. If `nextchunk` is not set, it means nextchunk will not be overridden (upstream original behavior is preserved).
 
+- When `nextchunk` is set, run9 also writes `Crun9NextChunkLimit` and rejects `NewSlice` after that mount's epoch range is exhausted. This makes each run9 mount own exactly one slice-id epoch range.
+
 - A customized Badger dependency to support SkipWAL.
 
 - run9 forces badger `ValueLogFileSize` down to `64 MiB` when opening metadata. run9 keeps badger directories inside the shared_meta JuiceFS mount, and the upstream `1 GiB` default preallocates `2 GiB` `*.vlog` files. In production this has surfaced as dangling vlog entries and `DB.Close` truncate `ENOENT` on the outer JuiceFS/FUSE layer during finalize, so run9 keeps the value logs small to stay on the boring path.
 
 Related files:
 
+- `pkg/meta/base.go`
 - `pkg/meta/tkv_badger.go`
 - `pkg/meta/tkv_badger_nextchunk_test.go`
 - `pkg/meta/tkv_badger_options_test.go`
@@ -125,6 +128,18 @@ Related files:
 - `cmd/umount_finalize_fork_linux_test.go`
 - `cmd/mount_finalize_fork_linux_test.go`
 - `pkg/chunk/cached_store_finalize_fork_test.go`
+
+### Run9 Deleted Snap Object GC
+
+- Hidden internal commands `list-live-slices` and `gc-lineage-objects` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC.
+- `list-live-slices` reports the format name, object block layout, and current live slice ids/sizes from one metadata DB.
+- `gc-lineage-objects` scans only the loaded format prefix's `chunks/` objects and deletes blocks not protected by live slices, active epoch ranges, or future epoch ranges.
+
+Related files:
+
+- `cmd/main.go`
+- `cmd/run9_gc.go`
+- `cmd/run9_gc_test.go`
 
 ## Important: Isolating Divergences
 
