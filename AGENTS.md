@@ -131,9 +131,10 @@ Related files:
 
 ### Run9 Deleted Snap Object GC
 
-- Hidden internal commands `list-live-slices` and `gc-lineage-objects` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC.
-- `list-live-slices` reports the format name, object block layout, and current live slice ids/sizes from one metadata DB.
-- `gc-lineage-objects` scans only the loaded format prefix's `chunks/` objects and deletes blocks not protected by live slices, active epoch ranges, or future epoch ranges.
+- Hidden internal commands `list-live-slices`, `describe-format`, and `gc-exact-objects` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC V2.
+- `list-live-slices` reports the format name, object block layout, and slice ids/sizes from one metadata DB; run9rt passes `--scan-pending` when materializing owner epoch manifests or candidate discovery proofs.
+- `describe-format` reports the persisted object storage descriptor so run9rt can delete after candidate metadata has been removed.
+- `gc-exact-objects` deletes only the exact keys provided by run9rt under the loaded format prefix. It must not list `chunks/` or reopen snap metadata.
 
 Related files:
 

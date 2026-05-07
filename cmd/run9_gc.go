@@ -4,14 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 
-	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/urfave/cli/v2"
@@ -20,6 +18,20 @@ import (
 type run9ObjectLayout struct {
 	BlockSizeBytes int  `json:"block_size_bytes"`
 	HashPrefix     bool `json:"hash_prefix"`
+}
+
+type run9ObjectStorageDescriptor struct {
+	Storage      string `json:"storage"`
+	Bucket       string `json:"bucket"`
+	UUID         string `json:"uuid,omitempty"`
+	AccessKey    string `json:"access_key,omitempty"`
+	SecretKey    string `json:"secret_key,omitempty"`
+	SessionToken string `json:"session_token,omitempty"`
+	StorageClass string `json:"storage_class,omitempty"`
+	Shards       int    `json:"shards,omitempty"`
+	EncryptKey   string `json:"encrypt_key,omitempty"`
+	EncryptAlgo  string `json:"encrypt_algo,omitempty"`
+	KeyEncrypted bool   `json:"key_encrypted,omitempty"`
 }
 
 type run9LiveSlice struct {
@@ -34,29 +46,31 @@ type run9ListLiveSlicesOutput struct {
 	Slices            []run9LiveSlice  `json:"slices"`
 }
 
-type run9ProtectedRange struct {
-	Start        uint64 `json:"start"`
-	EndInclusive uint64 `json:"end_inclusive"`
+type run9DescribeFormatOutput struct {
+	OK                bool                        `json:"ok"`
+	JuiceFSFormatName string                      `json:"juicefs_format_name"`
+	ObjectLayout      run9ObjectLayout            `json:"object_layout"`
+	ObjectStorage     run9ObjectStorageDescriptor `json:"object_storage"`
 }
 
-type run9GCLineageObjectsRequest struct {
-	FormatMetaURL     string               `json:"format_meta_url"`
-	JuiceFSFormatName string               `json:"juicefs_format_name"`
-	ObjectLayout      run9ObjectLayout     `json:"object_layout"`
-	LiveSlices        []run9LiveSlice      `json:"live_slices"`
-	ProtectedRanges   []run9ProtectedRange `json:"protected_ranges"`
-	MaxDeleteObjects  uint64               `json:"max_delete_objects"`
-	Threads           int                  `json:"threads"`
+type run9GCExactObject struct {
+	Key  string `json:"key"`
+	Size uint64 `json:"size"`
 }
 
-type run9GCLineageObjectsOutput struct {
+type run9GCExactObjectsRequest struct {
+	JuiceFSFormatName string                      `json:"juicefs_format_name"`
+	ObjectLayout      run9ObjectLayout            `json:"object_layout"`
+	ObjectStorage     run9ObjectStorageDescriptor `json:"object_storage"`
+	Objects           []run9GCExactObject         `json:"objects"`
+	Threads           int                         `json:"threads"`
+}
+
+type run9GCExactObjectsOutput struct {
 	OK             bool   `json:"ok"`
 	DeletedObjects uint64 `json:"deleted_objects"`
 	DeletedBytes   uint64 `json:"deleted_bytes"`
-	HasMore        bool   `json:"has_more"`
 }
-
-type run9ParsedObjectBlock = chunk.ObjectBlockKey
 
 func cmdRun9ListLiveSlices() *cli.Command {
 	return &cli.Command{
@@ -64,9 +78,15 @@ func cmdRun9ListLiveSlices() *cli.Command {
 		Hidden:    true,
 		Usage:     "run9 internal: list live slice manifest data",
 		ArgsUsage: "META-URL",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "scan-pending",
+				Usage: "include pending deleted and delayed slices",
+			},
+		},
 		Action: func(ctx *cli.Context) error {
 			setup(ctx, 1)
-			out, err := run9ListLiveSlices(ctx.Context, ctx.Args().Get(0))
+			out, err := run9ListSlices(ctx.Context, ctx.Args().Get(0), ctx.Bool("scan-pending"))
 			if err != nil {
 				return err
 			}
@@ -75,11 +95,28 @@ func cmdRun9ListLiveSlices() *cli.Command {
 	}
 }
 
-func cmdRun9GCLineageObjects() *cli.Command {
+func cmdRun9DescribeFormat() *cli.Command {
 	return &cli.Command{
-		Name:   "gc-lineage-objects",
+		Name:      "describe-format",
+		Hidden:    true,
+		Usage:     "run9 internal: describe JuiceFS format storage",
+		ArgsUsage: "META-URL",
+		Action: func(ctx *cli.Context) error {
+			setup(ctx, 1)
+			out, err := run9DescribeFormat(ctx.Context, ctx.Args().Get(0))
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(out)
+		},
+	}
+}
+
+func cmdRun9GCExactObjects() *cli.Command {
+	return &cli.Command{
+		Name:   "gc-exact-objects",
 		Hidden: true,
-		Usage:  "run9 internal: delete unprotected lineage objects",
+		Usage:  "run9 internal: delete exact object keys",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:     "request",
@@ -93,11 +130,11 @@ func cmdRun9GCLineageObjects() *cli.Command {
 			if err != nil {
 				return fmt.Errorf("read request: %w", err)
 			}
-			var req run9GCLineageObjectsRequest
+			var req run9GCExactObjectsRequest
 			if err := json.Unmarshal(raw, &req); err != nil {
 				return fmt.Errorf("parse request: %w", err)
 			}
-			out, err := run9GCLineageObjects(ctx.Context, req)
+			out, err := run9GCExactObjects(ctx.Context, req)
 			if err != nil {
 				return err
 			}
@@ -107,6 +144,10 @@ func cmdRun9GCLineageObjects() *cli.Command {
 }
 
 func run9ListLiveSlices(ctx context.Context, metaURL string) (run9ListLiveSlicesOutput, error) {
+	return run9ListSlices(ctx, metaURL, false)
+}
+
+func run9ListSlices(ctx context.Context, metaURL string, scanPending bool) (run9ListLiveSlicesOutput, error) {
 	metaURL = strings.TrimSpace(metaURL)
 	if metaURL == "" {
 		return run9ListLiveSlicesOutput{}, fmt.Errorf("missing meta url")
@@ -125,7 +166,7 @@ func run9ListLiveSlices(ctx context.Context, metaURL string) (run9ListLiveSlices
 	defer m.CloseSession() //nolint:errcheck
 
 	slicesByInode := map[meta.Ino][]meta.Slice{}
-	if st := m.ListSlices(meta.WrapContext(ctx), slicesByInode, false, false, nil); st != 0 {
+	if st := m.ListSlices(meta.WrapContext(ctx), slicesByInode, scanPending, false, nil); st != 0 {
 		return run9ListLiveSlicesOutput{}, fmt.Errorf("list slices: %s", st)
 	}
 
@@ -160,67 +201,68 @@ func run9ListLiveSlices(ctx context.Context, metaURL string) (run9ListLiveSlices
 	}, nil
 }
 
-func run9GCLineageObjects(ctx context.Context, req run9GCLineageObjectsRequest) (run9GCLineageObjectsOutput, error) {
-	if strings.TrimSpace(req.FormatMetaURL) == "" {
-		return run9GCLineageObjectsOutput{}, fmt.Errorf("missing format_meta_url")
+func run9DescribeFormat(ctx context.Context, metaURL string) (run9DescribeFormatOutput, error) {
+	metaURL = strings.TrimSpace(metaURL)
+	if metaURL == "" {
+		return run9DescribeFormatOutput{}, fmt.Errorf("missing meta url")
 	}
+
+	metaConf := meta.DefaultConf()
+	metaConf.NoBGJob = true
+	m := meta.NewClient(metaURL, metaConf)
+	format, err := m.Load(true)
+	if err != nil {
+		return run9DescribeFormatOutput{}, fmt.Errorf("load setting: %w", err)
+	}
+	return run9DescribeFormatOutput{
+		OK:                true,
+		JuiceFSFormatName: format.Name,
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: format.BlockSize * 1024, HashPrefix: format.HashPrefix},
+		ObjectStorage:     run9ObjectStorageDescriptorFromFormat(*format),
+	}, nil
+}
+
+func run9GCExactObjects(ctx context.Context, req run9GCExactObjectsRequest) (run9GCExactObjectsOutput, error) {
 	if strings.TrimSpace(req.JuiceFSFormatName) == "" {
-		return run9GCLineageObjectsOutput{}, fmt.Errorf("missing juicefs_format_name")
+		return run9GCExactObjectsOutput{}, fmt.Errorf("missing juicefs_format_name")
 	}
 	if err := req.ObjectLayout.validate(); err != nil {
-		return run9GCLineageObjectsOutput{}, err
+		return run9GCExactObjectsOutput{}, err
 	}
-	if req.MaxDeleteObjects == 0 {
-		return run9GCLineageObjectsOutput{}, fmt.Errorf("max_delete_objects must be greater than 0")
+	if err := req.ObjectStorage.validate(); err != nil {
+		return run9GCExactObjectsOutput{}, err
 	}
 	threads := req.Threads
 	if threads <= 0 {
 		threads = 1
 	}
+	for _, obj := range req.Objects {
+		if strings.TrimSpace(obj.Key) == "" {
+			return run9GCExactObjectsOutput{}, fmt.Errorf("object key must not be empty")
+		}
+	}
+	if len(req.Objects) == 0 {
+		return run9GCExactObjectsOutput{OK: true}, nil
+	}
 
-	metaConf := meta.DefaultConf()
-	metaConf.NoBGJob = true
-	m := meta.NewClient(strings.TrimSpace(req.FormatMetaURL), metaConf)
-	format, err := m.Load(true)
-	if err != nil {
-		return run9GCLineageObjectsOutput{}, fmt.Errorf("load setting: %w", err)
+	if req.ObjectLayout.BlockSizeBytes%1024 != 0 {
+		return run9GCExactObjectsOutput{}, fmt.Errorf("object_layout.block_size_bytes must be KiB-aligned")
 	}
-	if format.Name != req.JuiceFSFormatName {
-		return run9GCLineageObjectsOutput{}, fmt.Errorf("format name mismatch: loaded %q request %q", format.Name, req.JuiceFSFormatName)
-	}
+	format := req.ObjectStorage.toFormat(req.JuiceFSFormatName)
+	format.BlockSize = req.ObjectLayout.BlockSizeBytes / 1024
+	format.HashPrefix = req.ObjectLayout.HashPrefix
 	if format.BlockSize*1024 != req.ObjectLayout.BlockSizeBytes || format.HashPrefix != req.ObjectLayout.HashPrefix {
-		return run9GCLineageObjectsOutput{}, fmt.Errorf("object layout mismatch with loaded format")
+		return run9GCExactObjectsOutput{}, fmt.Errorf("object layout mismatch with descriptor")
 	}
-
-	blob, err := createStorage(*format)
+	blob, err := createStorage(format)
 	if err != nil {
-		return run9GCLineageObjectsOutput{}, fmt.Errorf("object storage: %w", err)
+		return run9GCExactObjectsOutput{}, fmt.Errorf("object storage: %w", err)
 	}
 	defer object.Shutdown(blob)
 
-	protectedSlices := map[uint64]uint32{}
-	for _, s := range req.LiveSlices {
-		if s.Size == 0 {
-			continue
-		}
-		if existing := protectedSlices[s.ID]; existing < s.Size {
-			protectedSlices[s.ID] = s.Size
-		}
-	}
-	ranges := normalizedRun9Ranges(req.ProtectedRanges)
-
-	listCtx, cancelList := context.WithCancel(ctx)
-	defer cancelList()
-
-	objs, err := object.ListAll(listCtx, blob, "chunks/", "", true, true)
-	if err != nil {
-		return run9GCLineageObjectsOutput{}, fmt.Errorf("list lineage objects: %w", err)
-	}
-
-	deleteJobs := make(chan object.Object)
+	deleteJobs := make(chan run9GCExactObject)
 	var deletedObjects atomic.Uint64
 	var deletedBytes atomic.Uint64
-	var scheduledDeletes atomic.Uint64
 	var firstDeleteErr error
 	var firstDeleteErrMu sync.Mutex
 	var wg sync.WaitGroup
@@ -235,68 +277,43 @@ func run9GCLineageObjects(ctx context.Context, req run9GCLineageObjectsRequest) 
 				if hasDeleteErr {
 					continue
 				}
-				if err := blob.Delete(ctx, obj.Key()); err != nil {
+				if err := blob.Delete(ctx, obj.Key); err != nil {
 					firstDeleteErrMu.Lock()
 					if firstDeleteErr == nil {
 						firstDeleteErr = err
 					}
 					firstDeleteErrMu.Unlock()
-					cancelList()
 					continue
 				}
 				deletedObjects.Add(1)
-				if obj.Size() > 0 {
-					deletedBytes.Add(uint64(obj.Size()))
-				}
+				deletedBytes.Add(obj.Size)
 			}
 		}()
 	}
-
-	hasMore := false
-	for obj := range objs {
-		if obj == nil {
-			close(deleteJobs)
-			wg.Wait()
-			return run9GCLineageObjectsOutput{}, fmt.Errorf("list lineage objects failed")
-		}
-		if obj.IsDir() {
-			continue
-		}
+	for _, obj := range req.Objects {
 		firstDeleteErrMu.Lock()
 		hasDeleteErr := firstDeleteErr != nil
 		firstDeleteErrMu.Unlock()
 		if hasDeleteErr {
 			break
 		}
-		parsed, ok := parseRun9ObjectBlockKey(obj.Key(), req.ObjectLayout)
-		if !ok {
-			continue
+		select {
+		case <-ctx.Done():
+			close(deleteJobs)
+			wg.Wait()
+			return run9GCExactObjectsOutput{}, ctx.Err()
+		case deleteJobs <- obj:
 		}
-		if run9ObjectBlockProtected(parsed, req.ObjectLayout.BlockSizeBytes, protectedSlices, ranges) {
-			continue
-		}
-		if scheduledDeletes.Add(1) > req.MaxDeleteObjects {
-			hasMore = true
-			cancelList()
-			break
-		}
-		deleteJobs <- obj
 	}
 	close(deleteJobs)
 	wg.Wait()
-
 	if firstDeleteErr != nil {
-		return run9GCLineageObjectsOutput{}, fmt.Errorf("delete lineage object: %w", firstDeleteErr)
+		return run9GCExactObjectsOutput{}, fmt.Errorf("delete exact object: %w", firstDeleteErr)
 	}
-
-	if deletedObjects.Load() >= req.MaxDeleteObjects {
-		hasMore = true
-	}
-	return run9GCLineageObjectsOutput{
+	return run9GCExactObjectsOutput{
 		OK:             true,
 		DeletedObjects: deletedObjects.Load(),
 		DeletedBytes:   deletedBytes.Load(),
-		HasMore:        hasMore,
 	}, nil
 }
 
@@ -307,92 +324,48 @@ func (l run9ObjectLayout) validate() error {
 	return nil
 }
 
-func parseRun9ObjectBlockKey(key string, layout run9ObjectLayout) (run9ParsedObjectBlock, bool) {
-	if err := layout.validate(); err != nil {
-		return run9ParsedObjectBlock{}, false
+func (d run9ObjectStorageDescriptor) validate() error {
+	if strings.TrimSpace(d.Storage) == "" {
+		return fmt.Errorf("object_storage.storage must not be empty")
 	}
-	block, ok := chunk.ParseObjectBlockKey(key, layout.HashPrefix)
-	if !ok {
-		return run9ParsedObjectBlock{}, false
+	if strings.TrimSpace(d.Bucket) == "" {
+		return fmt.Errorf("object_storage.bucket must not be empty")
 	}
-	if block.BlockSize == 0 || block.BlockSize > uint64(layout.BlockSizeBytes) {
-		return run9ParsedObjectBlock{}, false
+	if d.SecretKey == "removed" || d.SessionToken == "removed" || d.EncryptKey == "removed" {
+		return fmt.Errorf("object_storage contains removed secret")
 	}
-	return block, true
+	return nil
 }
 
-func run9ObjectBlockProtected(
-	block run9ParsedObjectBlock,
-	blockSizeBytes int,
-	liveSlices map[uint64]uint32,
-	ranges []run9ProtectedRange,
-) bool {
-	for _, r := range ranges {
-		if block.SliceID >= r.Start && block.SliceID <= r.EndInclusive {
-			return true
-		}
+func run9ObjectStorageDescriptorFromFormat(format meta.Format) run9ObjectStorageDescriptor {
+	return run9ObjectStorageDescriptor{
+		Storage:      format.Storage,
+		Bucket:       format.Bucket,
+		UUID:         format.UUID,
+		AccessKey:    format.AccessKey,
+		SecretKey:    format.SecretKey,
+		SessionToken: format.SessionToken,
+		StorageClass: format.StorageClass,
+		Shards:       format.Shards,
+		EncryptKey:   format.EncryptKey,
+		EncryptAlgo:  format.EncryptAlgo,
+		KeyEncrypted: format.KeyEncrypted,
 	}
-
-	sliceSize := uint64(liveSlices[block.SliceID])
-	if sliceSize == 0 {
-		return false
-	}
-	formatBlockSize := uint64(blockSizeBytes)
-	lastBlockIndex := (sliceSize - 1) / formatBlockSize
-	if block.BlockIndex > lastBlockIndex {
-		return false
-	}
-	expectedSize := formatBlockSize
-	if block.BlockIndex == lastBlockIndex {
-		expectedSize = sliceSize - block.BlockIndex*formatBlockSize
-	}
-	return block.BlockSize == expectedSize
 }
 
-func normalizedRun9Ranges(input []run9ProtectedRange) []run9ProtectedRange {
-	ranges := make([]run9ProtectedRange, 0, len(input))
-	for _, r := range input {
-		if r.Start > r.EndInclusive {
-			continue
-		}
-		ranges = append(ranges, r)
+func (d run9ObjectStorageDescriptor) toFormat(name string) meta.Format {
+	return meta.Format{
+		Name:         name,
+		UUID:         d.UUID,
+		Storage:      d.Storage,
+		Bucket:       d.Bucket,
+		AccessKey:    d.AccessKey,
+		SecretKey:    d.SecretKey,
+		SessionToken: d.SessionToken,
+		StorageClass: d.StorageClass,
+		Shards:       d.Shards,
+		EncryptKey:   d.EncryptKey,
+		EncryptAlgo:  d.EncryptAlgo,
+		KeyEncrypted: d.KeyEncrypted,
 	}
-	sort.Slice(ranges, func(i, j int) bool {
-		if ranges[i].Start != ranges[j].Start {
-			return ranges[i].Start < ranges[j].Start
-		}
-		return ranges[i].EndInclusive < ranges[j].EndInclusive
-	})
-	merged := ranges[:0]
-	for _, r := range ranges {
-		if len(merged) == 0 {
-			merged = append(merged, r)
-			continue
-		}
-		last := &merged[len(merged)-1]
-		if last.EndInclusive != math.MaxUint64 && r.Start <= last.EndInclusive+1 {
-			if r.EndInclusive > last.EndInclusive {
-				last.EndInclusive = r.EndInclusive
-			}
-			continue
-		}
-		merged = append(merged, r)
-	}
-	return merged
-}
-
-func run9SliceEpochRange(epoch uint64) run9ProtectedRange {
-	start := epoch << 32
-	if epoch >= math.MaxUint32 {
-		return run9ProtectedRange{Start: start, EndInclusive: math.MaxUint64}
-	}
-	return run9ProtectedRange{Start: start, EndInclusive: ((epoch + 1) << 32) - 1}
-}
-
-func run9FutureEpochRange(lastAllocatedEpoch uint64) (run9ProtectedRange, bool) {
-	if lastAllocatedEpoch >= math.MaxUint32 {
-		return run9ProtectedRange{}, false
-	}
-	start := (lastAllocatedEpoch + 1) << 32
-	return run9ProtectedRange{Start: start, EndInclusive: math.MaxUint64}, true
 }
