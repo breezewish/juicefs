@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -237,8 +238,8 @@ func run9GCExactObjects(ctx context.Context, req run9GCExactObjectsRequest) (run
 		threads = 1
 	}
 	for _, obj := range req.Objects {
-		if strings.TrimSpace(obj.Key) == "" {
-			return run9GCExactObjectsOutput{}, fmt.Errorf("object key must not be empty")
+		if err := validateRun9ExactObjectKey(obj.Key); err != nil {
+			return run9GCExactObjectsOutput{}, err
 		}
 	}
 	if len(req.Objects) == 0 {
@@ -315,6 +316,19 @@ func run9GCExactObjects(ctx context.Context, req run9GCExactObjectsRequest) (run
 		DeletedObjects: deletedObjects.Load(),
 		DeletedBytes:   deletedBytes.Load(),
 	}, nil
+}
+
+func validateRun9ExactObjectKey(key string) error {
+	if strings.TrimSpace(key) == "" {
+		return fmt.Errorf("object key must not be empty")
+	}
+	if key != strings.TrimSpace(key) || strings.HasPrefix(key, "/") || strings.Contains(key, "\\") || path.Clean(key) != key {
+		return fmt.Errorf("object key must be a normalized relative path: %q", key)
+	}
+	if !strings.HasPrefix(key, "chunks/") {
+		return fmt.Errorf("object key must be under chunks/: %q", key)
+	}
+	return nil
 }
 
 func (l run9ObjectLayout) validate() error {

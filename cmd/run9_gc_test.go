@@ -66,3 +66,23 @@ func TestRun9GCExactObjectsRejectsRemovedSecret(t *testing.T) {
 
 	require.ErrorContains(t, err, "removed secret")
 }
+
+func TestRun9GCExactObjectsRejectsEscapingKey(t *testing.T) {
+	bucket := t.TempDir()
+	outsidePath := filepath.Join(bucket, "other")
+	require.NoError(t, os.WriteFile(outsidePath, []byte("keep"), 0o644))
+
+	_, err := run9GCExactObjects(context.Background(), run9GCExactObjectsRequest{
+		JuiceFSFormatName: "fmtroot",
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: 4096},
+		ObjectStorage: run9ObjectStorageDescriptor{
+			Storage: "file",
+			Bucket:  bucket + string(os.PathSeparator),
+		},
+		Objects: []run9GCExactObject{{Key: "chunks/../../other", Size: 4}},
+		Threads: 1,
+	})
+
+	require.ErrorContains(t, err, "normalized relative path")
+	require.FileExists(t, outsidePath)
+}
