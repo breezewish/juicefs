@@ -128,7 +128,7 @@ func TestDeleteRun9ExactObjectsUsesBulkDeleteWhenSupported(t *testing.T) {
 	require.Equal(t, uint64(1001), deletedBytes)
 	require.Empty(t, store.deleteCalls)
 	require.Len(t, store.bulkCalls, 2)
-	require.Len(t, store.bulkCalls[0], run9GCExactObjectsBulkDeleteBatchSize)
+	require.Len(t, store.bulkCalls[0], run9GCExactObjectsMaxBulkDeleteBatchSize)
 	require.Len(t, store.bulkCalls[1], 1)
 	require.Equal(t, "chunks/0/0/0000_0_1", store.bulkCalls[0][0])
 }
@@ -184,4 +184,10 @@ func TestDeleteRun9ExactObjectsRunsBulkBatchesConcurrently(t *testing.T) {
 	require.Equal(t, uint64(2000), deletedObjects)
 	require.Equal(t, uint64(2000), deletedBytes)
 	require.Equal(t, 2, store.maxActive)
+}
+
+func TestBulkDeleteBatchSizeUsesConfiguredThreadsForSmallBatches(t *testing.T) {
+	require.Equal(t, 63, run9GCExactObjectsBulkDeleteBatchSize(1000, 16))
+	require.Equal(t, 1000, run9GCExactObjectsBulkDeleteBatchSize(100_000, 16))
+	require.Equal(t, 1000, run9GCExactObjectsBulkDeleteBatchSize(1000, 1))
 }

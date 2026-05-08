@@ -73,7 +73,24 @@ type run9GCExactObjectsOutput struct {
 	DeletedBytes   uint64 `json:"deleted_bytes"`
 }
 
-const run9GCExactObjectsBulkDeleteBatchSize = 1000
+const run9GCExactObjectsMaxBulkDeleteBatchSize = 1000
+
+func run9GCExactObjectsBulkDeleteBatchSize(objectCount int, threads int) int {
+	if objectCount <= 0 {
+		return 0
+	}
+	if threads <= 1 {
+		return run9GCExactObjectsMaxBulkDeleteBatchSize
+	}
+	batchSize := (objectCount + threads - 1) / threads
+	if batchSize < 1 {
+		return 1
+	}
+	if batchSize > run9GCExactObjectsMaxBulkDeleteBatchSize {
+		return run9GCExactObjectsMaxBulkDeleteBatchSize
+	}
+	return batchSize
+}
 
 func cmdRun9ListLiveSlices() *cli.Command {
 	return &cli.Command{
@@ -296,6 +313,7 @@ func deleteRun9ExactObjectsBulk(ctx context.Context, store run9GCExactObjectsBul
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	batchSize := run9GCExactObjectsBulkDeleteBatchSize(len(objects), threads)
 	deleteJobs := make(chan []run9GCExactObject)
 	var deletedObjects atomic.Uint64
 	var deletedBytes atomic.Uint64
@@ -334,14 +352,14 @@ func deleteRun9ExactObjectsBulk(ctx context.Context, store run9GCExactObjectsBul
 			}
 		}()
 	}
-	for start := 0; start < len(objects); start += run9GCExactObjectsBulkDeleteBatchSize {
+	for start := 0; start < len(objects); start += batchSize {
 		firstDeleteErrMu.Lock()
 		hasDeleteErr := firstDeleteErr != nil
 		firstDeleteErrMu.Unlock()
 		if hasDeleteErr {
 			break
 		}
-		end := start + run9GCExactObjectsBulkDeleteBatchSize
+		end := start + batchSize
 		if end > len(objects) {
 			end = len(objects)
 		}
