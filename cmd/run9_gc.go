@@ -279,42 +279,89 @@ type run9GCExactObjectsBulkDeleteStorage interface {
 }
 
 func deleteRun9ExactObjects(ctx context.Context, store object.ObjectStorage, objects []run9GCExactObject, threads int) (uint64, uint64, error) {
+	if threads <= 0 {
+		threads = 1
+	}
 	if object.SupportsBulkDelete(store) {
 		bulk, ok := store.(run9GCExactObjectsBulkDeleteStorage)
 		if !ok {
 			return 0, 0, fmt.Errorf("bulk delete unsupported by %T", store)
 		}
-		return deleteRun9ExactObjectsBulk(ctx, bulk, objects)
+		return deleteRun9ExactObjectsBulk(ctx, bulk, objects, threads)
 	}
 	return deleteRun9ExactObjectsSequential(ctx, store, objects, threads)
 }
 
-func deleteRun9ExactObjectsBulk(ctx context.Context, store run9GCExactObjectsBulkDeleteStorage, objects []run9GCExactObject) (uint64, uint64, error) {
-	var deletedObjects uint64
-	var deletedBytes uint64
+func deleteRun9ExactObjectsBulk(ctx context.Context, store run9GCExactObjectsBulkDeleteStorage, objects []run9GCExactObject, threads int) (uint64, uint64, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	deleteJobs := make(chan []run9GCExactObject)
+	var deletedObjects atomic.Uint64
+	var deletedBytes atomic.Uint64
+	var firstDeleteErr error
+	var firstDeleteErrMu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range deleteJobs {
+				firstDeleteErrMu.Lock()
+				hasDeleteErr := firstDeleteErr != nil
+				firstDeleteErrMu.Unlock()
+				if hasDeleteErr {
+					continue
+				}
+
+				keys := make([]string, 0, len(batch))
+				var batchBytes uint64
+				for _, obj := range batch {
+					keys = append(keys, obj.Key)
+					batchBytes += obj.Size
+				}
+				if err := store.DeleteObjects(ctx, keys); err != nil {
+					firstDeleteErrMu.Lock()
+					if firstDeleteErr == nil {
+						firstDeleteErr = err
+						cancel()
+					}
+					firstDeleteErrMu.Unlock()
+					continue
+				}
+				deletedObjects.Add(uint64(len(keys)))
+				deletedBytes.Add(batchBytes)
+			}
+		}()
+	}
 	for start := 0; start < len(objects); start += run9GCExactObjectsBulkDeleteBatchSize {
-		select {
-		case <-ctx.Done():
-			return 0, 0, ctx.Err()
-		default:
+		firstDeleteErrMu.Lock()
+		hasDeleteErr := firstDeleteErr != nil
+		firstDeleteErrMu.Unlock()
+		if hasDeleteErr {
+			break
 		}
 		end := start + run9GCExactObjectsBulkDeleteBatchSize
 		if end > len(objects) {
 			end = len(objects)
 		}
-		keys := make([]string, 0, end-start)
-		var batchBytes uint64
-		for _, obj := range objects[start:end] {
-			keys = append(keys, obj.Key)
-			batchBytes += obj.Size
+		select {
+		case <-ctx.Done():
+			close(deleteJobs)
+			wg.Wait()
+			if firstDeleteErr != nil {
+				return 0, 0, firstDeleteErr
+			}
+			return 0, 0, ctx.Err()
+		case deleteJobs <- objects[start:end]:
 		}
-		if err := store.DeleteObjects(ctx, keys); err != nil {
-			return 0, 0, err
-		}
-		deletedObjects += uint64(len(keys))
-		deletedBytes += batchBytes
 	}
-	return deletedObjects, deletedBytes, nil
+	close(deleteJobs)
+	wg.Wait()
+	if firstDeleteErr != nil {
+		return 0, 0, firstDeleteErr
+	}
+	return deletedObjects.Load(), deletedBytes.Load(), nil
 }
 
 func deleteRun9ExactObjectsSequential(ctx context.Context, store object.ObjectStorage, objects []run9GCExactObject, threads int) (uint64, uint64, error) {

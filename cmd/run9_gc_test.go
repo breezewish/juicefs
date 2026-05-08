@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/stretchr/testify/require"
@@ -91,16 +93,21 @@ func TestRun9GCExactObjectsRejectsEscapingKey(t *testing.T) {
 
 type fakeRun9GCExactObjectsBulkDeleteStore struct {
 	object.ObjectStorage
+	mu          sync.Mutex
 	bulkCalls   [][]string
 	deleteCalls []string
 }
 
 func (f *fakeRun9GCExactObjectsBulkDeleteStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, key)
 	return nil
 }
 
 func (f *fakeRun9GCExactObjectsBulkDeleteStore) DeleteObjects(ctx context.Context, keys []string, getters ...object.AttrGetter) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.bulkCalls = append(f.bulkCalls, append([]string(nil), keys...))
 	return nil
 }
@@ -115,7 +122,7 @@ func TestDeleteRun9ExactObjectsUsesBulkDeleteWhenSupported(t *testing.T) {
 		objects[i] = run9GCExactObject{Key: fmt.Sprintf("0/0/%04d_0_1", i), Size: 1}
 	}
 
-	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(context.Background(), wrapped, objects, 4)
+	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(context.Background(), wrapped, objects, 1)
 	require.NoError(t, err)
 	require.Equal(t, uint64(1001), deletedObjects)
 	require.Equal(t, uint64(1001), deletedBytes)
@@ -124,4 +131,57 @@ func TestDeleteRun9ExactObjectsUsesBulkDeleteWhenSupported(t *testing.T) {
 	require.Len(t, store.bulkCalls[0], run9GCExactObjectsBulkDeleteBatchSize)
 	require.Len(t, store.bulkCalls[1], 1)
 	require.Equal(t, "chunks/0/0/0000_0_1", store.bulkCalls[0][0])
+}
+
+type fakeRun9GCExactObjectsConcurrentBulkDeleteStore struct {
+	object.ObjectStorage
+	mu          sync.Mutex
+	active      int
+	maxActive   int
+	overlapped  chan struct{}
+	overlapOnce sync.Once
+}
+
+func (f *fakeRun9GCExactObjectsConcurrentBulkDeleteStore) DeleteObjects(ctx context.Context, keys []string, getters ...object.AttrGetter) error {
+	f.mu.Lock()
+	f.active++
+	if f.active > f.maxActive {
+		f.maxActive = f.active
+	}
+	if f.maxActive == 2 {
+		f.overlapOnce.Do(func() { close(f.overlapped) })
+	}
+	f.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-f.overlapped:
+	case <-time.After(500 * time.Millisecond):
+		return fmt.Errorf("bulk delete batches did not run concurrently")
+	}
+
+	f.mu.Lock()
+	f.active--
+	f.mu.Unlock()
+	return nil
+}
+
+func TestDeleteRun9ExactObjectsRunsBulkBatchesConcurrently(t *testing.T) {
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	store := &fakeRun9GCExactObjectsConcurrentBulkDeleteStore{
+		ObjectStorage: base,
+		overlapped:    make(chan struct{}),
+	}
+	objects := make([]run9GCExactObject, 2000)
+	for i := range objects {
+		objects[i] = run9GCExactObject{Key: fmt.Sprintf("chunks/0/0/%04d_0_1", i), Size: 1}
+	}
+
+	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(context.Background(), store, objects, 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2000), deletedObjects)
+	require.Equal(t, uint64(2000), deletedBytes)
+	require.Equal(t, 2, store.maxActive)
 }
