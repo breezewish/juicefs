@@ -133,6 +133,35 @@ func TestDeleteRun9ExactObjectsUsesBulkDeleteWhenSupported(t *testing.T) {
 	require.Equal(t, "chunks/0/0/0000_0_1", store.bulkCalls[0][0])
 }
 
+type fakeRun9GCExactObjectsRetryBulkDeleteStore struct {
+	object.ObjectStorage
+	mu        sync.Mutex
+	callCount int
+}
+
+func (f *fakeRun9GCExactObjectsRetryBulkDeleteStore) DeleteObjects(ctx context.Context, keys []string, getters ...object.AttrGetter) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callCount++
+	if f.callCount == 1 {
+		return fmt.Errorf("api error SlowDown: Please reduce your request rate")
+	}
+	return nil
+}
+
+func TestDeleteRun9ExactObjectsRetriesBulkDeleteSlowDown(t *testing.T) {
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	store := &fakeRun9GCExactObjectsRetryBulkDeleteStore{ObjectStorage: base}
+
+	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(context.Background(), store, []run9GCExactObject{{Key: "chunks/0/0/1_0_1", Size: 1}}, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), deletedObjects)
+	require.Equal(t, uint64(1), deletedBytes)
+	require.Equal(t, 2, store.callCount)
+}
+
 type fakeRun9GCExactObjectsConcurrentBulkDeleteStore struct {
 	object.ObjectStorage
 	mu          sync.Mutex

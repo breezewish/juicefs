@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
@@ -73,7 +74,11 @@ type run9GCExactObjectsOutput struct {
 	DeletedBytes   uint64 `json:"deleted_bytes"`
 }
 
-const run9GCExactObjectsMaxBulkDeleteBatchSize = 1000
+const (
+	run9GCExactObjectsMaxBulkDeleteBatchSize = 1000
+	run9GCExactObjectsDeleteAttempts         = 6
+	run9GCExactObjectsInitialRetryDelay      = 200 * time.Millisecond
+)
 
 func run9GCExactObjectsBulkDeleteBatchSize(objectCount int, threads int) int {
 	if objectCount <= 0 {
@@ -338,7 +343,7 @@ func deleteRun9ExactObjectsBulk(ctx context.Context, store run9GCExactObjectsBul
 					keys = append(keys, obj.Key)
 					batchBytes += obj.Size
 				}
-				if err := store.DeleteObjects(ctx, keys); err != nil {
+				if err := deleteRun9ExactObjectBatch(ctx, store, keys); err != nil {
 					firstDeleteErrMu.Lock()
 					if firstDeleteErr == nil {
 						firstDeleteErr = err
@@ -382,6 +387,44 @@ func deleteRun9ExactObjectsBulk(ctx context.Context, store run9GCExactObjectsBul
 	return deletedObjects.Load(), deletedBytes.Load(), nil
 }
 
+func deleteRun9ExactObjectBatch(ctx context.Context, store run9GCExactObjectsBulkDeleteStorage, keys []string) error {
+	delay := run9GCExactObjectsInitialRetryDelay
+	var err error
+	for attempt := 1; attempt <= run9GCExactObjectsDeleteAttempts; attempt++ {
+		err = store.DeleteObjects(ctx, keys)
+		if err == nil {
+			return nil
+		}
+		if !isRun9GCExactObjectsRetryableDeleteError(err) {
+			break
+		}
+		if attempt == run9GCExactObjectsDeleteAttempts {
+			break
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		delay *= 2
+	}
+	return err
+}
+
+func isRun9GCExactObjectsRetryableDeleteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "slowdown") ||
+		strings.Contains(msg, "throttl") ||
+		strings.Contains(msg, "requesttimeout") ||
+		strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "exceeded maximum number of attempts")
+}
+
 func deleteRun9ExactObjectsSequential(ctx context.Context, store object.ObjectStorage, objects []run9GCExactObject, threads int) (uint64, uint64, error) {
 	deleteJobs := make(chan run9GCExactObject)
 	var deletedObjects atomic.Uint64
@@ -400,7 +443,7 @@ func deleteRun9ExactObjectsSequential(ctx context.Context, store object.ObjectSt
 				if hasDeleteErr {
 					continue
 				}
-				if err := store.Delete(ctx, obj.Key); err != nil {
+				if err := deleteRun9ExactObjectWithRetry(ctx, store, obj.Key); err != nil {
 					firstDeleteErrMu.Lock()
 					if firstDeleteErr == nil {
 						firstDeleteErr = err
@@ -434,6 +477,32 @@ func deleteRun9ExactObjectsSequential(ctx context.Context, store object.ObjectSt
 		return 0, 0, firstDeleteErr
 	}
 	return deletedObjects.Load(), deletedBytes.Load(), nil
+}
+
+func deleteRun9ExactObjectWithRetry(ctx context.Context, store object.ObjectStorage, key string) error {
+	delay := run9GCExactObjectsInitialRetryDelay
+	var err error
+	for attempt := 1; attempt <= run9GCExactObjectsDeleteAttempts; attempt++ {
+		err = store.Delete(ctx, key)
+		if err == nil {
+			return nil
+		}
+		if !isRun9GCExactObjectsRetryableDeleteError(err) {
+			break
+		}
+		if attempt == run9GCExactObjectsDeleteAttempts {
+			break
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		delay *= 2
+	}
+	return err
 }
 
 func validateRun9ExactObjectKey(key string) error {
