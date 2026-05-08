@@ -420,7 +420,11 @@ func isRun9GCExactObjectsRetryableDeleteError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "slowdown") ||
 		strings.Contains(msg, "throttl") ||
+		strings.Contains(msg, "internalerror") ||
+		strings.Contains(msg, "internal error") ||
 		strings.Contains(msg, "requesttimeout") ||
+		strings.Contains(msg, "serviceunavailable") ||
+		strings.Contains(msg, "service unavailable") ||
 		strings.Contains(msg, "too many requests") ||
 		strings.Contains(msg, "exceeded maximum number of attempts")
 }

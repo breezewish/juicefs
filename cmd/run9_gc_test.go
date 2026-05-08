@@ -137,6 +137,7 @@ type fakeRun9GCExactObjectsRetryBulkDeleteStore struct {
 	object.ObjectStorage
 	mu        sync.Mutex
 	callCount int
+	firstErr  error
 }
 
 func (f *fakeRun9GCExactObjectsRetryBulkDeleteStore) DeleteObjects(ctx context.Context, keys []string, getters ...object.AttrGetter) error {
@@ -144,7 +145,7 @@ func (f *fakeRun9GCExactObjectsRetryBulkDeleteStore) DeleteObjects(ctx context.C
 	defer f.mu.Unlock()
 	f.callCount++
 	if f.callCount == 1 {
-		return fmt.Errorf("api error SlowDown: Please reduce your request rate")
+		return f.firstErr
 	}
 	return nil
 }
@@ -152,7 +153,26 @@ func (f *fakeRun9GCExactObjectsRetryBulkDeleteStore) DeleteObjects(ctx context.C
 func TestDeleteRun9ExactObjectsRetriesBulkDeleteSlowDown(t *testing.T) {
 	base, err := object.CreateStorage("mem", "test", "", "", "")
 	require.NoError(t, err)
-	store := &fakeRun9GCExactObjectsRetryBulkDeleteStore{ObjectStorage: base}
+	store := &fakeRun9GCExactObjectsRetryBulkDeleteStore{
+		ObjectStorage: base,
+		firstErr:      fmt.Errorf("api error SlowDown: Please reduce your request rate"),
+	}
+
+	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(context.Background(), store, []run9GCExactObject{{Key: "chunks/0/0/1_0_1", Size: 1}}, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), deletedObjects)
+	require.Equal(t, uint64(1), deletedBytes)
+	require.Equal(t, 2, store.callCount)
+}
+
+func TestDeleteRun9ExactObjectsRetriesBulkDeleteInternalError(t *testing.T) {
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	store := &fakeRun9GCExactObjectsRetryBulkDeleteStore{
+		ObjectStorage: base,
+		firstErr:      fmt.Errorf("bulk delete exact objects failed for \"chunks/0/0/1_0_1\": InternalError: We encountered an internal error. Please try again."),
+	}
 
 	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(context.Background(), store, []run9GCExactObject{{Key: "chunks/0/0/1_0_1", Size: 1}}, 1)
 
