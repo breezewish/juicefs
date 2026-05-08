@@ -135,6 +135,7 @@ Related files:
 - `list-live-slices` reports the format name, object block layout, and slice ids/sizes from one metadata DB; run9rt passes `--scan-pending` when materializing owner epoch manifests or candidate discovery proofs.
 - `describe-format` reports the persisted object storage descriptor so run9rt can delete after candidate metadata has been removed.
 - `gc-exact-objects` deletes only the exact keys provided by run9rt under the loaded format prefix. It must not list `chunks/` or reopen snap metadata.
+- When the loaded storage is sharded, exact bulk delete fans out independent shard groups in parallel so GC does not serialize shard-local deletes.
 
 Related files:
 

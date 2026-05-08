@@ -24,6 +24,7 @@ import (
 	"hash/fnv"
 	"io"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -97,18 +98,57 @@ func (s *sharded) DeleteObjects(ctx context.Context, keys []string, getters ...A
 		index[store] = len(groups)
 		groups = append(groups, deleteGroup{store: store, keys: []string{key}})
 	}
-	for _, group := range groups {
+
+	deleteGroupKeys := func(ctx context.Context, group deleteGroup, getters ...AttrGetter) error {
 		if deleter, ok := group.store.(bulkDeleteObjectStorage); ok {
-			if err := deleter.DeleteObjects(ctx, group.keys, getters...); err != nil {
-				return err
-			}
-			continue
+			return deleter.DeleteObjects(ctx, group.keys, getters...)
 		}
 		for _, key := range group.keys {
 			if err := group.store.Delete(ctx, key, getters...); err != nil {
 				return err
 			}
 		}
+		return nil
+	}
+
+	// Most run9 exact-delete callers do not pass AttrGetters. Keep the
+	// conservative serial path for any stateful getters, and only fan out the
+	// independent shard groups when no getter needs to observe each call.
+	if len(getters) > 0 || len(groups) <= 1 {
+		for _, group := range groups {
+			if err := deleteGroupKeys(ctx, group, getters...); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg       sync.WaitGroup
+		firstErr error
+		errMu    sync.Mutex
+	)
+	for _, group := range groups {
+		group := group
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := deleteGroupKeys(ctx, group); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					cancel()
+				}
+				errMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
 	}
 	return nil
 }
