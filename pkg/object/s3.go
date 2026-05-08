@@ -226,6 +226,39 @@ func (s *s3client) Delete(ctx context.Context, key string, getters ...AttrGetter
 	return err
 }
 
+func (s *s3client) DeleteObjects(ctx context.Context, keys []string, getters ...AttrGetter) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	objects := make([]types.ObjectIdentifier, 0, len(keys))
+	for _, key := range keys {
+		objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+	}
+	resp, err := s.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: &s.bucket,
+		Delete: &types.Delete{
+			Objects: objects,
+			Quiet:   aws.Bool(true),
+		},
+	})
+	attrs := ApplyGetters(getters...)
+	if err != nil {
+		var re s3.ResponseError
+		if errors.As(err, &re) {
+			attrs.SetRequestID(re.ServiceRequestID())
+		}
+		return err
+	}
+	if reqID, ok := middleware.GetRequestIDMetadata(resp.ResultMetadata); ok {
+		attrs.SetRequestID(reqID)
+	}
+	if len(resp.Errors) > 0 {
+		first := resp.Errors[0]
+		return fmt.Errorf("bulk delete exact objects failed for %q: %s: %s", aws.ToString(first.Key), aws.ToString(first.Code), aws.ToString(first.Message))
+	}
+	return nil
+}
+
 func (s *s3client) List(ctx context.Context, prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	if limit > 1000 {
 		limit = 1000

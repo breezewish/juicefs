@@ -311,4 +311,19 @@ func (e *encrypted) Put(ctx context.Context, key string, in io.Reader, getters .
 	return e.ObjectStorage.Put(ctx, key, bytes.NewReader(ciphertext), getters...)
 }
 
+func (e *encrypted) DeleteObjects(ctx context.Context, keys []string, getters ...AttrGetter) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if deleter, ok := e.ObjectStorage.(bulkDeleteObjectStorage); ok {
+		return deleter.DeleteObjects(ctx, keys, getters...)
+	}
+	for _, key := range keys {
+		if err := e.ObjectStorage.Delete(ctx, key, getters...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 var _ ObjectStorage = (*encrypted)(nil)

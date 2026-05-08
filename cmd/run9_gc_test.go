@@ -2,10 +2,12 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/stretchr/testify/require"
 )
 
@@ -85,4 +87,41 @@ func TestRun9GCExactObjectsRejectsEscapingKey(t *testing.T) {
 
 	require.ErrorContains(t, err, "normalized relative path")
 	require.FileExists(t, outsidePath)
+}
+
+type fakeRun9GCExactObjectsBulkDeleteStore struct {
+	object.ObjectStorage
+	bulkCalls   [][]string
+	deleteCalls []string
+}
+
+func (f *fakeRun9GCExactObjectsBulkDeleteStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
+	f.deleteCalls = append(f.deleteCalls, key)
+	return nil
+}
+
+func (f *fakeRun9GCExactObjectsBulkDeleteStore) DeleteObjects(ctx context.Context, keys []string, getters ...object.AttrGetter) error {
+	f.bulkCalls = append(f.bulkCalls, append([]string(nil), keys...))
+	return nil
+}
+
+func TestDeleteRun9ExactObjectsUsesBulkDeleteWhenSupported(t *testing.T) {
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	store := &fakeRun9GCExactObjectsBulkDeleteStore{ObjectStorage: base}
+	wrapped := object.WithPrefix(store, "chunks/")
+	objects := make([]run9GCExactObject, 1001)
+	for i := range objects {
+		objects[i] = run9GCExactObject{Key: fmt.Sprintf("0/0/%04d_0_1", i), Size: 1}
+	}
+
+	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(context.Background(), wrapped, objects, 4)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1001), deletedObjects)
+	require.Equal(t, uint64(1001), deletedBytes)
+	require.Empty(t, store.deleteCalls)
+	require.Len(t, store.bulkCalls, 2)
+	require.Len(t, store.bulkCalls[0], run9GCExactObjectsBulkDeleteBatchSize)
+	require.Len(t, store.bulkCalls[1], 1)
+	require.Equal(t, "chunks/0/0/0000_0_1", store.bulkCalls[0][0])
 }

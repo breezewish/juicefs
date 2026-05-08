@@ -108,6 +108,10 @@ type FileSystem interface {
 	Chown(path string, owner, group string) error
 }
 
+type bulkDeleteObjectStorage interface {
+	DeleteObjects(ctx context.Context, keys []string, getters ...AttrGetter) error
+}
+
 var notSupported = utils.ENOTSUP
 
 type DefaultObjectStorage struct{}

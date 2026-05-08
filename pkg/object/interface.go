@@ -135,3 +135,27 @@ func Shutdown(o ObjectStorage) {
 		fn(o)
 	}
 }
+
+// SupportsBulkDelete reports whether the storage chain can delete objects in batches
+// without falling back to per-object deletes.
+func SupportsBulkDelete(o ObjectStorage) bool {
+	switch o := o.(type) {
+	case *encrypted:
+		return SupportsBulkDelete(o.ObjectStorage)
+	case *withPrefix:
+		return SupportsBulkDelete(o.os)
+	case *sharded:
+		if len(o.stores) == 0 {
+			return false
+		}
+		for _, store := range o.stores {
+			if !SupportsBulkDelete(store) {
+				return false
+			}
+		}
+		return true
+	default:
+		_, ok := o.(bulkDeleteObjectStorage)
+		return ok
+	}
+}

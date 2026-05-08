@@ -78,6 +78,41 @@ func (s *sharded) Delete(ctx context.Context, key string, getters ...AttrGetter)
 	return s.pick(key).Delete(ctx, key, getters...)
 }
 
+func (s *sharded) DeleteObjects(ctx context.Context, keys []string, getters ...AttrGetter) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	type deleteGroup struct {
+		store ObjectStorage
+		keys  []string
+	}
+	groups := make([]deleteGroup, 0, len(keys))
+	index := map[ObjectStorage]int{}
+	for _, key := range keys {
+		store := s.pick(key)
+		if idx, ok := index[store]; ok {
+			groups[idx].keys = append(groups[idx].keys, key)
+			continue
+		}
+		index[store] = len(groups)
+		groups = append(groups, deleteGroup{store: store, keys: []string{key}})
+	}
+	for _, group := range groups {
+		if deleter, ok := group.store.(bulkDeleteObjectStorage); ok {
+			if err := deleter.DeleteObjects(ctx, group.keys, getters...); err != nil {
+				return err
+			}
+			continue
+		}
+		for _, key := range group.keys {
+			if err := group.store.Delete(ctx, key, getters...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (s *sharded) SetStorageClass(sc string) error {
 	var err = notSupported
 	for _, o := range s.stores {

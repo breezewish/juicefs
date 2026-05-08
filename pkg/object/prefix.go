@@ -127,6 +127,25 @@ func (p *withPrefix) Delete(ctx context.Context, key string, getters ...AttrGett
 	return p.os.Delete(ctx, p.prefix+key, getters...)
 }
 
+func (p *withPrefix) DeleteObjects(ctx context.Context, keys []string, getters ...AttrGetter) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	prefixed := make([]string, 0, len(keys))
+	for _, key := range keys {
+		prefixed = append(prefixed, p.prefix+key)
+	}
+	if deleter, ok := p.os.(bulkDeleteObjectStorage); ok {
+		return deleter.DeleteObjects(ctx, prefixed, getters...)
+	}
+	for _, key := range prefixed {
+		if err := p.os.Delete(ctx, key, getters...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (p *withPrefix) List(ctx context.Context, prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	if start != "" {
 		start = p.prefix + start
