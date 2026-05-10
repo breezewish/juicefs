@@ -47,6 +47,10 @@ import (
 const awsDefaultRegion = "us-east-1"
 const s3RequestIDKey = "X-Amz-Request-Id"
 
+// Bulk delete is idempotent and used by run9 GC under sustained cleanup load,
+// so let the S3 SDK absorb short SlowDown bursts before the caller retries.
+const s3DeleteObjectsRetryMaxAttempts = 4
+
 type s3client struct {
 	s3              *s3.Client
 	bucket          string
@@ -240,6 +244,8 @@ func (s *s3client) DeleteObjects(ctx context.Context, keys []string, getters ...
 			Objects: objects,
 			Quiet:   aws.Bool(true),
 		},
+	}, func(options *s3.Options) {
+		options.RetryMaxAttempts = s3DeleteObjectsRetryMaxAttempts
 	})
 	attrs := ApplyGetters(getters...)
 	if err != nil {

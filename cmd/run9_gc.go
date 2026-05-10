@@ -76,8 +76,9 @@ type run9GCExactObjectsOutput struct {
 
 const (
 	run9GCExactObjectsMaxBulkDeleteBatchSize = 1000
-	run9GCExactObjectsDeleteAttempts         = 6
-	run9GCExactObjectsInitialRetryDelay      = 200 * time.Millisecond
+	run9GCExactObjectsDeleteAttempts         = 12
+	run9GCExactObjectsInitialRetryDelay      = 500 * time.Millisecond
+	run9GCExactObjectsMaxRetryDelay          = 10 * time.Second
 )
 
 func run9GCExactObjectsBulkDeleteBatchSize(objectCount int, threads int) int {
@@ -408,9 +409,17 @@ func deleteRun9ExactObjectBatch(ctx context.Context, store run9GCExactObjectsBul
 			return ctx.Err()
 		case <-timer.C:
 		}
-		delay *= 2
+		delay = nextRun9GCExactObjectsRetryDelay(delay)
 	}
 	return err
+}
+
+func nextRun9GCExactObjectsRetryDelay(delay time.Duration) time.Duration {
+	delay *= 2
+	if delay > run9GCExactObjectsMaxRetryDelay {
+		return run9GCExactObjectsMaxRetryDelay
+	}
+	return delay
 }
 
 func isRun9GCExactObjectsRetryableDeleteError(err error) bool {
@@ -504,7 +513,7 @@ func deleteRun9ExactObjectWithRetry(ctx context.Context, store object.ObjectStor
 			return ctx.Err()
 		case <-timer.C:
 		}
-		delay *= 2
+		delay = nextRun9GCExactObjectsRetryDelay(delay)
 	}
 	return err
 }

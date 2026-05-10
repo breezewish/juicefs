@@ -17,9 +17,14 @@
 package object
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Test_s3client_full_string(t *testing.T) {
@@ -41,4 +46,35 @@ func Test_s3client_full_string(t *testing.T) {
 			assert.Equalf(t, tt.want, stor.String(), "Display full address of s3 compatible object storage")
 		})
 	}
+}
+
+func TestS3ClientDeleteObjectsRetriesSlowDown(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want %s", r.Method, http.MethodPost)
+		}
+		if !r.URL.Query().Has("delete") {
+			t.Errorf("query = %s, want delete", r.URL.RawQuery)
+		}
+
+		w.Header().Set("Content-Type", "application/xml")
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`))
+	}))
+	t.Cleanup(server.Close)
+
+	storage, err := newS3(server.URL+"/bucket", "access-key", "secret-key", "")
+	require.NoError(t, err)
+	client, ok := storage.(*s3client)
+	require.True(t, ok)
+
+	err = client.DeleteObjects(context.Background(), []string{"chunks/0/0/1_0_1"})
+	require.NoError(t, err)
+	require.Equal(t, int32(2), calls.Load())
 }
