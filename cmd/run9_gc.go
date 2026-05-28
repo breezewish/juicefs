@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/urfave/cli/v2"
@@ -72,6 +73,27 @@ type run9GCExactObjectsOutput struct {
 	OK             bool   `json:"ok"`
 	DeletedObjects uint64 `json:"deleted_objects"`
 	DeletedBytes   uint64 `json:"deleted_bytes"`
+}
+
+type run9GCSliceRange struct {
+	Start        uint64 `json:"start"`
+	EndInclusive uint64 `json:"end_inclusive"`
+}
+
+type run9GCSliceRangesRequest struct {
+	JuiceFSFormatName string                      `json:"juicefs_format_name"`
+	ObjectLayout      run9ObjectLayout            `json:"object_layout"`
+	ObjectStorage     run9ObjectStorageDescriptor `json:"object_storage"`
+	Ranges            []run9GCSliceRange          `json:"ranges"`
+	MaxDeleteObjects  uint64                      `json:"max_delete_objects"`
+	Threads           int                         `json:"threads"`
+}
+
+type run9GCSliceRangesOutput struct {
+	OK             bool   `json:"ok"`
+	DeletedObjects uint64 `json:"deleted_objects"`
+	DeletedBytes   uint64 `json:"deleted_bytes"`
+	HasMore        bool   `json:"has_more"`
 }
 
 const (
@@ -161,6 +183,37 @@ func cmdRun9GCExactObjects() *cli.Command {
 				return fmt.Errorf("parse request: %w", err)
 			}
 			out, err := run9GCExactObjects(ctx.Context, req)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(out)
+		},
+	}
+}
+
+func cmdRun9GCSliceRanges() *cli.Command {
+	return &cli.Command{
+		Name:   "gc-slice-ranges",
+		Hidden: true,
+		Usage:  "run9 internal: delete objects whose slice ids fall within one or more ranges",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "request",
+				Required: true,
+				Usage:    "path to JSON request",
+			},
+		},
+		Action: func(ctx *cli.Context) error {
+			setup(ctx, 0)
+			raw, err := os.ReadFile(ctx.String("request"))
+			if err != nil {
+				return fmt.Errorf("read request: %w", err)
+			}
+			var req run9GCSliceRangesRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				return fmt.Errorf("parse request: %w", err)
+			}
+			out, err := run9GCSliceRanges(ctx.Context, req)
 			if err != nil {
 				return err
 			}
@@ -295,6 +348,112 @@ func run9GCExactObjects(ctx context.Context, req run9GCExactObjectsRequest) (run
 		DeletedObjects: deletedObjects,
 		DeletedBytes:   deletedBytes,
 	}, nil
+}
+
+func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9GCSliceRangesOutput, error) {
+	if strings.TrimSpace(req.JuiceFSFormatName) == "" {
+		return run9GCSliceRangesOutput{}, fmt.Errorf("missing juicefs_format_name")
+	}
+	if err := req.ObjectLayout.validate(); err != nil {
+		return run9GCSliceRangesOutput{}, err
+	}
+	if err := req.ObjectStorage.validate(); err != nil {
+		return run9GCSliceRangesOutput{}, err
+	}
+	if req.MaxDeleteObjects == 0 {
+		return run9GCSliceRangesOutput{}, fmt.Errorf("max_delete_objects must be greater than 0")
+	}
+	threads := req.Threads
+	if threads <= 0 {
+		threads = 1
+	}
+	for _, r := range req.Ranges {
+		if r.EndInclusive < r.Start {
+			return run9GCSliceRangesOutput{}, fmt.Errorf("invalid range [%d,%d]", r.Start, r.EndInclusive)
+		}
+	}
+	if len(req.Ranges) == 0 {
+		return run9GCSliceRangesOutput{OK: true}, nil
+	}
+
+	if req.ObjectLayout.BlockSizeBytes%1024 != 0 {
+		return run9GCSliceRangesOutput{}, fmt.Errorf("object_layout.block_size_bytes must be KiB-aligned")
+	}
+	format := req.ObjectStorage.toFormat(req.JuiceFSFormatName)
+	format.BlockSize = req.ObjectLayout.BlockSizeBytes / 1024
+	format.HashPrefix = req.ObjectLayout.HashPrefix
+	if format.BlockSize*1024 != req.ObjectLayout.BlockSizeBytes || format.HashPrefix != req.ObjectLayout.HashPrefix {
+		return run9GCSliceRangesOutput{}, fmt.Errorf("object layout mismatch with descriptor")
+	}
+	blob, err := createStorage(format)
+	if err != nil {
+		return run9GCSliceRangesOutput{}, fmt.Errorf("object storage: %w", err)
+	}
+	defer object.Shutdown(blob)
+
+	listCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	objs, err := object.ListAll(listCtx, blob, "chunks/", "", true, false)
+	if err != nil {
+		return run9GCSliceRangesOutput{}, fmt.Errorf("list range objects: %w", err)
+	}
+
+	matches := make([]run9GCExactObject, 0, minInt(int(req.MaxDeleteObjects), 1024))
+	var hasMore bool
+	for obj := range objs {
+		if obj == nil {
+			return run9GCSliceRangesOutput{}, fmt.Errorf("list range objects returned out-of-order results")
+		}
+		if obj.IsDir() {
+			continue
+		}
+		block, ok := chunk.ParseObjectBlockKey(obj.Key(), req.ObjectLayout.HashPrefix)
+		if !ok || !sliceIDInRanges(block.SliceID, req.Ranges) {
+			continue
+		}
+		matches = append(matches, run9GCExactObject{
+			Key:  obj.Key(),
+			Size: uint64(obj.Size()),
+		})
+		if uint64(len(matches)) >= req.MaxDeleteObjects {
+			hasMore = true
+			cancel()
+			break
+		}
+	}
+	if len(matches) == 0 {
+		return run9GCSliceRangesOutput{OK: true, HasMore: hasMore}, nil
+	}
+
+	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(ctx, blob, matches, threads)
+	if err != nil {
+		return run9GCSliceRangesOutput{}, fmt.Errorf("delete range objects: %w", err)
+	}
+	return run9GCSliceRangesOutput{
+		OK:             true,
+		DeletedObjects: deletedObjects,
+		DeletedBytes:   deletedBytes,
+		HasMore:        hasMore,
+	}, nil
+}
+
+func sliceIDInRanges(sliceID uint64, ranges []run9GCSliceRange) bool {
+	for _, r := range ranges {
+		if sliceID < r.Start {
+			continue
+		}
+		if sliceID <= r.EndInclusive {
+			return true
+		}
+	}
+	return false
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 type run9GCExactObjectsBulkDeleteStorage interface {

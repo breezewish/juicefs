@@ -55,6 +55,63 @@ func TestRun9GCExactObjectsDeletesExactFileObject(t *testing.T) {
 	require.NoFileExists(t, objectPath)
 }
 
+func TestRun9GCSliceRangesDeletesOnlyMatchingObjects(t *testing.T) {
+	bucket := t.TempDir()
+	matchingKey := "chunks/0/0/11_0_3"
+	otherKey := "chunks/0/0/12_0_3"
+	matchingPath := filepath.Join(bucket, "fmtroot", matchingKey)
+	otherPath := filepath.Join(bucket, "fmtroot", otherKey)
+	require.NoError(t, os.MkdirAll(filepath.Dir(matchingPath), 0o755))
+	require.NoError(t, os.WriteFile(matchingPath, []byte("abc"), 0o644))
+	require.NoError(t, os.WriteFile(otherPath, []byte("def"), 0o644))
+
+	out, err := run9GCSliceRanges(context.Background(), run9GCSliceRangesRequest{
+		JuiceFSFormatName: "fmtroot",
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: 4096},
+		ObjectStorage: run9ObjectStorageDescriptor{
+			Storage: "file",
+			Bucket:  bucket + string(os.PathSeparator),
+		},
+		Ranges:           []run9GCSliceRange{{Start: 11, EndInclusive: 11}},
+		MaxDeleteObjects: 10,
+		Threads:          1,
+	})
+
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, uint64(1), out.DeletedObjects)
+	require.Equal(t, uint64(3), out.DeletedBytes)
+	require.False(t, out.HasMore)
+	require.NoFileExists(t, matchingPath)
+	require.FileExists(t, otherPath)
+}
+
+func TestRun9GCSliceRangesStopsAtBudget(t *testing.T) {
+	bucket := t.TempDir()
+	firstPath := filepath.Join(bucket, "fmtroot", "chunks/0/0/21_0_3")
+	secondPath := filepath.Join(bucket, "fmtroot", "chunks/0/0/22_0_3")
+	require.NoError(t, os.MkdirAll(filepath.Dir(firstPath), 0o755))
+	require.NoError(t, os.WriteFile(firstPath, []byte("abc"), 0o644))
+	require.NoError(t, os.WriteFile(secondPath, []byte("def"), 0o644))
+
+	out, err := run9GCSliceRanges(context.Background(), run9GCSliceRangesRequest{
+		JuiceFSFormatName: "fmtroot",
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: 4096},
+		ObjectStorage: run9ObjectStorageDescriptor{
+			Storage: "file",
+			Bucket:  bucket + string(os.PathSeparator),
+		},
+		Ranges:           []run9GCSliceRange{{Start: 21, EndInclusive: 22}},
+		MaxDeleteObjects: 1,
+		Threads:          1,
+	})
+
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, uint64(1), out.DeletedObjects)
+	require.True(t, out.HasMore)
+}
+
 func TestRun9GCExactObjectsRejectsRemovedSecret(t *testing.T) {
 	_, err := run9GCExactObjects(context.Background(), run9GCExactObjectsRequest{
 		JuiceFSFormatName: "fmtroot",
