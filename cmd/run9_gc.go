@@ -312,34 +312,7 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 		return run9GCSliceRangesOutput{}, fmt.Errorf("list range objects: %w", err)
 	}
 
-	matches := make([]run9GCExactObject, 0, minInt(int(req.MaxDeleteObjects), 1024))
-	var hasMore bool
-	for obj := range objs {
-		if obj == nil {
-			return run9GCSliceRangesOutput{}, fmt.Errorf("list range objects returned out-of-order results")
-		}
-		if obj.IsDir() {
-			continue
-		}
-		block, ok := chunk.ParseObjectBlockKey(obj.Key(), req.ObjectLayout.HashPrefix)
-		if !ok || !sliceIDInRanges(block.SliceID, req.Ranges) {
-			continue
-		}
-		matches = append(matches, run9GCExactObject{
-			Key:  obj.Key(),
-			Size: uint64(obj.Size()),
-		})
-		if uint64(len(matches)) >= req.MaxDeleteObjects {
-			hasMore = true
-			cancel()
-			break
-		}
-	}
-	if len(matches) == 0 {
-		return run9GCSliceRangesOutput{OK: true, HasMore: hasMore}, nil
-	}
-
-	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(ctx, blob, matches, threads)
+	deletedObjects, deletedBytes, hasMore, err := deleteRun9SliceRangeMatches(ctx, cancel, blob, objs, req.ObjectLayout.HashPrefix, req.Ranges, req.MaxDeleteObjects, threads)
 	if err != nil {
 		return run9GCSliceRangesOutput{}, fmt.Errorf("delete range objects: %w", err)
 	}
@@ -349,6 +322,204 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 		DeletedBytes:   deletedBytes,
 		HasMore:        hasMore,
 	}, nil
+}
+
+func deleteRun9SliceRangeMatches(
+	ctx context.Context,
+	stopScan context.CancelFunc,
+	store object.ObjectStorage,
+	objs <-chan object.Object,
+	hashPrefix bool,
+	ranges []run9GCSliceRange,
+	maxDeleteObjects uint64,
+	threads int,
+) (uint64, uint64, bool, error) {
+	if maxDeleteObjects == 0 {
+		return 0, 0, false, fmt.Errorf("max_delete_objects must be greater than 0")
+	}
+	if threads <= 0 {
+		threads = 1
+	}
+
+	scanStopped := false
+	stopListing := func() {
+		if scanStopped {
+			return
+		}
+		scanStopped = true
+		stopScan()
+	}
+	defer stopListing()
+
+	batchSize := run9GCDeleteBatchSizeForSliceRanges(store, maxDeleteObjects, threads)
+	deleteCtx, cancelDelete := context.WithCancel(ctx)
+	defer cancelDelete()
+
+	deleteJobs := make(chan []run9GCExactObject, threads*2)
+	supportsBulkDelete := object.SupportsBulkDelete(store)
+	var deletedObjects atomic.Uint64
+	var deletedBytes atomic.Uint64
+	var firstDeleteErr error
+	var firstDeleteErrMu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range deleteJobs {
+				firstDeleteErrMu.Lock()
+				hasDeleteErr := firstDeleteErr != nil
+				firstDeleteErrMu.Unlock()
+				if hasDeleteErr {
+					continue
+				}
+
+				batchDeletedObjects, batchDeletedBytes, err := deleteRun9SliceRangeDeleteBatch(deleteCtx, store, batch, supportsBulkDelete)
+				if err != nil {
+					firstDeleteErrMu.Lock()
+					if firstDeleteErr == nil {
+						firstDeleteErr = err
+						cancelDelete()
+						stopListing()
+					}
+					firstDeleteErrMu.Unlock()
+					continue
+				}
+				deletedObjects.Add(batchDeletedObjects)
+				deletedBytes.Add(batchDeletedBytes)
+			}
+		}()
+	}
+
+	sendBatch := func(batch []run9GCExactObject) error {
+		if len(batch) == 0 {
+			return nil
+		}
+		firstDeleteErrMu.Lock()
+		hasDeleteErr := firstDeleteErr != nil
+		err := firstDeleteErr
+		firstDeleteErrMu.Unlock()
+		if hasDeleteErr {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case deleteJobs <- batch:
+			return nil
+		}
+	}
+
+	matches := make([]run9GCExactObject, 0, batchSize)
+	var matchedForDelete uint64
+	var hasMore bool
+	for obj := range objs {
+		if obj == nil {
+			close(deleteJobs)
+			wg.Wait()
+			return 0, 0, false, fmt.Errorf("list range objects returned out-of-order results")
+		}
+		if obj.IsDir() {
+			continue
+		}
+		block, ok := chunk.ParseObjectBlockKey(obj.Key(), hashPrefix)
+		if !ok || !sliceIDInRanges(block.SliceID, ranges) {
+			continue
+		}
+		if matchedForDelete >= maxDeleteObjects {
+			hasMore = true
+			stopListing()
+			break
+		}
+
+		matches = append(matches, run9GCExactObject{
+			Key:  obj.Key(),
+			Size: uint64(obj.Size()),
+		})
+		matchedForDelete++
+		if len(matches) >= batchSize || matchedForDelete == maxDeleteObjects {
+			batch := matches
+			matches = make([]run9GCExactObject, 0, batchSize)
+			if err := sendBatch(batch); err != nil {
+				close(deleteJobs)
+				wg.Wait()
+				if err == nil {
+					err = firstDeleteErr
+				}
+				return 0, 0, false, err
+			}
+		}
+	}
+	if err := sendBatch(matches); err != nil {
+		close(deleteJobs)
+		wg.Wait()
+		if err == nil {
+			err = firstDeleteErr
+		}
+		return 0, 0, false, err
+	}
+	close(deleteJobs)
+	wg.Wait()
+
+	firstDeleteErrMu.Lock()
+	err := firstDeleteErr
+	firstDeleteErrMu.Unlock()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if ctx.Err() != nil {
+		return 0, 0, false, ctx.Err()
+	}
+	return deletedObjects.Load(), deletedBytes.Load(), hasMore, nil
+}
+
+func run9GCDeleteBatchSizeForSliceRanges(store object.ObjectStorage, maxDeleteObjects uint64, threads int) int {
+	if maxDeleteObjects == 0 {
+		return 1
+	}
+	if threads <= 0 {
+		threads = 1
+	}
+	maxBatchObjects := maxDeleteObjects
+	if maxBatchObjects > uint64(^uint(0)>>1) {
+		maxBatchObjects = uint64(^uint(0) >> 1)
+	}
+	if object.SupportsBulkDelete(store) {
+		return run9GCExactObjectsBulkDeleteBatchSize(int(maxBatchObjects), threads)
+	}
+	return 1
+}
+
+func deleteRun9SliceRangeDeleteBatch(ctx context.Context, store object.ObjectStorage, objects []run9GCExactObject, supportsBulkDelete bool) (uint64, uint64, error) {
+	if len(objects) == 0 {
+		return 0, 0, nil
+	}
+	if supportsBulkDelete {
+		bulk, ok := store.(run9GCExactObjectsBulkDeleteStorage)
+		if !ok {
+			return 0, 0, fmt.Errorf("bulk delete unsupported by %T", store)
+		}
+		keys := make([]string, 0, len(objects))
+		var deletedBytes uint64
+		for _, obj := range objects {
+			keys = append(keys, obj.Key)
+			deletedBytes += obj.Size
+		}
+		if err := deleteRun9ExactObjectBatch(ctx, bulk, keys); err != nil {
+			return 0, 0, err
+		}
+		return uint64(len(objects)), deletedBytes, nil
+	}
+
+	var deletedBytes uint64
+	for _, obj := range objects {
+		if err := deleteRun9ExactObjectWithRetry(ctx, store, obj.Key); err != nil {
+			return 0, 0, err
+		}
+		deletedBytes += obj.Size
+	}
+	return uint64(len(objects)), deletedBytes, nil
 }
 
 func sliceIDInRanges(sliceID uint64, ranges []run9GCSliceRange) bool {
@@ -361,13 +532,6 @@ func sliceIDInRanges(sliceID uint64, ranges []run9GCSliceRange) bool {
 		}
 	}
 	return false
-}
-
-func minInt(a int, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 type run9GCExactObjectsBulkDeleteStorage interface {

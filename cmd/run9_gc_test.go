@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/stretchr/testify/require"
@@ -113,6 +114,110 @@ func TestRun9GCSliceRangesStopsAtBudget(t *testing.T) {
 	require.True(t, out.OK)
 	require.Equal(t, uint64(1), out.DeletedObjects)
 	require.True(t, out.HasMore)
+}
+
+func TestRun9GCSliceRangesDoesNotReportMoreWhenBudgetEqualsEOF(t *testing.T) {
+	bucket := t.TempDir()
+	matchingPath := filepath.Join(bucket, "fmtroot", "chunks/0/0/31_0_3")
+	require.NoError(t, os.MkdirAll(filepath.Dir(matchingPath), 0o755))
+	require.NoError(t, os.WriteFile(matchingPath, []byte("abc"), 0o644))
+
+	out, err := run9GCSliceRanges(context.Background(), run9GCSliceRangesRequest{
+		JuiceFSFormatName: "fmtroot",
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: 4096},
+		ObjectStorage: run9ObjectStorageDescriptor{
+			Storage: "file",
+			Bucket:  bucket + string(os.PathSeparator),
+		},
+		Ranges:           []run9GCSliceRange{{Start: 31, EndInclusive: 31}},
+		MaxDeleteObjects: 1,
+		Threads:          1,
+	})
+
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, uint64(1), out.DeletedObjects)
+	require.False(t, out.HasMore)
+}
+
+type fakeRun9GCSliceRangesStreamingStore struct {
+	object.ObjectStorage
+	firstDelete chan struct{}
+	firstOnce   sync.Once
+}
+
+func (f *fakeRun9GCSliceRangesStreamingStore) DeleteObjects(ctx context.Context, keys []string, getters ...object.AttrGetter) error {
+	f.firstOnce.Do(func() { close(f.firstDelete) })
+	return nil
+}
+
+func TestDeleteRun9SliceRangeMatchesStreamsDeletesBeforeScanFinishes(t *testing.T) {
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	store := &fakeRun9GCSliceRangesStreamingStore{
+		ObjectStorage: base,
+		firstDelete:   make(chan struct{}),
+	}
+
+	objs := make(chan object.Object, 4)
+	_, stopScan := context.WithCancel(context.Background())
+	defer stopScan()
+
+	type result struct {
+		deletedObjects uint64
+		deletedBytes   uint64
+		hasMore        bool
+		err            error
+	}
+	done := make(chan result, 1)
+	go func() {
+		deletedObjects, deletedBytes, hasMore, err := deleteRun9SliceRangeMatches(
+			context.Background(),
+			stopScan,
+			store,
+			objs,
+			false,
+			[]run9GCSliceRange{{Start: 41, EndInclusive: 44}},
+			4,
+			2,
+		)
+		done <- result{
+			deletedObjects: deletedObjects,
+			deletedBytes:   deletedBytes,
+			hasMore:        hasMore,
+			err:            err,
+		}
+	}()
+
+	objs <- testRun9GCObject(chunk.FormatObjectBlockKey(41, 0, 1, false))
+	objs <- testRun9GCObject(chunk.FormatObjectBlockKey(42, 0, 1, false))
+	select {
+	case <-store.firstDelete:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected first delete batch before scan reached EOF")
+	}
+	objs <- testRun9GCObject(chunk.FormatObjectBlockKey(43, 0, 1, false))
+	objs <- testRun9GCObject(chunk.FormatObjectBlockKey(44, 0, 1, false))
+	close(objs)
+
+	select {
+	case out := <-done:
+		require.NoError(t, out.err)
+		require.Equal(t, uint64(4), out.deletedObjects)
+		require.Equal(t, uint64(4), out.deletedBytes)
+		require.False(t, out.hasMore)
+	case <-time.After(2 * time.Second):
+		t.Fatal("deleteRun9SliceRangeMatches did not finish")
+	}
+}
+
+func testRun9GCObject(key string) object.Object {
+	return object.UnmarshalObject(map[string]interface{}{
+		"key":   key,
+		"size":  float64(1),
+		"mtime": "0",
+		"isdir": false,
+	})
 }
 
 type fakeRun9GCExactObjectsBulkDeleteStore struct {
