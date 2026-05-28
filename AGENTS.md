@@ -77,14 +77,6 @@ Related files:
 - `cmd/mount_unix.go`
 - `cmd/mount_shutdown_test.go`
 
-### Faster Mount
-
-- JFS_SKIP_FAST_FAIL is introduced. When it is set, mount process will not load metadata in stage 0, and only load it in stage 3. This should make mount to be faster.
-
-Related files:
-
-- `cmd/mount.go`
-
 ### Mount Supervisor Cleanup
 
 - When `JFS_RUN9_SUPERVISOR_RECORD` is set, the background mount supervisor writes its pid + starttime to that record file before launching the child mount process. run9rt uses that identity to kill the supervisor if startup later fails before a normal `umount-finalize` path can prove and clean it up.
@@ -131,11 +123,11 @@ Related files:
 
 ### Run9 Deleted Snap Object GC
 
-- Hidden internal commands `list-live-slices`, `describe-format`, and `gc-exact-objects` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC V2.
-- `list-live-slices` reports the format name, object block layout, and slice ids/sizes from one metadata DB; run9rt passes `--scan-pending` when materializing owner epoch manifests or candidate discovery proofs.
-- `describe-format` reports the persisted object storage descriptor so run9rt can delete after candidate metadata has been removed.
-- `gc-exact-objects` deletes only the exact keys provided by run9rt under the loaded format prefix. It must not list `chunks/` or reopen snap metadata.
-- When the loaded storage is sharded, exact bulk delete fans out independent shard groups in parallel so GC does not serialize shard-local deletes.
+- Hidden internal commands `list-live-slices`, `describe-format`, and `gc-slice-ranges` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC.
+- `list-live-slices` reports the format name, object block layout, and slice ids/sizes from one metadata DB; run9rt passes `--scan-pending` when materializing manifests from metadata state instead of only the live view.
+- `describe-format` reports the persisted object storage descriptor and object layout so runtime can operate after candidate metadata has been removed, and also seeds a prepared writable epoch through the `?nextchunk=` badger path.
+- `gc-slice-ranges` lists only the loaded format prefix, parses `slice_id` from object keys, and deletes only keys whose `slice_id` falls within the requested ranges. It may stop early at `max_delete_objects` and return `has_more=true`.
+- When the loaded storage is sharded, range deletion reuses bulk delete and fans out independent shard groups in parallel so GC does not serialize shard-local deletes.
 
 Related files:
 

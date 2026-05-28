@@ -86,7 +86,6 @@ func Main(args []string) error {
 			cmdClone(),
 			cmdRun9ListLiveSlices(),
 			cmdRun9DescribeFormat(),
-			cmdRun9GCExactObjects(),
 			cmdRun9GCSliceRanges(),
 			cmdSummary(),
 			cmdCompact(),

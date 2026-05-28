@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -59,20 +58,6 @@ type run9DescribeFormatOutput struct {
 type run9GCExactObject struct {
 	Key  string `json:"key"`
 	Size uint64 `json:"size"`
-}
-
-type run9GCExactObjectsRequest struct {
-	JuiceFSFormatName string                      `json:"juicefs_format_name"`
-	ObjectLayout      run9ObjectLayout            `json:"object_layout"`
-	ObjectStorage     run9ObjectStorageDescriptor `json:"object_storage"`
-	Objects           []run9GCExactObject         `json:"objects"`
-	Threads           int                         `json:"threads"`
-}
-
-type run9GCExactObjectsOutput struct {
-	OK             bool   `json:"ok"`
-	DeletedObjects uint64 `json:"deleted_objects"`
-	DeletedBytes   uint64 `json:"deleted_bytes"`
 }
 
 type run9GCSliceRange struct {
@@ -152,37 +137,6 @@ func cmdRun9DescribeFormat() *cli.Command {
 		Action: func(ctx *cli.Context) error {
 			setup(ctx, 1)
 			out, err := run9DescribeFormat(ctx.Context, ctx.Args().Get(0))
-			if err != nil {
-				return err
-			}
-			return json.NewEncoder(os.Stdout).Encode(out)
-		},
-	}
-}
-
-func cmdRun9GCExactObjects() *cli.Command {
-	return &cli.Command{
-		Name:   "gc-exact-objects",
-		Hidden: true,
-		Usage:  "run9 internal: delete exact object keys",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:     "request",
-				Required: true,
-				Usage:    "path to JSON request",
-			},
-		},
-		Action: func(ctx *cli.Context) error {
-			setup(ctx, 0)
-			raw, err := os.ReadFile(ctx.String("request"))
-			if err != nil {
-				return fmt.Errorf("read request: %w", err)
-			}
-			var req run9GCExactObjectsRequest
-			if err := json.Unmarshal(raw, &req); err != nil {
-				return fmt.Errorf("parse request: %w", err)
-			}
-			out, err := run9GCExactObjects(ctx.Context, req)
 			if err != nil {
 				return err
 			}
@@ -307,55 +261,6 @@ func run9DescribeFormat(ctx context.Context, metaURL string) (run9DescribeFormat
 		JuiceFSFormatName: format.Name,
 		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: format.BlockSize * 1024, HashPrefix: format.HashPrefix},
 		ObjectStorage:     run9ObjectStorageDescriptorFromFormat(*format),
-	}, nil
-}
-
-func run9GCExactObjects(ctx context.Context, req run9GCExactObjectsRequest) (run9GCExactObjectsOutput, error) {
-	if strings.TrimSpace(req.JuiceFSFormatName) == "" {
-		return run9GCExactObjectsOutput{}, fmt.Errorf("missing juicefs_format_name")
-	}
-	if err := req.ObjectLayout.validate(); err != nil {
-		return run9GCExactObjectsOutput{}, err
-	}
-	if err := req.ObjectStorage.validate(); err != nil {
-		return run9GCExactObjectsOutput{}, err
-	}
-	threads := req.Threads
-	if threads <= 0 {
-		threads = 1
-	}
-	for _, obj := range req.Objects {
-		if err := validateRun9ExactObjectKey(obj.Key); err != nil {
-			return run9GCExactObjectsOutput{}, err
-		}
-	}
-	if len(req.Objects) == 0 {
-		return run9GCExactObjectsOutput{OK: true}, nil
-	}
-
-	if req.ObjectLayout.BlockSizeBytes%1024 != 0 {
-		return run9GCExactObjectsOutput{}, fmt.Errorf("object_layout.block_size_bytes must be KiB-aligned")
-	}
-	format := req.ObjectStorage.toFormat(req.JuiceFSFormatName)
-	format.BlockSize = req.ObjectLayout.BlockSizeBytes / 1024
-	format.HashPrefix = req.ObjectLayout.HashPrefix
-	if format.BlockSize*1024 != req.ObjectLayout.BlockSizeBytes || format.HashPrefix != req.ObjectLayout.HashPrefix {
-		return run9GCExactObjectsOutput{}, fmt.Errorf("object layout mismatch with descriptor")
-	}
-	blob, err := createStorage(format)
-	if err != nil {
-		return run9GCExactObjectsOutput{}, fmt.Errorf("object storage: %w", err)
-	}
-	defer object.Shutdown(blob)
-
-	deletedObjects, deletedBytes, err := deleteRun9ExactObjects(ctx, blob, req.Objects, threads)
-	if err != nil {
-		return run9GCExactObjectsOutput{}, fmt.Errorf("delete exact object: %w", err)
-	}
-	return run9GCExactObjectsOutput{
-		OK:             true,
-		DeletedObjects: deletedObjects,
-		DeletedBytes:   deletedBytes,
 	}, nil
 }
 
@@ -684,19 +589,6 @@ func deleteRun9ExactObjectWithRetry(ctx context.Context, store object.ObjectStor
 		delay = nextRun9GCExactObjectsRetryDelay(delay)
 	}
 	return err
-}
-
-func validateRun9ExactObjectKey(key string) error {
-	if strings.TrimSpace(key) == "" {
-		return fmt.Errorf("object key must not be empty")
-	}
-	if key != strings.TrimSpace(key) || strings.HasPrefix(key, "/") || strings.Contains(key, "\\") || path.Clean(key) != key {
-		return fmt.Errorf("object key must be a normalized relative path: %q", key)
-	}
-	if !strings.HasPrefix(key, "chunks/") {
-		return fmt.Errorf("object key must be under chunks/: %q", key)
-	}
-	return nil
 }
 
 func (l run9ObjectLayout) validate() error {
