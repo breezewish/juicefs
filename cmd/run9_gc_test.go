@@ -59,6 +59,48 @@ func TestRun9DescribeFormatPersistsNextChunkOverride(t *testing.T) {
 	require.Equal(t, override+(1<<32), readCounter("Crun9NextChunkLimit"))
 }
 
+func TestRun9PrepareWritableEpochPersistsNextChunkOverride(t *testing.T) {
+	metaDir := filepath.Join(t.TempDir(), "meta")
+	store := meta.NewClient("badger://"+metaDir, meta.DefaultConf())
+	require.NoError(t, store.Init(&meta.Format{
+		Name:      "fmtroot",
+		Storage:   "file",
+		Bucket:    t.TempDir(),
+		BlockSize: 4,
+		TrashDays: 0,
+	}, true))
+	require.NoError(t, store.Shutdown())
+
+	out, err := run9PrepareWritableEpoch(context.Background(), "badger://"+metaDir, 7)
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, "fmtroot", out.JuiceFSFormatName)
+
+	db, err := badger.Open(badger.DefaultOptions(metaDir).WithLogger(nil))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+
+	readCounter := func(key string) int64 {
+		var raw []byte
+		require.NoError(t, db.View(func(txn *badger.Txn) error {
+			item, err := txn.Get([]byte(key))
+			if err != nil {
+				return err
+			}
+			return item.Value(func(val []byte) error {
+				raw = append([]byte(nil), val...)
+				return nil
+			})
+		}))
+		require.Len(t, raw, 8)
+		return int64(binary.LittleEndian.Uint64(raw))
+	}
+
+	override := int64(7 << 32)
+	require.Equal(t, override, readCounter("CnextChunk"))
+	require.Equal(t, override+(1<<32), readCounter("Crun9NextChunkLimit"))
+}
+
 func TestRun9GCSliceRangesDeletesOnlyMatchingObjects(t *testing.T) {
 	bucket := t.TempDir()
 	matchingKey := "chunks/0/0/11_0_3"

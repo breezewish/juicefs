@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -145,6 +147,32 @@ func cmdRun9DescribeFormat() *cli.Command {
 	}
 }
 
+func cmdRun9PrepareWritableEpoch() *cli.Command {
+	return &cli.Command{
+		Name:      "prepare-writable-epoch",
+		Hidden:    true,
+		Usage:     "run9 internal: seed a fresh writable epoch into badger metadata",
+		ArgsUsage: "META-URL OWNED-EPOCH",
+		Action: func(ctx *cli.Context) error {
+			setup(ctx, 2)
+			metaURL := ctx.Args().Get(0)
+			ownedEpochText := strings.TrimSpace(ctx.Args().Get(1))
+			ownedEpoch, err := strconv.ParseUint(ownedEpochText, 10, 64)
+			if err != nil {
+				return fmt.Errorf("parse owned epoch %q: %w", ownedEpochText, err)
+			}
+			if ownedEpoch == 0 {
+				return fmt.Errorf("owned epoch must be greater than 0")
+			}
+			out, err := run9PrepareWritableEpoch(ctx.Context, metaURL, ownedEpoch)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(out)
+		},
+	}
+}
+
 func cmdRun9GCSliceRanges() *cli.Command {
 	return &cli.Command{
 		Name:   "gc-slice-ranges",
@@ -262,6 +290,22 @@ func run9DescribeFormat(ctx context.Context, metaURL string) (run9DescribeFormat
 		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: format.BlockSize * 1024, HashPrefix: format.HashPrefix},
 		ObjectStorage:     run9ObjectStorageDescriptorFromFormat(*format),
 	}, nil
+}
+
+func run9PrepareWritableEpoch(ctx context.Context, metaURL string, ownedEpoch uint64) (run9DescribeFormatOutput, error) {
+	if ownedEpoch == 0 {
+		return run9DescribeFormatOutput{}, fmt.Errorf("owned epoch must be greater than 0")
+	}
+	nextChunkStart := ownedEpoch << 32
+	return run9DescribeFormat(ctx, run9MetaURLWithNextChunk(metaURL, nextChunkStart))
+}
+
+func run9MetaURLWithNextChunk(metaURL string, nextChunkStart uint64) string {
+	nextChunkText := fmt.Sprintf("%d", nextChunkStart)
+	if strings.Contains(metaURL, "?") {
+		return metaURL + "&nextchunk=" + url.QueryEscape(nextChunkText)
+	}
+	return metaURL + "?nextchunk=" + url.QueryEscape(nextChunkText)
 }
 
 func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9GCSliceRangesOutput, error) {
