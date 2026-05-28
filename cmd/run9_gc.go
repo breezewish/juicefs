@@ -237,12 +237,17 @@ func run9ListSlices(ctx context.Context, metaURL string, scanPending bool) (run9
 	m := meta.NewClient(metaURL, metaConf)
 	format, err := m.Load(true)
 	if err != nil {
+		_ = m.Shutdown()
 		return run9ListLiveSlicesOutput{}, fmt.Errorf("load setting: %w", err)
 	}
 	if err := m.NewSession(false); err != nil {
+		_ = m.Shutdown()
 		return run9ListLiveSlicesOutput{}, fmt.Errorf("new session: %w", err)
 	}
-	defer m.CloseSession() //nolint:errcheck
+	defer func() {
+		_ = m.CloseSession()
+		_ = m.Shutdown()
+	}()
 
 	slicesByInode := map[meta.Ino][]meta.Slice{}
 	if st := m.ListSlices(meta.WrapContext(ctx), slicesByInode, scanPending, false, nil); st != 0 {
@@ -291,7 +296,11 @@ func run9DescribeFormat(ctx context.Context, metaURL string) (run9DescribeFormat
 	m := meta.NewClient(metaURL, metaConf)
 	format, err := m.Load(true)
 	if err != nil {
+		_ = m.Shutdown()
 		return run9DescribeFormatOutput{}, fmt.Errorf("load setting: %w", err)
+	}
+	if err := m.Shutdown(); err != nil {
+		return run9DescribeFormatOutput{}, fmt.Errorf("shutdown meta: %w", err)
 	}
 	return run9DescribeFormatOutput{
 		OK:                true,

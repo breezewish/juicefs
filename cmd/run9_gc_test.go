@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,9 +10,53 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger/v4"
+	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRun9DescribeFormatPersistsNextChunkOverride(t *testing.T) {
+	metaDir := filepath.Join(t.TempDir(), "meta")
+	store := meta.NewClient("badger://"+metaDir, meta.DefaultConf())
+	require.NoError(t, store.Init(&meta.Format{
+		Name:      "fmtroot",
+		Storage:   "file",
+		Bucket:    t.TempDir(),
+		BlockSize: 4,
+		TrashDays: 0,
+	}, true))
+	require.NoError(t, store.Shutdown())
+
+	override := int64(7 << 32)
+	out, err := run9DescribeFormat(context.Background(), fmt.Sprintf("badger://%s?nextchunk=%d", metaDir, override))
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, "fmtroot", out.JuiceFSFormatName)
+
+	db, err := badger.Open(badger.DefaultOptions(metaDir).WithLogger(nil))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+
+	readCounter := func(key string) int64 {
+		var raw []byte
+		require.NoError(t, db.View(func(txn *badger.Txn) error {
+			item, err := txn.Get([]byte(key))
+			if err != nil {
+				return err
+			}
+			return item.Value(func(val []byte) error {
+				raw = append([]byte(nil), val...)
+				return nil
+			})
+		}))
+		require.Len(t, raw, 8)
+		return int64(binary.LittleEndian.Uint64(raw))
+	}
+
+	require.Equal(t, override, readCounter("CnextChunk"))
+	require.Equal(t, override+(1<<32), readCounter("Crun9NextChunkLimit"))
+}
 
 func TestRun9GCExactObjectsAcceptsEmptyBatch(t *testing.T) {
 	out, err := run9GCExactObjects(context.Background(), run9GCExactObjectsRequest{

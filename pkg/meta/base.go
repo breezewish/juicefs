@@ -2023,7 +2023,7 @@ func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
 	m.freeMu.Lock()
 	defer m.freeMu.Unlock()
 	if m.freeSlices.next >= m.freeSlices.maxid {
-		// Fork divergence: run9 clamps each Badger mount with ?nextchunk to one slice-id epoch.
+		// Fork divergence: run9 clamps each prepared writable epoch to one slice-id range.
 		run9NextChunkLimit, err := m.en.getCounter("run9NextChunkLimit")
 		if err != nil {
 			return errno(err)
