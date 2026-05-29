@@ -204,10 +204,6 @@ func cmdRun9GCSliceRanges() *cli.Command {
 	}
 }
 
-func run9ListLiveSlices(ctx context.Context, metaURL string) (run9ListLiveSlicesOutput, error) {
-	return run9ListSlices(ctx, metaURL, false)
-}
-
 func run9ListSlices(ctx context.Context, metaURL string, scanPending bool) (run9ListLiveSlicesOutput, error) {
 	metaURL = strings.TrimSpace(metaURL)
 	if metaURL == "" {
