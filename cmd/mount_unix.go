@@ -57,6 +57,25 @@ import (
 
 var mountPid int
 
+const (
+	initialMountpointCheckInterval = 10 * time.Millisecond
+	maxMountpointCheckInterval     = 200 * time.Millisecond
+)
+
+func nextMountpointCheckInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return initialMountpointCheckInterval
+	}
+	if interval >= maxMountpointCheckInterval {
+		return maxMountpointCheckInterval
+	}
+	interval *= 2
+	if interval > maxMountpointCheckInterval {
+		return maxMountpointCheckInterval
+	}
+	return interval
+}
+
 func showThreadStack(agentAddr string) {
 	if agentAddr == "" {
 		return
@@ -212,10 +231,6 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 	}
 	_, oldConf, _ := loadConfig(mp)
 	mountTimeOut := 10 // default 10 seconds
-	// run9's cold exec path waits on the background mount command to return, so
-	// coarse polling here directly adds avoidable tail latency to first-use box
-	// startup. Keep the same readiness proof, but check more frequently.
-	intervalMs := 100
 	if tStr, ok := os.LookupEnv("JFS_MOUNT_TIMEOUT"); ok {
 		if t, err := strconv.ParseInt(tStr, 10, 64); err == nil {
 			mountTimeOut = int(t)
@@ -223,8 +238,17 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 			logger.Errorf("invalid env JFS_MOUNT_TIMEOUT: %s %s", tStr, err)
 		}
 	}
-	for i := 0; i < mountTimeOut*1000/intervalMs; i++ {
-		time.Sleep(time.Duration(intervalMs) * time.Millisecond)
+	deadline := time.Now().Add(time.Duration(mountTimeOut) * time.Second)
+	interval := initialMountpointCheckInterval
+	for {
+		sleep := interval
+		if remaining := time.Until(deadline); sleep > remaining {
+			sleep = remaining
+		}
+		if sleep <= 0 {
+			break
+		}
+		time.Sleep(sleep)
 		st, err := os.Stat(mp)
 		if err == nil {
 			if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Ino == uint64(meta.RootInode) {
@@ -239,8 +263,12 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 				return
 			}
 		}
+		if time.Until(deadline) <= 0 {
+			break
+		}
 		_, _ = os.Stdout.WriteString(".")
 		_ = os.Stdout.Sync()
+		interval = nextMountpointCheckInterval(interval)
 	}
 	_, _ = os.Stdout.WriteString("\n")
 	mountDesc := "mount process is not started yet"
