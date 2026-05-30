@@ -212,7 +212,10 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 	}
 	_, oldConf, _ := loadConfig(mp)
 	mountTimeOut := 10 // default 10 seconds
-	interval := 500    // check every 500 Millisecond
+	// run9's cold exec path waits on the background mount command to return, so
+	// coarse polling here directly adds avoidable tail latency to first-use box
+	// startup. Keep the same readiness proof, but check more frequently.
+	intervalMs := 100
 	if tStr, ok := os.LookupEnv("JFS_MOUNT_TIMEOUT"); ok {
 		if t, err := strconv.ParseInt(tStr, 10, 64); err == nil {
 			mountTimeOut = int(t)
@@ -220,8 +223,8 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 			logger.Errorf("invalid env JFS_MOUNT_TIMEOUT: %s %s", tStr, err)
 		}
 	}
-	for i := 0; i < mountTimeOut*1000/interval; i++ {
-		time.Sleep(time.Duration(interval) * time.Millisecond)
+	for i := 0; i < mountTimeOut*1000/intervalMs; i++ {
+		time.Sleep(time.Duration(intervalMs) * time.Millisecond)
 		st, err := os.Stat(mp)
 		if err == nil {
 			if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Ino == uint64(meta.RootInode) {
