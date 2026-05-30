@@ -10,8 +10,6 @@ import (
 	"path/filepath"
 )
 
-const run9SupervisorRecordEnv = "JFS_RUN9_SUPERVISOR_RECORD"
-
 type run9SupervisorRecord struct {
 	Pid               int    `json:"pid"`
 	PidStarttimeTicks uint64 `json:"pid_starttime_ticks"`

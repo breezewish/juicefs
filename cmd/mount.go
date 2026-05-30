@@ -245,6 +245,10 @@ func daemonRun(c *cli.Context, addr string, vfsConf *vfs.Config) {
 	}
 }
 
+func run9BackgroundMountFastPathEnabled(background bool) bool {
+	return runtime.GOOS != "windows" && background && os.Getenv(run9SupervisorRecordEnv) != ""
+}
+
 func expandPathForEmbedded(addr string) string {
 	embeddedSchemes := []string{"sqlite3://", "badger://"}
 	for _, es := range embeddedSchemes {
@@ -543,6 +547,22 @@ func mount(c *cli.Context) error {
 	supervisor := os.Getenv("JFS_SUPERVISOR")
 	if supervisor != "" || runtime.GOOS == "windows" {
 		stage = 3
+	}
+	if run9BackgroundMountFastPathEnabled(c.Bool("background")) && stage < 3 {
+		// run9 mounts onto one dedicated path per snap and run9rt already owns the
+		// mount-ready + cleanup contract, so the generic parent-side wait is just
+		// fixed startup tax here.
+		err := daemonRunWithoutMountpointCheck(c, addr, mp)
+		if err != nil {
+			logger.Fatalf("Failed to make daemon: %s", err)
+		}
+		os.Setenv("JFS_SUPERVISOR", strconv.Itoa(os.Getppid()))
+		if stage == 2 {
+			if err := writeRun9SupervisorRecordFromEnv(); err != nil {
+				return fmt.Errorf("write run9 supervisor record: %w", err)
+			}
+		}
+		return launchMount(c, mp, nil)
 	}
 
 	var err error

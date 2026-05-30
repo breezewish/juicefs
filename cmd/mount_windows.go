@@ -146,6 +146,10 @@ func makeDaemon(c *cli.Context, conf *vfs.Config) error {
 	return winfsp.RunAsSystemService(conf.Format.Name, c.Args().Get(1), logPath, defaultCacheDir, c)
 }
 
+func daemonRunWithoutMountpointCheck(c *cli.Context, addr string, mp string) error {
+	return nil
+}
+
 func makeDaemonForSvc(c *cli.Context, m meta.Meta, metaUrl, listenAddr string) error {
 	logger.Warnf("Cannot run in background in Windows.")
 	return nil

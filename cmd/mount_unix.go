@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -818,25 +819,42 @@ func fixCacheDirs(c *cli.Context) {
 }
 
 func makeDaemon(c *cli.Context, conf *vfs.Config) error {
-	var attrs godaemon.DaemonAttr
 	logfile := c.String("log")
 	mp := conf.Meta.MountPoint
-	attrs.OnExit = func(stage int) error {
+	return makeDaemonWithOptionalParentWait(c, mp, logfile, func(stage int) error {
 		if stage == 0 {
 			checkMountpoint(conf.Format.Name, mp, logfile, true)
 		}
 		return nil
-	}
+	})
+}
 
-	// the current dir will be changed to root in daemon,
+func daemonRunWithoutMountpointCheck(c *cli.Context, addr string, mp string) error {
+	cacheDirPathToAbs(c)
+	_ = expandPathForEmbedded(addr)
+	utils.InitLoggers(!c.Bool("no-syslog"))
+	err := makeDaemonWithoutMountpointCheck(c, mp)
+	if err == nil && runtime.GOOS == "linux" {
+		log.SetOutput(os.Stderr)
+	}
+	return err
+}
+
+func makeDaemonWithoutMountpointCheck(c *cli.Context, mp string) error {
+	return makeDaemonWithOptionalParentWait(c, mp, c.String("log"), nil)
+}
+
+func makeDaemonWithOptionalParentWait(c *cli.Context, mp string, logfile string, onExit func(stage int) error) error {
+	var attrs godaemon.DaemonAttr
+	attrs.OnExit = onExit
+
+	// The current dir will be changed to root in daemon mode,
 	// so the mount point has to be an absolute path.
 	if godaemon.Stage() == 0 {
-		mp := c.Args().Get(1)
 		amp, err := filepath.Abs(mp)
 		if err == nil && amp != mp {
 			for i := len(os.Args) - 1; i > 2; i-- {
 				if os.Args[i] == mp {
-					// FIXME: it could be other options
 					os.Args[i] = amp
 					break
 				}
@@ -917,7 +935,7 @@ func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 		utils.DisableTHP()
 	}
 
-	if canShutdownGracefully(mp, conf) {
+	if conf != nil && canShutdownGracefully(mp, conf) {
 		shutdownGraceful(mp)
 	}
 	os.Setenv("_FUSE_FD_COMM", serverAddress)
