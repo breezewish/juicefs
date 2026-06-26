@@ -182,6 +182,114 @@ func TestRun9GCSliceRangesDoesNotReportMoreWhenBudgetEqualsEOF(t *testing.T) {
 	require.False(t, out.HasMore)
 }
 
+func TestRun9CountSliceRangesCountsOnlyMatchingObjects(t *testing.T) {
+	bucket := t.TempDir()
+	matchingKey := "chunks/0/0/51_0_3"
+	otherKey := "chunks/0/0/52_0_5"
+	matchingPath := filepath.Join(bucket, "fmtroot", matchingKey)
+	otherPath := filepath.Join(bucket, "fmtroot", otherKey)
+	require.NoError(t, os.MkdirAll(filepath.Dir(matchingPath), 0o755))
+	require.NoError(t, os.WriteFile(matchingPath, []byte("abc"), 0o644))
+	require.NoError(t, os.WriteFile(otherPath, []byte("abcde"), 0o644))
+
+	out, err := run9CountSliceRanges(context.Background(), run9CountSliceRangesRequest{
+		JuiceFSFormatName: "fmtroot",
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: 4096},
+		ObjectStorage: run9ObjectStorageDescriptor{
+			Storage: "file",
+			Bucket:  bucket + string(os.PathSeparator),
+		},
+		Ranges: []run9GCSliceRange{{Start: 51, EndInclusive: 51}},
+	})
+
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, uint64(1), out.Objects)
+	require.Equal(t, uint64(3), out.Bytes)
+	require.Equal(t, []run9CountSliceRangeAccount{{
+		Start:        51,
+		EndInclusive: 51,
+		Objects:      1,
+		Bytes:        3,
+	}}, out.Ranges)
+	require.FileExists(t, matchingPath)
+	require.FileExists(t, otherPath)
+}
+
+func TestRun9CountSliceRangesUsesHashPrefixLayout(t *testing.T) {
+	bucket := t.TempDir()
+	matchingKey := chunk.FormatObjectBlockKey(61, 0, 3, true)
+	otherKey := chunk.FormatObjectBlockKey(62, 0, 5, true)
+	matchingPath := filepath.Join(bucket, "fmtroot", matchingKey)
+	otherPath := filepath.Join(bucket, "fmtroot", otherKey)
+	require.NoError(t, os.MkdirAll(filepath.Dir(matchingPath), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(otherPath), 0o755))
+	require.NoError(t, os.WriteFile(matchingPath, []byte("abc"), 0o644))
+	require.NoError(t, os.WriteFile(otherPath, []byte("abcde"), 0o644))
+
+	out, err := run9CountSliceRanges(context.Background(), run9CountSliceRangesRequest{
+		JuiceFSFormatName: "fmtroot",
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: 4096, HashPrefix: true},
+		ObjectStorage: run9ObjectStorageDescriptor{
+			Storage: "file",
+			Bucket:  bucket + string(os.PathSeparator),
+		},
+		Ranges: []run9GCSliceRange{{Start: 61, EndInclusive: 61}},
+	})
+
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, uint64(1), out.Objects)
+	require.Equal(t, uint64(3), out.Bytes)
+	require.Equal(t, []run9CountSliceRangeAccount{{
+		Start:        61,
+		EndInclusive: 61,
+		Objects:      1,
+		Bytes:        3,
+	}}, out.Ranges)
+}
+
+func TestRun9CountSliceRangesReturnsPerRangeAccountsInRequestOrder(t *testing.T) {
+	bucket := t.TempDir()
+	firstPath := filepath.Join(bucket, "fmtroot", "chunks/0/0/71_0_3")
+	secondPath := filepath.Join(bucket, "fmtroot", "chunks/0/0/72_0_5")
+	require.NoError(t, os.MkdirAll(filepath.Dir(firstPath), 0o755))
+	require.NoError(t, os.WriteFile(firstPath, []byte("abc"), 0o644))
+	require.NoError(t, os.WriteFile(secondPath, []byte("abcde"), 0o644))
+
+	out, err := run9CountSliceRanges(context.Background(), run9CountSliceRangesRequest{
+		JuiceFSFormatName: "fmtroot",
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: 4096},
+		ObjectStorage: run9ObjectStorageDescriptor{
+			Storage: "file",
+			Bucket:  bucket + string(os.PathSeparator),
+		},
+		Ranges: []run9GCSliceRange{
+			{SnapID: "snap-b", Start: 72, EndInclusive: 72},
+			{SnapID: "snap-a", Start: 71, EndInclusive: 71},
+		},
+	})
+
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, uint64(2), out.Objects)
+	require.Equal(t, uint64(8), out.Bytes)
+	require.Equal(t, []run9CountSliceRangeAccount{
+		{SnapID: "snap-b", Start: 72, EndInclusive: 72, Objects: 1, Bytes: 5},
+		{SnapID: "snap-a", Start: 71, EndInclusive: 71, Objects: 1, Bytes: 3},
+	}, out.Ranges)
+}
+
+func TestRun9CountSliceRangesRejectsOverlappingRanges(t *testing.T) {
+	_, _, _, err := countRun9SliceRangeMatches(context.Background(), nil, false, []run9GCSliceRange{
+		{Start: 81, EndInclusive: 83},
+		{Start: 83, EndInclusive: 84},
+	})
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "overlapping ranges")
+}
+
 type fakeRun9GCSliceRangesStreamingStore struct {
 	object.ObjectStorage
 	firstDelete chan struct{}

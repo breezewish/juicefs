@@ -88,6 +88,7 @@ func Main(args []string) error {
 			cmdRun9DescribeFormat(),
 			cmdRun9PrepareWritableEpoch(),
 			cmdRun9GCSliceRanges(),
+			cmdRun9CountSliceRanges(),
 			cmdSummary(),
 			cmdCompact(),
 		},

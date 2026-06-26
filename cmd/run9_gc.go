@@ -63,6 +63,7 @@ type run9GCExactObject struct {
 }
 
 type run9GCSliceRange struct {
+	SnapID       string `json:"snap_id,omitempty"`
 	Start        uint64 `json:"start"`
 	EndInclusive uint64 `json:"end_inclusive"`
 }
@@ -81,6 +82,28 @@ type run9GCSliceRangesOutput struct {
 	DeletedObjects uint64 `json:"deleted_objects"`
 	DeletedBytes   uint64 `json:"deleted_bytes"`
 	HasMore        bool   `json:"has_more"`
+}
+
+type run9CountSliceRangesRequest struct {
+	JuiceFSFormatName string                      `json:"juicefs_format_name"`
+	ObjectLayout      run9ObjectLayout            `json:"object_layout"`
+	ObjectStorage     run9ObjectStorageDescriptor `json:"object_storage"`
+	Ranges            []run9GCSliceRange          `json:"ranges"`
+}
+
+type run9CountSliceRangesOutput struct {
+	OK      bool                         `json:"ok"`
+	Objects uint64                       `json:"objects"`
+	Bytes   uint64                       `json:"bytes"`
+	Ranges  []run9CountSliceRangeAccount `json:"ranges"`
+}
+
+type run9CountSliceRangeAccount struct {
+	SnapID       string `json:"snap_id,omitempty"`
+	Start        uint64 `json:"start"`
+	EndInclusive uint64 `json:"end_inclusive"`
+	Objects      uint64 `json:"objects"`
+	Bytes        uint64 `json:"bytes"`
 }
 
 const (
@@ -204,6 +227,37 @@ func cmdRun9GCSliceRanges() *cli.Command {
 	}
 }
 
+func cmdRun9CountSliceRanges() *cli.Command {
+	return &cli.Command{
+		Name:   "count-slice-ranges",
+		Hidden: true,
+		Usage:  "run9 internal: count objects whose slice ids fall within one or more ranges",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "request",
+				Required: true,
+				Usage:    "path to JSON request",
+			},
+		},
+		Action: func(ctx *cli.Context) error {
+			setup(ctx, 0)
+			raw, err := os.ReadFile(ctx.String("request"))
+			if err != nil {
+				return fmt.Errorf("read request: %w", err)
+			}
+			var req run9CountSliceRangesRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				return fmt.Errorf("parse request: %w", err)
+			}
+			out, err := run9CountSliceRanges(ctx.Context, req)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(out)
+		},
+	}
+}
+
 func run9ListSlices(ctx context.Context, metaURL string, scanPending bool) (run9ListLiveSlicesOutput, error) {
 	metaURL = strings.TrimSpace(metaURL)
 	if metaURL == "" {
@@ -308,12 +362,6 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 	if strings.TrimSpace(req.JuiceFSFormatName) == "" {
 		return run9GCSliceRangesOutput{}, fmt.Errorf("missing juicefs_format_name")
 	}
-	if err := req.ObjectLayout.validate(); err != nil {
-		return run9GCSliceRangesOutput{}, err
-	}
-	if err := req.ObjectStorage.validate(); err != nil {
-		return run9GCSliceRangesOutput{}, err
-	}
 	if req.MaxDeleteObjects == 0 {
 		return run9GCSliceRangesOutput{}, fmt.Errorf("max_delete_objects must be greater than 0")
 	}
@@ -330,16 +378,7 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 		return run9GCSliceRangesOutput{OK: true}, nil
 	}
 
-	if req.ObjectLayout.BlockSizeBytes%1024 != 0 {
-		return run9GCSliceRangesOutput{}, fmt.Errorf("object_layout.block_size_bytes must be KiB-aligned")
-	}
-	format := req.ObjectStorage.toFormat(req.JuiceFSFormatName)
-	format.BlockSize = req.ObjectLayout.BlockSizeBytes / 1024
-	format.HashPrefix = req.ObjectLayout.HashPrefix
-	if format.BlockSize*1024 != req.ObjectLayout.BlockSizeBytes || format.HashPrefix != req.ObjectLayout.HashPrefix {
-		return run9GCSliceRangesOutput{}, fmt.Errorf("object layout mismatch with descriptor")
-	}
-	blob, err := createStorage(format)
+	blob, err := run9SliceRangeObjectStorage(req.JuiceFSFormatName, req.ObjectLayout, req.ObjectStorage)
 	if err != nil {
 		return run9GCSliceRangesOutput{}, fmt.Errorf("object storage: %w", err)
 	}
@@ -362,6 +401,140 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 		DeletedBytes:   deletedBytes,
 		HasMore:        hasMore,
 	}, nil
+}
+
+func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) (run9CountSliceRangesOutput, error) {
+	if strings.TrimSpace(req.JuiceFSFormatName) == "" {
+		return run9CountSliceRangesOutput{}, fmt.Errorf("missing juicefs_format_name")
+	}
+	for _, r := range req.Ranges {
+		if r.EndInclusive < r.Start {
+			return run9CountSliceRangesOutput{}, fmt.Errorf("invalid range [%d,%d]", r.Start, r.EndInclusive)
+		}
+	}
+	if len(req.Ranges) == 0 {
+		return run9CountSliceRangesOutput{OK: true}, nil
+	}
+
+	blob, err := run9SliceRangeObjectStorage(req.JuiceFSFormatName, req.ObjectLayout, req.ObjectStorage)
+	if err != nil {
+		return run9CountSliceRangesOutput{}, fmt.Errorf("object storage: %w", err)
+	}
+	defer object.Shutdown(blob)
+
+	objs, err := object.ListAll(ctx, blob, "chunks/", "", true, false)
+	if err != nil {
+		return run9CountSliceRangesOutput{}, fmt.Errorf("list range objects: %w", err)
+	}
+
+	objects, bytes, ranges, err := countRun9SliceRangeMatches(ctx, objs, req.ObjectLayout.HashPrefix, req.Ranges)
+	if err != nil {
+		return run9CountSliceRangesOutput{}, fmt.Errorf("count range objects: %w", err)
+	}
+	return run9CountSliceRangesOutput{
+		OK:      true,
+		Objects: objects,
+		Bytes:   bytes,
+		Ranges:  ranges,
+	}, nil
+}
+
+func run9SliceRangeObjectStorage(formatName string, layout run9ObjectLayout, descriptor run9ObjectStorageDescriptor) (object.ObjectStorage, error) {
+	if err := layout.validate(); err != nil {
+		return nil, err
+	}
+	if err := descriptor.validate(); err != nil {
+		return nil, err
+	}
+	if layout.BlockSizeBytes%1024 != 0 {
+		return nil, fmt.Errorf("object_layout.block_size_bytes must be KiB-aligned")
+	}
+	format := descriptor.toFormat(formatName)
+	format.BlockSize = layout.BlockSizeBytes / 1024
+	format.HashPrefix = layout.HashPrefix
+	if format.BlockSize*1024 != layout.BlockSizeBytes || format.HashPrefix != layout.HashPrefix {
+		return nil, fmt.Errorf("object layout mismatch with descriptor")
+	}
+	return createStorage(format)
+}
+
+type run9CountSliceRangeAccumulator struct {
+	run9CountSliceRangeAccount
+	requestIndex int
+}
+
+func countRun9SliceRangeMatches(ctx context.Context, objs <-chan object.Object, hashPrefix bool, ranges []run9GCSliceRange) (uint64, uint64, []run9CountSliceRangeAccount, error) {
+	accumulators := make([]run9CountSliceRangeAccumulator, 0, len(ranges))
+	for i, r := range ranges {
+		if r.EndInclusive < r.Start {
+			return 0, 0, nil, fmt.Errorf("invalid range [%d,%d]", r.Start, r.EndInclusive)
+		}
+		accumulators = append(accumulators, run9CountSliceRangeAccumulator{
+			run9CountSliceRangeAccount: run9CountSliceRangeAccount{
+				SnapID:       r.SnapID,
+				Start:        r.Start,
+				EndInclusive: r.EndInclusive,
+			},
+			requestIndex: i,
+		})
+	}
+	sort.Slice(accumulators, func(i, j int) bool {
+		if accumulators[i].Start != accumulators[j].Start {
+			return accumulators[i].Start < accumulators[j].Start
+		}
+		return accumulators[i].EndInclusive < accumulators[j].EndInclusive
+	})
+	for i := 1; i < len(accumulators); i++ {
+		if accumulators[i].Start <= accumulators[i-1].EndInclusive {
+			return 0, 0, nil, fmt.Errorf("overlapping ranges [%d,%d] and [%d,%d]", accumulators[i-1].Start, accumulators[i-1].EndInclusive, accumulators[i].Start, accumulators[i].EndInclusive)
+		}
+	}
+
+	var objects uint64
+	var bytes uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, 0, nil, ctx.Err()
+		case obj, ok := <-objs:
+			if !ok {
+				out := make([]run9CountSliceRangeAccount, len(accumulators))
+				for _, acc := range accumulators {
+					out[acc.requestIndex] = acc.run9CountSliceRangeAccount
+				}
+				return objects, bytes, out, nil
+			}
+			if obj == nil {
+				return 0, 0, nil, fmt.Errorf("list range objects returned out-of-order results")
+			}
+			if obj.IsDir() {
+				continue
+			}
+			block, ok := chunk.ParseObjectBlockKey(obj.Key(), hashPrefix)
+			if !ok {
+				continue
+			}
+			accumulatorIndex := run9CountSliceRangeAccumulatorIndex(accumulators, block.SliceID)
+			if accumulatorIndex < 0 {
+				continue
+			}
+			objects++
+			size := uint64(obj.Size())
+			bytes += size
+			accumulators[accumulatorIndex].Objects++
+			accumulators[accumulatorIndex].Bytes += size
+		}
+	}
+}
+
+func run9CountSliceRangeAccumulatorIndex(ranges []run9CountSliceRangeAccumulator, sliceID uint64) int {
+	i := sort.Search(len(ranges), func(i int) bool {
+		return ranges[i].EndInclusive >= sliceID
+	})
+	if i >= len(ranges) || ranges[i].Start > sliceID {
+		return -1
+	}
+	return i
 }
 
 func deleteRun9SliceRangeMatches(
