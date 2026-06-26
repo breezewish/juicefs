@@ -361,6 +361,52 @@ func TestDeleteRun9SliceRangeMatchesStreamsDeletesBeforeScanFinishes(t *testing.
 	}
 }
 
+type fakeRun9GCSliceRangeListStore struct {
+	object.ObjectStorage
+	pages [][]object.Object
+	call  int
+}
+
+func (f *fakeRun9GCSliceRangeListStore) List(ctx context.Context, prefix, marker, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
+	if f.call >= len(f.pages) {
+		return nil, false, "", nil
+	}
+	page := f.pages[f.call]
+	f.call++
+	hasMore := f.call < len(f.pages)
+	return page, hasMore, fmt.Sprintf("token-%d", f.call), nil
+}
+
+func TestListRun9GCSliceRangeObjectsCountsListRequests(t *testing.T) {
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+
+	objs, scanStats, err := listRun9GCSliceRangeObjects(context.Background(), &fakeRun9GCSliceRangeListStore{
+		ObjectStorage: base,
+		pages: [][]object.Object{
+			{
+				testRun9GCObject(chunk.FormatObjectBlockKey(51, 0, 1, false)),
+				testRun9GCObject(chunk.FormatObjectBlockKey(52, 0, 1, false)),
+			},
+			{
+				testRun9GCObject(chunk.FormatObjectBlockKey(53, 0, 1, false)),
+			},
+		},
+	}, "chunks/", "", true)
+	require.NoError(t, err)
+
+	var listed []object.Object
+	for obj := range objs {
+		listed = append(listed, obj)
+	}
+	<-scanStats.done
+
+	require.Len(t, listed, 3)
+	listRequests, listedObjects := scanStats.snapshot()
+	require.Equal(t, uint64(2), listRequests)
+	require.Equal(t, uint64(3), listedObjects)
+}
+
 func testRun9GCObject(key string) object.Object {
 	return object.UnmarshalObject(map[string]interface{}{
 		"key":   key,

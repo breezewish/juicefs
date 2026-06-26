@@ -78,10 +78,12 @@ type run9GCSliceRangesRequest struct {
 }
 
 type run9GCSliceRangesOutput struct {
-	OK             bool   `json:"ok"`
-	DeletedObjects uint64 `json:"deleted_objects"`
-	DeletedBytes   uint64 `json:"deleted_bytes"`
-	HasMore        bool   `json:"has_more"`
+	OK                bool   `json:"ok"`
+	ScanListRequests  uint64 `json:"scan_list_requests"`
+	ScanListedObjects uint64 `json:"scan_listed_objects"`
+	DeletedObjects    uint64 `json:"deleted_objects"`
+	DeletedBytes      uint64 `json:"deleted_bytes"`
+	HasMore           bool   `json:"has_more"`
 }
 
 type run9CountSliceRangesRequest struct {
@@ -111,7 +113,29 @@ const (
 	run9GCExactObjectsDeleteAttempts         = 12
 	run9GCExactObjectsInitialRetryDelay      = 500 * time.Millisecond
 	run9GCExactObjectsMaxRetryDelay          = 10 * time.Second
+	run9GCSliceRangesListPageSize            = 10000
 )
+
+type run9GCSliceRangeScanStats struct {
+	listRequests  atomic.Uint64
+	listedObjects atomic.Uint64
+	done          chan struct{}
+}
+
+func newRun9GCSliceRangeScanStats() *run9GCSliceRangeScanStats {
+	return &run9GCSliceRangeScanStats{done: make(chan struct{})}
+}
+
+func (s *run9GCSliceRangeScanStats) record(listedObjects int) {
+	s.listRequests.Add(1)
+	if listedObjects > 0 {
+		s.listedObjects.Add(uint64(listedObjects))
+	}
+}
+
+func (s *run9GCSliceRangeScanStats) snapshot() (uint64, uint64) {
+	return s.listRequests.Load(), s.listedObjects.Load()
+}
 
 func run9GCExactObjectsBulkDeleteBatchSize(objectCount int, threads int) int {
 	if objectCount <= 0 {
@@ -386,20 +410,24 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 
 	listCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	objs, err := object.ListAll(listCtx, blob, "chunks/", "", true, false)
+	objs, scanStats, err := listRun9GCSliceRangeObjects(listCtx, blob, "chunks/", "", true)
 	if err != nil {
 		return run9GCSliceRangesOutput{}, fmt.Errorf("list range objects: %w", err)
 	}
 
 	deletedObjects, deletedBytes, hasMore, err := deleteRun9SliceRangeMatches(ctx, cancel, blob, objs, req.ObjectLayout.HashPrefix, req.Ranges, req.MaxDeleteObjects, threads)
+	<-scanStats.done
 	if err != nil {
 		return run9GCSliceRangesOutput{}, fmt.Errorf("delete range objects: %w", err)
 	}
+	scanListRequests, scanListedObjects := scanStats.snapshot()
 	return run9GCSliceRangesOutput{
-		OK:             true,
-		DeletedObjects: deletedObjects,
-		DeletedBytes:   deletedBytes,
-		HasMore:        hasMore,
+		OK:                true,
+		ScanListRequests:  scanListRequests,
+		ScanListedObjects: scanListedObjects,
+		DeletedObjects:    deletedObjects,
+		DeletedBytes:      deletedBytes,
+		HasMore:           hasMore,
 	}, nil
 }
 
@@ -535,6 +563,83 @@ func run9CountSliceRangeAccumulatorIndex(ranges []run9CountSliceRangeAccumulator
 		return -1
 	}
 	return i
+}
+
+func listRun9GCSliceRangeObjects(ctx context.Context, store object.ObjectStorage, prefix, marker string, followLink bool) (<-chan object.Object, *run9GCSliceRangeScanStats, error) {
+	scanStats := newRun9GCSliceRangeScanStats()
+	objs, hasMore, nextToken, err := store.List(ctx, prefix, marker, "", "", run9GCSliceRangesListPageSize, followLink)
+	if err != nil {
+		return listRun9GCSliceRangeObjectsFallback(ctx, scanStats, store, prefix, marker, followLink)
+	}
+	scanStats.record(len(objs))
+
+	out := make(chan object.Object, run9GCSliceRangesListPageSize)
+	go func() {
+		defer close(out)
+		defer close(scanStats.done)
+
+		lastKey := marker
+		for {
+			for _, obj := range objs {
+				lastKey = obj.Key()
+				select {
+				case <-ctx.Done():
+					return
+				case out <- obj:
+				}
+			}
+			if !hasMore {
+				return
+			}
+
+			marker = lastKey
+			for {
+				var nextToken2 string
+				objs, hasMore, nextToken2, err = store.List(ctx, prefix, marker, nextToken, "", run9GCSliceRangesListPageSize, followLink)
+				scanStats.record(len(objs))
+				if err == nil {
+					nextToken = nextToken2
+					break
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				timer := time.NewTimer(100 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+		}
+	}()
+	return out, scanStats, nil
+}
+
+func listRun9GCSliceRangeObjectsFallback(ctx context.Context, scanStats *run9GCSliceRangeScanStats, store object.ObjectStorage, prefix, marker string, followLink bool) (<-chan object.Object, *run9GCSliceRangeScanStats, error) {
+	objs, err := object.ListAll(ctx, store, prefix, marker, followLink, false)
+	if err != nil {
+		close(scanStats.done)
+		return nil, nil, err
+	}
+
+	out := make(chan object.Object, run9GCSliceRangesListPageSize)
+	go func() {
+		defer close(out)
+		defer close(scanStats.done)
+		for obj := range objs {
+			if obj != nil {
+				scanStats.listedObjects.Add(1)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case out <- obj:
+			}
+		}
+	}()
+	return out, scanStats, nil
 }
 
 func deleteRun9SliceRangeMatches(
