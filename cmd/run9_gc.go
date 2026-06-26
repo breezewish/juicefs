@@ -94,10 +94,12 @@ type run9CountSliceRangesRequest struct {
 }
 
 type run9CountSliceRangesOutput struct {
-	OK      bool                         `json:"ok"`
-	Objects uint64                       `json:"objects"`
-	Bytes   uint64                       `json:"bytes"`
-	Ranges  []run9CountSliceRangeAccount `json:"ranges"`
+	OK                bool                         `json:"ok"`
+	ScanListRequests  uint64                       `json:"scan_list_requests"`
+	ScanListedObjects uint64                       `json:"scan_listed_objects"`
+	Objects           uint64                       `json:"objects"`
+	Bytes             uint64                       `json:"bytes"`
+	Ranges            []run9CountSliceRangeAccount `json:"ranges"`
 }
 
 type run9CountSliceRangeAccount struct {
@@ -450,20 +452,27 @@ func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) 
 	}
 	defer object.Shutdown(blob)
 
-	objs, err := object.ListAll(ctx, blob, "chunks/", "", true, false)
+	listCtx, cancel := context.WithCancel(ctx)
+	objs, scanStats, err := listRun9GCSliceRangeObjects(listCtx, blob, "chunks/", "", true)
 	if err != nil {
+		cancel()
 		return run9CountSliceRangesOutput{}, fmt.Errorf("list range objects: %w", err)
 	}
 
 	objects, bytes, ranges, err := countRun9SliceRangeMatches(ctx, objs, req.ObjectLayout.HashPrefix, req.Ranges)
+	cancel()
+	<-scanStats.done
 	if err != nil {
 		return run9CountSliceRangesOutput{}, fmt.Errorf("count range objects: %w", err)
 	}
+	scanListRequests, scanListedObjects := scanStats.snapshot()
 	return run9CountSliceRangesOutput{
-		OK:      true,
-		Objects: objects,
-		Bytes:   bytes,
-		Ranges:  ranges,
+		OK:                true,
+		ScanListRequests:  scanListRequests,
+		ScanListedObjects: scanListedObjects,
+		Objects:           objects,
+		Bytes:             bytes,
+		Ranges:            ranges,
 	}, nil
 }
 
@@ -623,6 +632,7 @@ func listRun9GCSliceRangeObjectsFallback(ctx context.Context, scanStats *run9GCS
 		close(scanStats.done)
 		return nil, nil, err
 	}
+	scanStats.record(0)
 
 	out := make(chan object.Object, run9GCSliceRangesListPageSize)
 	go func() {

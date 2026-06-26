@@ -204,6 +204,8 @@ func TestRun9CountSliceRangesCountsOnlyMatchingObjects(t *testing.T) {
 
 	require.NoError(t, err)
 	require.True(t, out.OK)
+	require.Greater(t, out.ScanListRequests, uint64(0))
+	require.GreaterOrEqual(t, out.ScanListedObjects, uint64(2))
 	require.Equal(t, uint64(1), out.Objects)
 	require.Equal(t, uint64(3), out.Bytes)
 	require.Equal(t, []run9CountSliceRangeAccount{{
