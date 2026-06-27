@@ -539,6 +539,18 @@ func mount(c *cli.Context) error {
 	addr := c.Args().Get(0)
 	removePassword(addr)
 	mp := c.Args().Get(1)
+	traceRequestID := filepath.Base(filepath.Clean(mp))
+	emitRun9StageTrace := func(event string, stageStart time.Time, fields map[string]any) {
+		if !utils.Run9PerfTraceEnabled() {
+			return
+		}
+		if fields == nil {
+			fields = map[string]any{}
+		}
+		fields["dur_ms"] = time.Since(stageStart).Milliseconds()
+		fields["mount_point"] = mp
+		utils.EmitRun9PerfTraceEvent("juicefs", event, traceRequestID, fields)
+	}
 
 	stage := getDaemonStage()
 	if stage < 0 || stage > 2 {
@@ -607,10 +619,14 @@ func mount(c *cli.Context) error {
 	// stage 2: need the volume name to check if it's already mounted
 	// stage 3: the real service process
 	if stage != 1 {
+		metaLoadStart := time.Now()
 		metaCli = meta.NewClient(addr, metaConf)
 		format, err = metaCli.Load(true)
 		if err != nil {
 			return err
+		}
+		if stage == 3 {
+			emitRun9StageTrace("mount_stage3_meta_load_end", metaLoadStart, nil)
 		}
 	}
 
@@ -618,9 +634,13 @@ func mount(c *cli.Context) error {
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
 	if stage == 0 || stage == 3 {
+		blobReadyStart := time.Now()
 		blob, err = NewReloadableStorage(format, metaCli, updateFormat(c))
 		if err != nil {
 			return fmt.Errorf("object storage: %s", err)
+		}
+		if stage == 3 {
+			emitRun9StageTrace("mount_stage3_blob_ready_end", blobReadyStart, nil)
 		}
 		logger.Infof("Data use %s", blob)
 	}
@@ -670,9 +690,11 @@ func mount(c *cli.Context) error {
 		return nil
 	}
 	logger.Infof("JuiceFS version %s", version.Version())
+	mountRecordStart := time.Now()
 	if err := writeRun9MountRecordFromEnv(); err != nil {
 		return fmt.Errorf("write run9 mount record: %w", err)
 	}
+	emitRun9StageTrace("mount_stage3_mount_record_end", mountRecordStart, nil)
 
 	if commPath := os.Getenv("_FUSE_FD_COMM"); commPath != "" {
 		vfsConf.CommPath = commPath
@@ -688,6 +710,7 @@ func mount(c *cli.Context) error {
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(metaCli, store, chunkConf)
 
+	newSessionStart := time.Now()
 	err = metaCli.NewSession(true)
 	if err != nil {
 		// Fork divergence: always shutdown meta client on fatal exit.
@@ -698,7 +721,9 @@ func mount(c *cli.Context) error {
 		object.Shutdown(blob)
 		logger.Fatalf("new session: %s", err)
 	}
+	emitRun9StageTrace("mount_stage3_new_session_end", newSessionStart, nil)
 
+	vfsReadyStart := time.Now()
 	metaCli.OnReload(func(fmt *meta.Format) {
 		updateFormat(c)(fmt)
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
@@ -707,6 +732,7 @@ func mount(c *cli.Context) error {
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
+	emitRun9StageTrace("mount_stage3_vfs_ready_end", vfsReadyStart, nil)
 	mountMain(v, c)
 	if forkFinalizeInProgress.Load() {
 		return runForkFinalizeOnMain(metaCli, v, blob)

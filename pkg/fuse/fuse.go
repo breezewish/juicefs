@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -513,6 +514,7 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 		opt.Options = append(opt.Options, "volname="+conf.Format.Name)
 		opt.Options = append(opt.Options, "daemon_timeout=60", "iosize=65536", "novncache")
 	}
+	newServerStart := time.Now()
 	fssrv, err := fuse.NewServer(imp, conf.Meta.MountPoint, &opt)
 	if err != nil {
 		if execErr, ok := err.(*exec.Error); ok {
@@ -523,6 +525,12 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 			}
 		}
 		return fmt.Errorf("fuse: %s", err)
+	}
+	if utils.Run9PerfTraceEnabled() {
+		utils.EmitRun9PerfTraceEvent("juicefs", "mount_stage3_fuse_new_server_end", filepath.Base(filepath.Clean(conf.Meta.MountPoint)), map[string]any{
+			"dur_ms":      time.Since(newServerStart).Milliseconds(),
+			"mount_point": conf.Meta.MountPoint,
+		})
 	}
 	defer func() {
 		if runtime.GOOS == "darwin" {
