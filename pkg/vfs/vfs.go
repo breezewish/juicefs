@@ -1274,7 +1274,10 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 		meta.TrashName = ".jfs" + meta.TrashName
 	}
 
-	statePath := os.Getenv("_FUSE_STATE_PATH")
+	statePath := conf.StatePath
+	if statePath == "" {
+		statePath = os.Getenv("_FUSE_STATE_PATH")
+	}
 	if statePath == "" {
 		statePath = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
 	}

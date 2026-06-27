@@ -249,6 +249,10 @@ func run9BackgroundMountFastPathEnabled(background bool) bool {
 	return runtime.GOOS != "windows" && background && os.Getenv(run9SupervisorRecordEnv) != ""
 }
 
+func run9BackgroundMountDirectStage(background bool, stage int) bool {
+	return run9BackgroundMountFastPathEnabled(background) && stage == 2
+}
+
 func expandPathForEmbedded(addr string) string {
 	embeddedSchemes := []string{"sqlite3://", "badger://"}
 	for _, es := range embeddedSchemes {
@@ -569,12 +573,19 @@ func mount(c *cli.Context) error {
 			logger.Fatalf("Failed to make daemon: %s", err)
 		}
 		os.Setenv("JFS_SUPERVISOR", strconv.Itoa(os.Getppid()))
-		if stage == 2 {
+		if run9BackgroundMountDirectStage(c.Bool("background"), stage) {
 			if err := writeRun9SupervisorRecordFromEnv(); err != nil {
 				return fmt.Errorf("write run9 supervisor record: %w", err)
 			}
+			cleanupMountRuntime, err := prepareMountRuntime(c, mp, nil)
+			if err != nil {
+				return fmt.Errorf("prepare run9 mount runtime: %w", err)
+			}
+			defer cleanupMountRuntime()
+			stage = 3
+		} else {
+			return nil
 		}
-		return launchMount(c, mp, nil)
 	}
 
 	var err error
@@ -698,7 +709,10 @@ func mount(c *cli.Context) error {
 
 	if commPath := os.Getenv("_FUSE_FD_COMM"); commPath != "" {
 		vfsConf.CommPath = commPath
-		vfsConf.StatePath = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
+		vfsConf.StatePath = os.Getenv("_FUSE_STATE_PATH")
+		if vfsConf.StatePath == "" {
+			vfsConf.StatePath = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
+		}
 	}
 
 	if st := metaCli.Chroot(meta.Background(), metaConf.Subdir); st != 0 {

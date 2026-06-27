@@ -894,7 +894,10 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 			sig := <-signalChan
 			logger.Infof("Received signal %s, exiting...", sig.String())
 			if sig == syscall.SIGHUP {
-				path := fmt.Sprintf("/tmp/state%d.json", os.Getppid())
+				path := v.Conf.StatePath
+				if path == "" {
+					path = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
+				}
 				if err := v.FlushAll(""); err == nil {
 					fuse.Shutdown()
 					err = v.FlushAll(path)
@@ -926,7 +929,8 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 
 	installForkFinalizeHandler(m, v, blob)
 }
-func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
+
+func prepareMountRuntime(c *cli.Context, mp string, conf *vfs.Config) (func(), error) {
 	increaseRlimit()
 	utils.AdjustOOMKiller(-1000)
 	utils.SetIOFlusher()
@@ -938,9 +942,21 @@ func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 	if conf != nil && canShutdownGracefully(mp, conf) {
 		shutdownGraceful(mp)
 	}
+
 	os.Setenv("_FUSE_FD_COMM", serverAddress)
+	os.Setenv("_FUSE_STATE_PATH", fmt.Sprintf("/tmp/state%d.json", os.Getpid()))
 	serveFuseFD(serverAddress)
-	defer os.Remove(serverAddress)
+	return func() {
+		_ = os.Remove(serverAddress)
+	}, nil
+}
+
+func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
+	cleanupMountRuntime, err := prepareMountRuntime(c, mp, conf)
+	if err != nil {
+		return err
+	}
+	defer cleanupMountRuntime()
 
 	path, err := os.Executable()
 	if err != nil {

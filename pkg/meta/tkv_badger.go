@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -269,6 +270,22 @@ func parseBadgerAddrOptions(addr string) (badgerAddrOptions, error) {
 	return opts, nil
 }
 
+func emitRun9BadgerTrace(event string, start time.Time, dir string, fields map[string]any) {
+	if !utils.Run9PerfTraceEnabled() {
+		return
+	}
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields["dur_ms"] = time.Since(start).Milliseconds()
+	fields["dir"] = dir
+	requestID := filepath.Base(dir)
+	if requestID == "meta" {
+		requestID = filepath.Base(filepath.Dir(dir))
+	}
+	utils.EmitRun9PerfTraceEvent("juicefs", event, requestID, fields)
+}
+
 func newBadgerClient(addr string) (tkvClient, error) {
 	// Fork divergence: allow the query param `nextchunk` in the badger address.
 	// `nextchunk=<n>` overrides the tkv counter "nextChunk" (key "CnextChunk") so forked metadata won't conflict.
@@ -287,12 +304,19 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	// FUSE/object-storage layer. Keep value logs small enough that create/close stays
 	// on the boring path while preserving badger's normal lifecycle.
 	opt.ValueLogFileSize = badgerValueLogFileSize
+	openStart := time.Now()
 	client, err := badger.Open(opt)
+	openFields := map[string]any{"override_nextchunk": opts.overrideNextChunk}
+	if err != nil {
+		openFields["error"] = err.Error()
+	}
+	emitRun9BadgerTrace("badger_open_end", openStart, opts.dir, openFields)
 	if err != nil {
 		return nil, err
 	}
 
 	if opts.overrideNextChunk {
+		overrideStart := time.Now()
 		if err := client.Update(func(txn *badger.Txn) error {
 			if err := txn.Set([]byte("CnextChunk"), packCounter(opts.nextChunkValue)); err != nil {
 				return err
@@ -303,9 +327,16 @@ func newBadgerClient(addr string) (tkvClient, error) {
 			}
 			return txn.Set([]byte("Crun9NextChunkLimit"), packCounter(limit))
 		}); err != nil {
+			emitRun9BadgerTrace("badger_open_nextchunk_override_end", overrideStart, opts.dir, map[string]any{
+				"nextchunk": opts.nextChunkValue,
+				"error":     err.Error(),
+			})
 			_ = client.Close()
 			return nil, fmt.Errorf("failed to set nextchunk to %d: %w", opts.nextChunkValue, err)
 		}
+		emitRun9BadgerTrace("badger_open_nextchunk_override_end", overrideStart, opts.dir, map[string]any{
+			"nextchunk": opts.nextChunkValue,
+		})
 	}
 
 	ticker := time.NewTicker(time.Hour)
