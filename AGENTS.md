@@ -81,11 +81,16 @@ Related files:
 
 - When `JFS_RUN9_SUPERVISOR_RECORD` is set, the background mount supervisor writes its pid + starttime to that record file before launching the child mount process. run9rt uses that identity to kill the supervisor if startup later fails before a normal `umount-finalize` path can prove and clean it up.
 
+- When `JFS_RUN9_MOUNT_RECORD` is set, the background mount child writes its own pid + starttime as soon as stage 3 starts. run9rt uses that identity to trust the live mount process before JuiceFS publishes `.jfs.config`, so box cold start no longer pays an extra wait for that file.
+
 Related files:
 
 - `cmd/mount.go`
 - `cmd/mount_run9_supervisor_record_fork.go`
 - `cmd/mount_run9_supervisor_record_fork_test.go`
+- `cmd/mount_run9_mount_record.go`
+- `cmd/mount_run9_mount_record_fork.go`
+- `cmd/mount_run9_mount_record_fork_test.go`
 
 ### Umount with Finalize Semantics
 

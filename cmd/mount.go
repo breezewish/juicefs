@@ -670,6 +670,9 @@ func mount(c *cli.Context) error {
 		return nil
 	}
 	logger.Infof("JuiceFS version %s", version.Version())
+	if err := writeRun9MountRecordFromEnv(); err != nil {
+		return fmt.Errorf("write run9 mount record: %w", err)
+	}
 
 	if commPath := os.Getenv("_FUSE_FD_COMM"); commPath != "" {
 		vfsConf.CommPath = commPath
