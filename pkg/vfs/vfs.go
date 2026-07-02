@@ -122,24 +122,29 @@ type SecurityConfig struct {
 }
 
 type Config struct {
-	Meta                 *meta.Config
-	Format               meta.Format
-	Chunk                *chunk.Config
-	Security             *SecurityConfig
-	Port                 *Port
-	Version              string
-	AttrTimeout          time.Duration
-	DirEntryTimeout      time.Duration
-	NegEntryTimeout      time.Duration
-	EntryTimeout         time.Duration
-	ReaddirCache         bool
-	BackupMeta           time.Duration
-	BackupSkipTrash      bool
-	FastResolve          bool   `json:",omitempty"`
-	AccessLog            string `json:",omitempty"`
-	Subdir               string `json:",omitempty"`
-	PrefixInternal       bool
-	HideInternal         bool
+	Meta            *meta.Config
+	Format          meta.Format
+	Chunk           *chunk.Config
+	Security        *SecurityConfig
+	Port            *Port
+	Version         string
+	AttrTimeout     time.Duration
+	DirEntryTimeout time.Duration
+	NegEntryTimeout time.Duration
+	EntryTimeout    time.Duration
+	ReaddirCache    bool
+	BackupMeta      time.Duration
+	BackupSkipTrash bool
+	FastResolve     bool   `json:",omitempty"`
+	AccessLog       string `json:",omitempty"`
+	Subdir          string `json:",omitempty"`
+	PrefixInternal  bool
+	HideInternal    bool
+	// Run9AsyncFsync makes file fsync return without forcing a per-handle
+	// data flush. run9 uses umount-finalize as the publish fence for forkable
+	// snaps, so this option is only for the run9 block-disk experiment where
+	// repeated guest fsync must not fragment JuiceFS writeback into tiny flushes.
+	Run9AsyncFsync       bool              `json:",omitempty"`
 	RootSquash           *AnonymousAccount `json:",omitempty"`
 	AllSquash            *AnonymousAccount `json:",omitempty"`
 	NonDefaultPermission bool              `json:",omitempty"`
@@ -1036,6 +1041,9 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 func (v *VFS) Fsync(ctx Context, ino Ino, datasync int, fh uint64) (err syscall.Errno) {
 	defer func() { logit(ctx, "fsync", err, "(%d,%d)", ino, datasync) }()
 	if IsSpecialNode(ino) {
+		return
+	}
+	if v.Conf != nil && v.Conf.Run9AsyncFsync {
 		return
 	}
 	h := v.findHandle(ino, fh)

@@ -17,6 +17,7 @@
 package vfs
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -359,6 +360,30 @@ func TestVFSIO(t *testing.T) {
 	}
 
 	v.Release(ctx, fe.Inode, fh)
+}
+
+func TestRun9AsyncFsyncDefersWriterFlush(t *testing.T) {
+	v, blob := createTestVFS(nil, "")
+	v.Conf.Run9AsyncFsync = true
+	ctx := NewLogContext(meta.Background())
+
+	fe, fh, e := v.Create(ctx, 1, "file", 0755, 0, syscall.O_RDWR)
+	require.Zero(t, e)
+	require.Zero(t, v.Write(ctx, fe.Inode, []byte("hello"), 0, fh))
+
+	require.Zero(t, v.Fsync(ctx, fe.Inode, 1, fh))
+	require.Equal(t, 0, countTestObjects(t, blob))
+
+	require.Zero(t, v.Flush(ctx, fe.Inode, fh, 0))
+	require.Greater(t, countTestObjects(t, blob), 0)
+}
+
+func countTestObjects(t *testing.T, blob object.ObjectStorage) int {
+	t.Helper()
+
+	objs, _, _, err := blob.List(context.Background(), "", "", "", "", 1000, false)
+	require.NoError(t, err)
+	return len(objs)
 }
 
 func TestVFSXattrs(t *testing.T) {
