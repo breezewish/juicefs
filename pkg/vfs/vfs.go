@@ -140,11 +140,10 @@ type Config struct {
 	Subdir          string `json:",omitempty"`
 	PrefixInternal  bool
 	HideInternal    bool
-	// Run9AsyncFsync makes file fsync return without forcing a per-handle
-	// data flush. run9 uses umount-finalize as the publish fence for forkable
-	// snaps, so this option is only for the run9 block-disk experiment where
-	// repeated guest fsync must not fragment JuiceFS writeback into tiny flushes.
-	Run9AsyncFsync       bool              `json:",omitempty"`
+	// DeferFsyncFlush makes file fsync return without forcing a per-handle
+	// data flush. It is only safe when the caller has a stronger publish fence
+	// that flushes and verifies pending writes before the data is observed.
+	DeferFsyncFlush      bool              `json:",omitempty"`
 	RootSquash           *AnonymousAccount `json:",omitempty"`
 	AllSquash            *AnonymousAccount `json:",omitempty"`
 	NonDefaultPermission bool              `json:",omitempty"`
@@ -1043,7 +1042,7 @@ func (v *VFS) Fsync(ctx Context, ino Ino, datasync int, fh uint64) (err syscall.
 	if IsSpecialNode(ino) {
 		return
 	}
-	if v.Conf != nil && v.Conf.Run9AsyncFsync {
+	if v.Conf != nil && v.Conf.DeferFsyncFlush {
 		return
 	}
 	h := v.findHandle(ino, fh)

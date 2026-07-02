@@ -362,9 +362,9 @@ func TestVFSIO(t *testing.T) {
 	v.Release(ctx, fe.Inode, fh)
 }
 
-func TestRun9AsyncFsyncDefersWriterFlush(t *testing.T) {
+func TestDeferFsyncFlushDefersWriterFlush(t *testing.T) {
 	v, blob := createTestVFS(nil, "")
-	v.Conf.Run9AsyncFsync = true
+	v.Conf.DeferFsyncFlush = true
 	ctx := NewLogContext(meta.Background())
 
 	fe, fh, e := v.Create(ctx, 1, "file", 0755, 0, syscall.O_RDWR)

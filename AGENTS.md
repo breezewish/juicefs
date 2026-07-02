@@ -126,6 +126,16 @@ Related files:
 - `cmd/mount_finalize_fork_linux_test.go`
 - `pkg/chunk/cached_store_finalize_fork_test.go`
 
+### Deferred File Fsync Flush
+
+- When `JFS_DEFER_FSYNC_FLUSH=1` is set, file `fsync` returns without forcing the current file handle to flush its writer. This is only valid for callers that use a stronger publish fence, such as `umount-finalize`, before the data becomes forkable or externally visible. The option keeps block-disk workloads from fragmenting JuiceFS writeback into tiny per-guest-fsync uploads.
+
+Related files:
+
+- `cmd/mount.go`
+- `pkg/vfs/vfs.go`
+- `pkg/vfs/vfs_test.go`
+
 ### Run9 Deleted Snap Object GC
 
 - Hidden internal commands `list-live-slices`, `describe-format`, and `gc-slice-ranges` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC.

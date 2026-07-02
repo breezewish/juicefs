@@ -291,7 +291,7 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 		PPid:            os.Getppid(),
 		UMask:           0xFFFF,
 		HideInternal:    c.Bool("hide-internal"),
-		Run9AsyncFsync:  os.Getenv("JFS_RUN9_ASYNC_FSYNC") == "1",
+		DeferFsyncFlush: os.Getenv("JFS_DEFER_FSYNC_FLUSH") == "1",
 	}
 
 	if c.IsSet("umask") {

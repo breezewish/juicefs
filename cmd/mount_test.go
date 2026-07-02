@@ -19,6 +19,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,6 +48,15 @@ import (
 const testMeta = "redis://127.0.0.1:6379/11"
 const testMountPoint = "/tmp/jfs-unit-test"
 const testVolume = "test"
+
+func TestGetVfsConfUsesGenericDeferFsyncFlushEnv(t *testing.T) {
+	c := cli.NewContext(cli.NewApp(), flag.NewFlagSet("mount", flag.ContinueOnError), nil)
+	t.Setenv("JFS_RUN9_ASYNC_FSYNC", "1")
+	require.False(t, getVfsConf(c, &meta.Config{}, &meta.Format{}, nil).DeferFsyncFlush)
+
+	t.Setenv("JFS_DEFER_FSYNC_FLUSH", "1")
+	require.True(t, getVfsConf(c, &meta.Config{}, &meta.Format{}, nil).DeferFsyncFlush)
+}
 
 // gomonkey may encounter the problem of insufficient permissions under mac, please solve it by viewing this link https://github.com/agiledragon/gomonkey/issues/70
 func Test_exposeMetrics(t *testing.T) {
