@@ -231,7 +231,10 @@ type badgerAddrOptions struct {
 	nextChunkValue    int64
 }
 
-const badgerValueLogFileSize = 64 << 20
+const (
+	badgerValueLogFileSize = 64 << 20
+	badgerBlockCacheSize   = 16 << 20
+)
 
 func parseBadgerAddrOptions(addr string) (badgerAddrOptions, error) {
 	// addr is a filesystem path (may contain Windows backslashes), with optional query.
@@ -304,6 +307,10 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	// FUSE/object-storage layer. Keep value logs small enough that create/close stays
 	// on the boring path while preserving badger's normal lifecycle.
 	opt.ValueLogFileSize = badgerValueLogFileSize
+	// Fork divergence: run9 opens one small badger metadata DB per mounted snap.
+	// The upstream 256 MiB block cache is disproportionate for this workload and
+	// adds fixed startup cost on every first exec mount.
+	opt.BlockCacheSize = badgerBlockCacheSize
 	openStart := time.Now()
 	client, err := badger.Open(opt)
 	openFields := map[string]any{"override_nextchunk": opts.overrideNextChunk}
