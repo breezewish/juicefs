@@ -234,6 +234,7 @@ type badgerAddrOptions struct {
 const (
 	badgerValueLogFileSize = 64 << 20
 	badgerBlockCacheSize   = 16 << 20
+	badgerIndexCacheSize   = 16 << 20
 )
 
 func parseBadgerAddrOptions(addr string) (badgerAddrOptions, error) {
@@ -311,6 +312,10 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	// The upstream 256 MiB block cache is disproportionate for this workload and
 	// adds fixed startup cost on every first exec mount.
 	opt.BlockCacheSize = badgerBlockCacheSize
+	// Fork divergence: the upstream zero value keeps every SSTable index and
+	// bloom filter in memory. run9 opens these DBs on the exec hot path, so keep
+	// a small on-demand index cache instead of front-loading all table indexes.
+	opt.IndexCacheSize = badgerIndexCacheSize
 	openStart := time.Now()
 	client, err := badger.Open(opt)
 	openFields := map[string]any{"override_nextchunk": opts.overrideNextChunk}

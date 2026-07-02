@@ -27,4 +27,7 @@ func TestBadgerClientUsesRun9ValueLogSize(t *testing.T) {
 	if opts.BlockCacheSize != badgerBlockCacheSize {
 		t.Fatalf("expected BlockCacheSize=%d, got %d", badgerBlockCacheSize, opts.BlockCacheSize)
 	}
+	if opts.IndexCacheSize != badgerIndexCacheSize {
+		t.Fatalf("expected IndexCacheSize=%d, got %d", badgerIndexCacheSize, opts.IndexCacheSize)
+	}
 }
