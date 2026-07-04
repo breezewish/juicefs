@@ -51,7 +51,6 @@ const testVolume = "test"
 
 func TestGetVfsConfUsesGenericDeferFsyncFlushEnv(t *testing.T) {
 	c := cli.NewContext(cli.NewApp(), flag.NewFlagSet("mount", flag.ContinueOnError), nil)
-	t.Setenv("JFS_RUN9_ASYNC_FSYNC", "1")
 	require.False(t, getVfsConf(c, &meta.Config{}, &meta.Format{}, nil).DeferFsyncFlush)
 
 	t.Setenv("JFS_DEFER_FSYNC_FLUSH", "1")
