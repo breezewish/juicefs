@@ -928,6 +928,7 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 	}()
 
 	installForkFinalizeHandler(m, v, blob)
+	installForkFlushDrainHandler(v)
 }
 
 func prepareMountRuntime(c *cli.Context, mp string, conf *vfs.Config) (func(), error) {
