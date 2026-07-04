@@ -1,6 +1,7 @@
 package chunk
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -238,6 +239,89 @@ func TestWaitForUploadDrain_QueuesRecoverablePendingUpload(t *testing.T) {
 	}
 	if string(data) != "good" {
 		t.Fatalf("uploaded data %q != expect good", data)
+	}
+}
+
+func TestWaitForUploadDrain_RecoversPendingUploadWhenCacheIndexMissesHardlink(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.Writeback = true
+	conf.CacheDir = t.TempDir()
+	conf.UploadDelay = time.Hour
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+
+	key := "chunks/0/0/123_0_4"
+	stagingPath, err := store.bcache.stage(key, []byte("good"))
+	if err != nil {
+		t.Fatalf("stage block: %v", err)
+	}
+	cacheManager := store.bcache.(*cacheManager)
+	cacheStore := cacheManager.getStore(key)
+	cachePath := cacheStore.cachePath(key)
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("cache hardlink should exist before recovery: %v", err)
+	}
+
+	cacheStore.Lock()
+	cacheStore.keys.remove(cacheStore.getCacheKey(key), true)
+	cacheStore.scanned = true
+	cacheStore.Unlock()
+
+	store.pendingKeys[key] = &pendingItem{
+		key:   key,
+		fpath: stagingPath,
+		ts:    time.Now(),
+	}
+	if err := os.Remove(stagingPath); err != nil {
+		t.Fatalf("remove staging path: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := store.WaitForUploadDrain(ctx); err != nil {
+		t.Fatalf("WaitForUploadDrain should recover from keyed cache hardlink despite index miss, got %v", err)
+	}
+
+	in, err := mem.Get(ctx, key, 0, -1)
+	if err != nil {
+		t.Fatalf("uploaded object should exist: %v", err)
+	}
+	defer in.Close()
+	data, err := io.ReadAll(in)
+	if err != nil {
+		t.Fatalf("read uploaded object: %v", err)
+	}
+	if string(data) != "good" {
+		t.Fatalf("uploaded data %q != expect good", data)
+	}
+}
+
+func TestWaitForUploadDrain_RemovesStalePendingWhenObjectAlreadyStored(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.Writeback = true
+	conf.CacheDir = t.TempDir()
+	conf.UploadDelay = time.Hour
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+
+	key := "chunks/0/0/123_0_4"
+	ctx := context.Background()
+	if err := mem.Put(ctx, key, bytes.NewReader([]byte("good"))); err != nil {
+		t.Fatalf("put remote object: %v", err)
+	}
+	store.pendingKeys[key] = &pendingItem{
+		key:   key,
+		fpath: filepath.Join(t.TempDir(), "missing"),
+		ts:    time.Now(),
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := store.WaitForUploadDrain(waitCtx); err != nil {
+		t.Fatalf("WaitForUploadDrain should remove stale pending when remote object is already stored, got %v", err)
+	}
+	if _, ok := store.pendingKeys[key]; ok {
+		t.Fatalf("pending key %s should be removed after remote object proof", key)
 	}
 }
 

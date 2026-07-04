@@ -1044,6 +1044,10 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	block, err := store.loadPendingBlockForUpload(key, stagingPath, blen)
 	if err != nil {
 		if store.isPendingValid(key) {
+			if err == errNotCached && store.pendingObjectAlreadyStored(context.TODO(), key, blen) == nil {
+				store.removePending(key)
+				return
+			}
 			logger.Errorf("Load pending upload block key %s path %s: %s", key, stagingPath, err)
 		} else {
 			logger.Debugf("Key %s is not needed, drop it", key)
@@ -1088,8 +1092,9 @@ func (store *cachedStore) loadPendingBlockForUpload(key string, stagingPath stri
 
 	// The rawstaging link can disappear while the keyed cache hardlink still preserves
 	// the same bytes. Recover from the cache copy instead of leaving a stale pending
-	// entry that will make finalize fail later.
-	reader, cacheErr := store.bcache.load(key)
+	// entry that will make finalize fail later. For disk cache, bypass the in-memory
+	// key index because a scan race can make it miss a still-existing hardlink.
+	reader, cacheErr := store.loadPendingCacheBlockForUpload(key)
 	if cacheErr != nil {
 		return nil, cacheErr
 	}
@@ -1101,6 +1106,22 @@ func (store *cachedStore) loadPendingBlockForUpload(key string, stagingPath stri
 		return nil, cacheErr
 	}
 	return block, nil
+}
+
+func (store *cachedStore) loadPendingCacheBlockForUpload(key string) (ReadCloser, error) {
+	if diskCache, ok := store.bcache.(*cacheManager); ok {
+		return diskCache.loadCacheFileForUploadRecovery(key)
+	}
+	return store.bcache.load(key)
+}
+
+func (store *cachedStore) pendingObjectAlreadyStored(ctx context.Context, key string, blen int) error {
+	if store == nil || store.storage == nil {
+		return errNotCached
+	}
+	block := NewOffPage(blen)
+	defer block.Release()
+	return store.load(ctx, key, block, false, false)
 }
 
 func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.Time, force bool) bool {

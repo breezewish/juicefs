@@ -35,7 +35,7 @@ func (store *cachedStore) WaitForUploadDrain(ctx context.Context) error {
 			return ctx.Err()
 		}
 		store.forcePendingUploads()
-		done, err := store.isUploadDrained()
+		done, err := store.isUploadDrained(ctx)
 		if err != nil {
 			return err
 		}
@@ -66,7 +66,7 @@ func (store *cachedStore) forcePendingUploads() {
 	}
 }
 
-func (store *cachedStore) isUploadDrained() (bool, error) {
+func (store *cachedStore) isUploadDrained(ctx context.Context) (bool, error) {
 	store.pendingMutex.Lock()
 	pendingItems := make([]*pendingItem, 0, len(store.pendingKeys))
 	for _, item := range store.pendingKeys {
@@ -90,7 +90,7 @@ func (store *cachedStore) isUploadDrained() (bool, error) {
 					if !store.isCurrentPendingSnapshot(item) {
 						continue
 					}
-					if err := store.pendingBlockRecoveryError(item.key, item.fpath); err == nil {
+					if err := store.pendingBlockRecoveryError(ctx, item.key, item.fpath); err == nil {
 						return false, nil
 					} else {
 						return false, fmt.Errorf("%w: key %s path %s: %v", errPendingStagingMissing, item.key, item.fpath, err)
@@ -148,12 +148,17 @@ func (store *cachedStore) enqueuePendingUpload(item *pendingItem) {
 	}
 }
 
-func (store *cachedStore) pendingBlockRecoveryError(key, stagingPath string) error {
+func (store *cachedStore) pendingBlockRecoveryError(ctx context.Context, key, stagingPath string) error {
 	if store == nil || store.bcache == nil {
 		return errors.New("cache manager unavailable")
 	}
-	block, err := store.loadPendingBlockForUpload(key, stagingPath, parseObjOrigSize(key))
+	blen := parseObjOrigSize(key)
+	block, err := store.loadPendingBlockForUpload(key, stagingPath, blen)
 	if err != nil {
+		if err == errNotCached && store.pendingObjectAlreadyStored(ctx, key, blen) == nil {
+			store.removePending(key)
+			return nil
+		}
 		return err
 	}
 	block.Release()

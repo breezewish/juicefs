@@ -669,6 +669,22 @@ func (cache *cacheStore) load(key string) (ReadCloser, error) {
 	return f, err
 }
 
+func (cache *cacheStore) loadCacheFileForUploadRecovery(key string) (ReadCloser, error) {
+	var f *cacheFile
+	err := cache.checkErr(func() error {
+		var err error
+		f, err = openCacheFile(cache.cachePath(key), parseObjOrigSize(key), cache.checksum)
+		if err != nil && !os.IsNotExist(err) {
+			logger.Warnf("Open cache file %s for pending upload recovery failed: %s", cache.cachePath(key), err)
+		}
+		return err
+	})
+	if os.IsNotExist(err) {
+		return nil, errNotCached
+	}
+	return f, err
+}
+
 func (cache *cacheStore) exist(key string) (bool, error) {
 	cache.Lock()
 	defer cache.Unlock()
@@ -1249,6 +1265,21 @@ func (m *cacheManager) load(key string) (ReadCloser, error) {
 		legacy := m.getStoreLegacy(key)
 		if legacy != store && legacy != nil {
 			r, err = legacy.load(key)
+		}
+	}
+	return r, err
+}
+
+func (m *cacheManager) loadCacheFileForUploadRecovery(key string) (ReadCloser, error) {
+	store := m.getStore(key)
+	if store == nil {
+		return nil, errors.New("no available cache dir")
+	}
+	r, err := store.loadCacheFileForUploadRecovery(key)
+	if err == errNotCached {
+		legacy := m.getStoreLegacy(key)
+		if legacy != store && legacy != nil {
+			r, err = legacy.loadCacheFileForUploadRecovery(key)
 		}
 	}
 	return r, err

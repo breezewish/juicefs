@@ -105,7 +105,9 @@ Related files:
 
 - During `WaitForUploadDrain(ctx)`, finalize actively re-queues current pending items that are not already uploading, so drain proof does not depend on the background delayed-upload scanner to make progress.
 
-- When a pending block still exists in bookkeeping but its `rawstaging` path is gone, both `uploadStagingFile()` and `cachedStore.WaitForUploadDrain(ctx)` recover only if the keyed cache copy can still be fully read and verified with the configured checksum. Missing or corrupt cache copies stay fatal so finalize keeps exposing real data-loss evidence instead of timing out or silently degrading.
+- When a pending block still exists in bookkeeping but its `rawstaging` path is gone, both `uploadStagingFile()` and `cachedStore.WaitForUploadDrain(ctx)` recover only if the keyed cache copy can still be fully read and verified with the configured checksum, or if the remote object can already be fully read and decompressed to the original block size. Missing or corrupt local copies stay fatal unless the remote object proves that the pending upload has already completed, so finalize keeps exposing real data-loss evidence instead of timing out or silently degrading.
+
+- Disk-cache recovery for such pending blocks opens the keyed cache hardlink directly and does not trust the in-memory cache key index. The index is an accelerator and may miss a still-existing hardlink during cache scan races; pending upload recovery must use the filesystem copy as the authoritative recovery source.
 
 - Chunk unit tests avoid `mockey` (assembly-based monkey patching; Go version/arch sensitive). Instead, tests override small package-level function variables like `diskUsageFn` / `statPathForUploadDrain`.
 
