@@ -51,12 +51,25 @@ type run9LiveSlicePathSummary struct {
 	Unattributed   bool     `json:"unattributed,omitempty"`
 }
 
+type run9LiveSliceRef struct {
+	Inode                  uint64   `json:"inode"`
+	Paths                  []string `json:"paths,omitempty"`
+	ChunkIndex             uint32   `json:"chunk_index"`
+	ChunkOffsetBytes       uint64   `json:"chunk_offset_bytes"`
+	FileOffsetBytes        uint64   `json:"file_offset_bytes"`
+	SliceID                uint64   `json:"slice_id"`
+	SliceSizeBytes         uint32   `json:"slice_size_bytes"`
+	SliceObjectOffsetBytes uint32   `json:"slice_object_offset_bytes"`
+	SliceLenBytes          uint32   `json:"slice_len_bytes"`
+}
+
 type run9ListLiveSlicesOutput struct {
 	OK                bool                       `json:"ok"`
 	JuiceFSFormatName string                     `json:"juicefs_format_name"`
 	ObjectLayout      run9ObjectLayout           `json:"object_layout"`
 	Slices            []run9LiveSlice            `json:"slices"`
 	PathSummaries     []run9LiveSlicePathSummary `json:"path_summaries,omitempty"`
+	SliceRefs         []run9LiveSliceRef         `json:"slice_refs,omitempty"`
 }
 
 type run9DescribeFormatOutput struct {
@@ -180,10 +193,14 @@ func cmdRun9ListLiveSlices() *cli.Command {
 				Name:  "include-paths",
 				Usage: "include per-inode path summaries for diagnostics",
 			},
+			&cli.BoolFlag{
+				Name:  "include-refs",
+				Usage: "include per-file live slice references with chunk offsets for diagnostics",
+			},
 		},
 		Action: func(ctx *cli.Context) error {
 			setup(ctx, 1)
-			out, err := run9ListSlices(ctx.Context, ctx.Args().Get(0), ctx.Bool("scan-pending"), ctx.Bool("include-paths"))
+			out, err := run9ListSlices(ctx.Context, ctx.Args().Get(0), ctx.Bool("scan-pending"), ctx.Bool("include-paths"), ctx.Bool("include-refs"))
 			if err != nil {
 				return err
 			}
@@ -297,7 +314,7 @@ func cmdRun9CountSliceRanges() *cli.Command {
 	}
 }
 
-func run9ListSlices(ctx context.Context, metaURL string, scanPending bool, includePaths bool) (run9ListLiveSlicesOutput, error) {
+func run9ListSlices(ctx context.Context, metaURL string, scanPending bool, includePaths bool, includeRefs bool) (run9ListLiveSlicesOutput, error) {
 	metaURL = strings.TrimSpace(metaURL)
 	if metaURL == "" {
 		return run9ListLiveSlicesOutput{}, fmt.Errorf("missing meta url")
@@ -349,6 +366,14 @@ func run9ListSlices(ctx context.Context, metaURL string, scanPending bool, inclu
 	if includePaths {
 		pathSummaries = run9LiveSlicePathSummaries(meta.WrapContext(ctx), m, slicesByInode)
 	}
+	var sliceRefs []run9LiveSliceRef
+	if includeRefs {
+		var err error
+		sliceRefs, err = run9LiveSliceRefs(meta.WrapContext(ctx), m, slicesByInode)
+		if err != nil {
+			return run9ListLiveSlicesOutput{}, err
+		}
+	}
 
 	return run9ListLiveSlicesOutput{
 		OK:                true,
@@ -359,6 +384,7 @@ func run9ListSlices(ctx context.Context, metaURL string, scanPending bool, inclu
 		},
 		Slices:        slices,
 		PathSummaries: pathSummaries,
+		SliceRefs:     sliceRefs,
 	}, nil
 }
 
@@ -413,6 +439,74 @@ func run9LiveSlicePathSummaries(ctx meta.Context, m meta.Meta, slicesByInode map
 		return leftPath < rightPath
 	})
 	return summaries
+}
+
+func run9LiveSliceRefs(ctx meta.Context, m meta.Meta, slicesByInode map[meta.Ino][]meta.Slice) ([]run9LiveSliceRef, error) {
+	inodes := make([]meta.Ino, 0, len(slicesByInode))
+	for inode := range slicesByInode {
+		if inode != 0 {
+			inodes = append(inodes, inode)
+		}
+	}
+	sort.Slice(inodes, func(i, j int) bool { return inodes[i] < inodes[j] })
+
+	var refs []run9LiveSliceRef
+	for _, inode := range inodes {
+		var attr meta.Attr
+		if st := m.GetAttr(ctx, inode, &attr); st != 0 {
+			return nil, fmt.Errorf("get attr for inode %d: %s", inode, st)
+		}
+		if attr.Typ != meta.TypeFile {
+			return nil, fmt.Errorf("inode %d has live slices but is not a file", inode)
+		}
+
+		paths := m.GetPaths(ctx, inode)
+		sort.Strings(paths)
+
+		chunkCount := uint64(0)
+		if attr.Length > 0 {
+			chunkCount = (attr.Length + meta.ChunkSize - 1) / meta.ChunkSize
+		}
+		for chunkIndex := uint64(0); chunkIndex < chunkCount; chunkIndex++ {
+			var chunkSlices []meta.Slice
+			if st := m.Read(ctx, inode, uint32(chunkIndex), &chunkSlices); st != 0 {
+				return nil, fmt.Errorf("read inode %d chunk %d: %s", inode, chunkIndex, st)
+			}
+			var chunkOffset uint64
+			for _, s := range chunkSlices {
+				sliceChunkOffset := chunkOffset
+				chunkOffset += uint64(s.Len)
+				if s.Id == 0 || s.Size == 0 {
+					continue
+				}
+				refs = append(refs, run9LiveSliceRef{
+					Inode:                  uint64(inode),
+					Paths:                  paths,
+					ChunkIndex:             uint32(chunkIndex),
+					ChunkOffsetBytes:       sliceChunkOffset,
+					FileOffsetBytes:        chunkIndex*meta.ChunkSize + sliceChunkOffset,
+					SliceID:                s.Id,
+					SliceSizeBytes:         s.Size,
+					SliceObjectOffsetBytes: s.Off,
+					SliceLenBytes:          s.Len,
+				})
+			}
+		}
+	}
+
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].Inode != refs[j].Inode {
+			return refs[i].Inode < refs[j].Inode
+		}
+		if refs[i].ChunkIndex != refs[j].ChunkIndex {
+			return refs[i].ChunkIndex < refs[j].ChunkIndex
+		}
+		if refs[i].ChunkOffsetBytes != refs[j].ChunkOffsetBytes {
+			return refs[i].ChunkOffsetBytes < refs[j].ChunkOffsetBytes
+		}
+		return refs[i].SliceID < refs[j].SliceID
+	})
+	return refs, nil
 }
 
 func run9DescribeFormat(ctx context.Context, metaURL string) (run9DescribeFormatOutput, error) {

@@ -127,7 +127,7 @@ func TestRun9ListSlicesIncludesPathSummariesWhenRequested(t *testing.T) {
 	require.NoError(t, store.CloseSession())
 	require.NoError(t, store.Shutdown())
 
-	out, err := run9ListSlices(context.Background(), "badger://"+metaDir, false, true)
+	out, err := run9ListSlices(context.Background(), "badger://"+metaDir, false, true, false)
 	require.NoError(t, err)
 	require.True(t, out.OK)
 	require.Equal(t, []run9LiveSlice{{ID: sliceID, Size: 1024}}, out.Slices)
@@ -137,6 +137,65 @@ func TestRun9ListSlicesIncludesPathSummariesWhenRequested(t *testing.T) {
 		Count:          1,
 		TotalSizeBytes: 1024,
 	}}, out.PathSummaries)
+}
+
+func TestRun9ListSlicesIncludesRefsWhenRequested(t *testing.T) {
+	metaDir := filepath.Join(t.TempDir(), "meta")
+	store := meta.NewClient("badger://"+metaDir, meta.DefaultConf())
+	require.NoError(t, store.Init(&meta.Format{
+		Name:      "fmtroot",
+		Storage:   "file",
+		Bucket:    t.TempDir(),
+		BlockSize: 4,
+		TrashDays: 0,
+	}, true))
+	require.NoError(t, store.NewSession(false))
+
+	ctx := meta.Background()
+	attr := &meta.Attr{}
+	var rootfsIno meta.Ino
+	require.Zero(t, store.Mkdir(ctx, 1, "rootfs", 0o755, 0, 0, &rootfsIno, attr))
+	var fileIno meta.Ino
+	require.Zero(t, store.Create(ctx, rootfsIno, "disk.raw", 0o644, 0, 0, &fileIno, attr))
+
+	var firstSliceID uint64
+	require.Zero(t, store.NewSlice(ctx, &firstSliceID))
+	require.Zero(t, store.Write(ctx, fileIno, 0, 0, meta.Slice{Id: firstSliceID, Size: 1024, Len: 1024}, time.Now()))
+
+	var secondSliceID uint64
+	require.Zero(t, store.NewSlice(ctx, &secondSliceID))
+	require.Zero(t, store.Write(ctx, fileIno, 0, 4096, meta.Slice{Id: secondSliceID, Size: 2048, Off: 128, Len: 512}, time.Now()))
+
+	require.NoError(t, store.CloseSession())
+	require.NoError(t, store.Shutdown())
+
+	out, err := run9ListSlices(context.Background(), "badger://"+metaDir, false, false, true)
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, []run9LiveSliceRef{
+		{
+			Inode:                  uint64(fileIno),
+			Paths:                  []string{"/rootfs/disk.raw"},
+			ChunkIndex:             0,
+			ChunkOffsetBytes:       0,
+			FileOffsetBytes:        0,
+			SliceID:                firstSliceID,
+			SliceSizeBytes:         1024,
+			SliceObjectOffsetBytes: 0,
+			SliceLenBytes:          1024,
+		},
+		{
+			Inode:                  uint64(fileIno),
+			Paths:                  []string{"/rootfs/disk.raw"},
+			ChunkIndex:             0,
+			ChunkOffsetBytes:       4096,
+			FileOffsetBytes:        4096,
+			SliceID:                secondSliceID,
+			SliceSizeBytes:         2048,
+			SliceObjectOffsetBytes: 128,
+			SliceLenBytes:          512,
+		},
+	}, out.SliceRefs)
 }
 
 func TestRun9GCSliceRangesDeletesOnlyMatchingObjects(t *testing.T) {
