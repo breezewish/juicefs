@@ -101,6 +101,44 @@ func TestRun9PrepareWritableEpochPersistsNextChunkOverride(t *testing.T) {
 	require.Equal(t, override+(1<<32), readCounter("Crun9NextChunkLimit"))
 }
 
+func TestRun9ListSlicesIncludesPathSummariesWhenRequested(t *testing.T) {
+	metaDir := filepath.Join(t.TempDir(), "meta")
+	store := meta.NewClient("badger://"+metaDir, meta.DefaultConf())
+	require.NoError(t, store.Init(&meta.Format{
+		Name:      "fmtroot",
+		Storage:   "file",
+		Bucket:    t.TempDir(),
+		BlockSize: 4,
+		TrashDays: 0,
+	}, true))
+	require.NoError(t, store.NewSession(false))
+
+	ctx := meta.Background()
+	attr := &meta.Attr{}
+	var rootfsIno meta.Ino
+	require.Zero(t, store.Mkdir(ctx, 1, "rootfs", 0o755, 0, 0, &rootfsIno, attr))
+	var workIno meta.Ino
+	require.Zero(t, store.Mkdir(ctx, rootfsIno, "work", 0o755, 0, 0, &workIno, attr))
+	var fileIno meta.Ino
+	require.Zero(t, store.Create(ctx, workIno, "data.bin", 0o644, 0, 0, &fileIno, attr))
+	var sliceID uint64
+	require.Zero(t, store.NewSlice(ctx, &sliceID))
+	require.Zero(t, store.Write(ctx, fileIno, 0, 0, meta.Slice{Id: sliceID, Size: 1024, Len: 1024}, time.Now()))
+	require.NoError(t, store.CloseSession())
+	require.NoError(t, store.Shutdown())
+
+	out, err := run9ListSlices(context.Background(), "badger://"+metaDir, false, true)
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, []run9LiveSlice{{ID: sliceID, Size: 1024}}, out.Slices)
+	require.Equal(t, []run9LiveSlicePathSummary{{
+		Inode:          uint64(fileIno),
+		Paths:          []string{"/rootfs/work/data.bin"},
+		Count:          1,
+		TotalSizeBytes: 1024,
+	}}, out.PathSummaries)
+}
+
 func TestRun9GCSliceRangesDeletesOnlyMatchingObjects(t *testing.T) {
 	bucket := t.TempDir()
 	matchingKey := "chunks/0/0/11_0_3"

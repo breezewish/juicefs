@@ -43,11 +43,20 @@ type run9LiveSlice struct {
 	Size uint32 `json:"size"`
 }
 
+type run9LiveSlicePathSummary struct {
+	Inode          uint64   `json:"inode,omitempty"`
+	Paths          []string `json:"paths,omitempty"`
+	Count          int      `json:"count"`
+	TotalSizeBytes uint64   `json:"total_size_bytes"`
+	Unattributed   bool     `json:"unattributed,omitempty"`
+}
+
 type run9ListLiveSlicesOutput struct {
-	OK                bool             `json:"ok"`
-	JuiceFSFormatName string           `json:"juicefs_format_name"`
-	ObjectLayout      run9ObjectLayout `json:"object_layout"`
-	Slices            []run9LiveSlice  `json:"slices"`
+	OK                bool                       `json:"ok"`
+	JuiceFSFormatName string                     `json:"juicefs_format_name"`
+	ObjectLayout      run9ObjectLayout           `json:"object_layout"`
+	Slices            []run9LiveSlice            `json:"slices"`
+	PathSummaries     []run9LiveSlicePathSummary `json:"path_summaries,omitempty"`
 }
 
 type run9DescribeFormatOutput struct {
@@ -167,10 +176,14 @@ func cmdRun9ListLiveSlices() *cli.Command {
 				Name:  "scan-pending",
 				Usage: "include pending deleted and delayed slices",
 			},
+			&cli.BoolFlag{
+				Name:  "include-paths",
+				Usage: "include per-inode path summaries for diagnostics",
+			},
 		},
 		Action: func(ctx *cli.Context) error {
 			setup(ctx, 1)
-			out, err := run9ListSlices(ctx.Context, ctx.Args().Get(0), ctx.Bool("scan-pending"))
+			out, err := run9ListSlices(ctx.Context, ctx.Args().Get(0), ctx.Bool("scan-pending"), ctx.Bool("include-paths"))
 			if err != nil {
 				return err
 			}
@@ -284,7 +297,7 @@ func cmdRun9CountSliceRanges() *cli.Command {
 	}
 }
 
-func run9ListSlices(ctx context.Context, metaURL string, scanPending bool) (run9ListLiveSlicesOutput, error) {
+func run9ListSlices(ctx context.Context, metaURL string, scanPending bool, includePaths bool) (run9ListLiveSlicesOutput, error) {
 	metaURL = strings.TrimSpace(metaURL)
 	if metaURL == "" {
 		return run9ListLiveSlicesOutput{}, fmt.Errorf("missing meta url")
@@ -332,6 +345,11 @@ func run9ListSlices(ctx context.Context, metaURL string, scanPending bool) (run9
 		return slices[i].ID < slices[j].ID
 	})
 
+	var pathSummaries []run9LiveSlicePathSummary
+	if includePaths {
+		pathSummaries = run9LiveSlicePathSummaries(meta.WrapContext(ctx), m, slicesByInode)
+	}
+
 	return run9ListLiveSlicesOutput{
 		OK:                true,
 		JuiceFSFormatName: format.Name,
@@ -339,8 +357,62 @@ func run9ListSlices(ctx context.Context, metaURL string, scanPending bool) (run9
 			BlockSizeBytes: format.BlockSize * 1024,
 			HashPrefix:     format.HashPrefix,
 		},
-		Slices: slices,
+		Slices:        slices,
+		PathSummaries: pathSummaries,
 	}, nil
+}
+
+func run9LiveSlicePathSummaries(ctx meta.Context, m meta.Meta, slicesByInode map[meta.Ino][]meta.Slice) []run9LiveSlicePathSummary {
+	inodes := make([]meta.Ino, 0, len(slicesByInode))
+	for inode := range slicesByInode {
+		inodes = append(inodes, inode)
+	}
+	sort.Slice(inodes, func(i, j int) bool { return inodes[i] < inodes[j] })
+
+	summaries := make([]run9LiveSlicePathSummary, 0, len(inodes))
+	for _, inode := range inodes {
+		sliceSizes := map[uint64]uint32{}
+		for _, s := range slicesByInode[inode] {
+			if s.Size == 0 {
+				continue
+			}
+			if existing := sliceSizes[s.Id]; existing < s.Size {
+				sliceSizes[s.Id] = s.Size
+			}
+		}
+		if len(sliceSizes) == 0 {
+			continue
+		}
+
+		summary := run9LiveSlicePathSummary{
+			Inode: uint64(inode),
+			Count: len(sliceSizes),
+		}
+		for _, size := range sliceSizes {
+			summary.TotalSizeBytes += uint64(size)
+		}
+
+		if inode == 0 {
+			summary.Unattributed = true
+		} else {
+			summary.Paths = m.GetPaths(ctx, inode)
+			sort.Strings(summary.Paths)
+			if len(summary.Paths) == 0 {
+				summary.Unattributed = true
+			}
+		}
+		summaries = append(summaries, summary)
+	}
+
+	sort.Slice(summaries, func(i, j int) bool {
+		leftPath := strings.Join(summaries[i].Paths, "\x00")
+		rightPath := strings.Join(summaries[j].Paths, "\x00")
+		if leftPath == rightPath {
+			return summaries[i].Inode < summaries[j].Inode
+		}
+		return leftPath < rightPath
+	})
+	return summaries
 }
 
 func run9DescribeFormat(ctx context.Context, metaURL string) (run9DescribeFormatOutput, error) {
