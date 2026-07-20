@@ -139,6 +139,7 @@ func (tx *badgerTxn) delete(key []byte) {
 
 type badgerClient struct {
 	client    *badger.DB
+	readOnly  bool
 	ticker    *time.Ticker
 	done      chan struct{}
 	gcDone    chan struct{}
@@ -163,7 +164,7 @@ func (c *badgerClient) simpleTxn(ctx context.Context, f func(*kvTxn) error, retr
 }
 
 func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) (err error) {
-	tx := &badgerTxn{c.client.NewTransaction(true), c.client}
+	tx := &badgerTxn{c.client.NewTransaction(!c.readOnly), c.client}
 	defer func() { tx.t.Discard() }()
 	defer func() {
 		if r := recover(); r != nil {
@@ -178,6 +179,9 @@ func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int)
 	err = f(&kvTxn{tx, retry})
 	if err != nil {
 		return err
+	}
+	if c.readOnly {
+		return nil
 	}
 	// tx.t may differ from the original
 	return tx.t.Commit()
@@ -229,6 +233,7 @@ type badgerAddrOptions struct {
 
 	overrideNextChunk bool
 	nextChunkValue    int64
+	readOnly          bool
 }
 
 const (
@@ -253,8 +258,8 @@ func parseBadgerAddrOptions(addr string) (badgerAddrOptions, error) {
 		return badgerAddrOptions{}, fmt.Errorf("parse badger address query %q: %w", rawQuery, err)
 	}
 	for key := range query {
-		if key != "nextchunk" {
-			return badgerAddrOptions{}, fmt.Errorf("unsupported badger address query parameter %q (only nextchunk is supported)", key)
+		if key != "nextchunk" && key != "readonly" {
+			return badgerAddrOptions{}, fmt.Errorf("unsupported badger address query parameter %q (only nextchunk and readonly are supported)", key)
 		}
 	}
 
@@ -270,6 +275,18 @@ func parseBadgerAddrOptions(addr string) (badgerAddrOptions, error) {
 			return badgerAddrOptions{}, fmt.Errorf("invalid nextchunk value %q: %w", nextChunkStr, err)
 		}
 		opts.overrideNextChunk = true
+	}
+	if readOnlyValues, ok := query["readonly"]; ok {
+		if len(readOnlyValues) != 1 {
+			return badgerAddrOptions{}, fmt.Errorf("badger address readonly must be specified once, got %d", len(readOnlyValues))
+		}
+		opts.readOnly, err = strconv.ParseBool(readOnlyValues[0])
+		if err != nil {
+			return badgerAddrOptions{}, fmt.Errorf("invalid readonly value %q: %w", readOnlyValues[0], err)
+		}
+	}
+	if opts.readOnly && opts.overrideNextChunk {
+		return badgerAddrOptions{}, fmt.Errorf("badger address readonly and nextchunk cannot be combined")
 	}
 	return opts, nil
 }
@@ -316,9 +333,16 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	// bloom filter in memory. run9 opens these DBs on the exec hot path, so keep
 	// a small on-demand index cache instead of front-loading all table indexes.
 	opt.IndexCacheSize = badgerIndexCacheSize
+	// Fork divergence: offline run9 file readers open a cloned metadata directory
+	// without taking a writer lock. Badger's native read-only mode is the safety
+	// boundary that prevents those long-lived readers from mutating the clone.
+	opt.ReadOnly = opts.readOnly
 	openStart := time.Now()
 	client, err := badger.Open(opt)
-	openFields := map[string]any{"override_nextchunk": opts.overrideNextChunk}
+	openFields := map[string]any{
+		"override_nextchunk": opts.overrideNextChunk,
+		"read_only":          opts.readOnly,
+	}
 	if err != nil {
 		openFields["error"] = err.Error()
 	}
@@ -356,6 +380,10 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	gcDone := make(chan struct{})
 	go func() {
 		defer close(gcDone)
+		if opts.readOnly {
+			<-done
+			return
+		}
 		for {
 			select {
 			case <-ticker.C:
@@ -376,10 +404,11 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	}()
 
 	return &badgerClient{
-		client: client,
-		ticker: ticker,
-		done:   done,
-		gcDone: gcDone,
+		client:   client,
+		readOnly: opts.readOnly,
+		ticker:   ticker,
+		done:     done,
+		gcDone:   gcDone,
 	}, nil
 }
 

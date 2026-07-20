@@ -35,6 +35,8 @@ Related files:
 
 - run9 forces badger `ValueLogFileSize` down to `64 MiB` when opening metadata. run9 keeps badger directories inside the shared_meta JuiceFS mount, and the upstream `1 GiB` default preallocates `2 GiB` `*.vlog` files. In production this has surfaced as dangling vlog entries and `DB.Close` truncate `ENOENT` on the outer JuiceFS/FUSE layer during finalize, so run9 keeps the value logs small to stay on the boring path.
 
+- Accept `badger://path?readonly=1` and open Badger in its native read-only mode. This is used only for immutable metadata clones held by the run9 file gateway; it cannot be combined with `nextchunk`.
+
 Related files:
 
 - `pkg/meta/base.go`
@@ -42,6 +44,21 @@ Related files:
 - `pkg/meta/tkv_badger_nextchunk_test.go`
 - `pkg/meta/tkv_badger_options_test.go`
 - `go.mod`
+
+### Immutable Read View Server
+
+- The hidden `serve-read-view` command holds one immutable Badger generation and its object storage client open, and serves GET, HEAD, Range, conditional requests, and bounded directory listings over a mode-0600 Unix socket.
+
+- `pkg/fs.FileSystem.ReadDirPage` provides bounded, name-cursor directory reads for the immutable reader. It uses a Badger key scan directly instead of materializing the complete directory; other metadata backends keep their upstream contract unchanged.
+
+Related files:
+
+- `cmd/main.go`
+- `cmd/run9_read_view.go`
+- `cmd/run9_read_view_test.go`
+- `pkg/meta/run9_readdir_page.go`
+- `pkg/fs/run9_readdir_page.go`
+- `pkg/fs/run9_readdir_page_test.go`
 
 ### Meta tests hygiene
 

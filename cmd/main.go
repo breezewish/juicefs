@@ -90,6 +90,7 @@ func Main(args []string) error {
 			cmdRun9PrepareWritableEpoch(),
 			cmdRun9GCSliceRanges(),
 			cmdRun9CountSliceRanges(),
+			cmdRun9ServeReadView(),
 			cmdSummary(),
 			cmdCompact(),
 		},

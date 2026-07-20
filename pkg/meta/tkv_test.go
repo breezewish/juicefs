@@ -263,10 +263,15 @@ func testTKV(t *testing.T, c tkvClient) {
 }
 
 func TestBadgerKV(t *testing.T) {
-	c, err := newBadgerClient("test_badger")
+	c, err := newBadgerClient(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := c.close(); err != nil {
+			t.Fatalf("close badger client: %s", err)
+		}
+	})
 	testTKV(t, c)
 }
 
