@@ -87,12 +87,15 @@ func installForkFinalizeHandler(_ meta.Meta, v *vfs.VFS, _ object.ObjectStorage)
 				logger.Infof("Received SIGUSR2 but finalize is already in progress")
 				continue
 			}
+			forkMountLifecycle.Lock()
 			if err := writeForkFinalizePendingAckForCurrentProcess(); err != nil {
 				logger.Warnf("finalize: write pending ack: %s", err)
 			}
 			logger.Infof("Received SIGUSR2, requesting finalize via force umount")
 			if err := doUmount(v.Conf.Meta.MountPoint, true); err != nil {
 				logger.Warnf("finalize: force umount: %s", err)
+				forkFinalizeInProgress.Store(false)
+				forkMountLifecycle.Unlock()
 			}
 		}
 	}()

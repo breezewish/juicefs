@@ -29,11 +29,19 @@ func installForkFlushDrainHandler(v *vfs.VFS) {
 	signal.Notify(signalChan, syscall.SIGUSR1)
 	go func() {
 		for range signalChan {
+			forkMountLifecycle.RLock()
+			if forkFinalizeInProgress.Load() {
+				forkMountLifecycle.RUnlock()
+				logger.Infof("Received SIGUSR1 but finalize is already in progress")
+				continue
+			}
 			if !forkFlushDrainInProgress.CompareAndSwap(false, true) {
+				forkMountLifecycle.RUnlock()
 				logger.Infof("Received SIGUSR1 but flush-drain is already in progress")
 				continue
 			}
 			go func() {
+				defer forkMountLifecycle.RUnlock()
 				defer forkFlushDrainInProgress.Store(false)
 				if err := runForkFlushDrain(v); err != nil {
 					logger.Errorf("flush-drain: %s", err)
@@ -132,9 +140,11 @@ func runForkFlushDrain(v *vfs.VFS) (resultErr error) {
 	}()
 
 	writePendingAck("flush_all")
-	recordErr("flush_all", runForkFinalizeBlockingPhase(flushCtx, flushTimeout, requestedTimeout, func() error {
-		return forkFlushDrainFlushAll(v)
-	}))
+	flushErr := forkFlushDrainFlushAll(v)
+	if flushCtx.Err() != nil {
+		flushErr = forkFinalizePhaseTimeoutErr(flushTimeout, requestedTimeout, flushCtx.Err())
+	}
+	recordErr("flush_all", flushErr)
 	if flushCtx.Err() != nil {
 		return resultErr
 	}
