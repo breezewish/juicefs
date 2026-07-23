@@ -333,6 +333,11 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	// bloom filter in memory. run9 opens these DBs on the exec hot path, so keep
 	// a small on-demand index cache instead of front-loading all table indexes.
 	opt.IndexCacheSize = badgerIndexCacheSize
+	// Fork divergence: run9rt owns a distributed per-snap lock before any
+	// writable Badger client can open this directory. Badger's local LOCK file
+	// duplicates that invariant and adds shared-FUSE metadata round trips to
+	// every first exec mount.
+	opt.BypassLockGuard = true
 	// Fork divergence: offline run9 file readers open a cloned metadata directory
 	// without taking a writer lock. Badger's native read-only mode is the safety
 	// boundary that prevents those long-lived readers from mutating the clone.

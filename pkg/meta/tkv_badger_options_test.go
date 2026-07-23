@@ -34,6 +34,9 @@ func TestBadgerClientUsesRun9ValueLogSize(t *testing.T) {
 	if opts.IndexCacheSize != badgerIndexCacheSize {
 		t.Fatalf("expected IndexCacheSize=%d, got %d", badgerIndexCacheSize, opts.IndexCacheSize)
 	}
+	if !opts.BypassLockGuard {
+		t.Fatal("expected BypassLockGuard=true")
+	}
 }
 
 func TestBadgerClientReadOnlyAddress(t *testing.T) {
