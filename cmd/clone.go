@@ -58,6 +58,11 @@ $ juicefs clone -p /mnt/jfs/file1 /mnt/jfs/file2`,
 				Value: meta.CLONE_DEFAULT_CONCURRENCY,
 				Usage: "number of concurrent workers for cloning directories",
 			},
+			&cli.PathFlag{
+				Name:   "mountpoint-hint",
+				Usage:  "discover the JuiceFS mountpoint once from a known ancestor of SRC and DST",
+				Hidden: true,
+			},
 		},
 	}
 }
@@ -91,16 +96,34 @@ func clone(ctx *cli.Context) error {
 		return fmt.Errorf("abs of %s: %s", dst, err)
 	}
 
-	srcMp, err := findMountpoint(srcAbsPath)
-	if err != nil {
-		return err
-	}
-	dstMp, err := findMountpoint(filepath.Dir(dstAbsPath))
-	if err != nil {
-		return err
-	}
-	if srcMp != dstMp {
-		return fmt.Errorf("the clone DST path should be at the same mount point as the SRC path")
+	var srcMp string
+	if configuredHint := strings.TrimSpace(ctx.Path("mountpoint-hint")); configuredHint != "" {
+		hintAbsPath, err := filepath.Abs(configuredHint)
+		if err != nil {
+			return fmt.Errorf("abs of mountpoint hint %s: %s", configuredHint, err)
+		}
+		if !pathWithinCloneMountpointHint(hintAbsPath, srcAbsPath) {
+			return fmt.Errorf("the clone SRC path should be under the configured mountpoint hint")
+		}
+		if !pathWithinCloneMountpointHint(hintAbsPath, filepath.Dir(dstAbsPath)) {
+			return fmt.Errorf("the clone DST path should be under the configured mountpoint hint")
+		}
+		srcMp, err = findMountpoint(hintAbsPath)
+		if err != nil {
+			return fmt.Errorf("discover mountpoint from hint %s: %s", hintAbsPath, err)
+		}
+	} else {
+		srcMp, err = findMountpoint(srcAbsPath)
+		if err != nil {
+			return err
+		}
+		dstMp, err := findMountpoint(filepath.Dir(dstAbsPath))
+		if err != nil {
+			return err
+		}
+		if srcMp != dstMp {
+			return fmt.Errorf("the clone DST path should be at the same mount point as the SRC path")
+		}
 	}
 	if strings.HasPrefix(dstAbsPath, path.Clean(srcAbsPath)+"/") {
 		return fmt.Errorf("the clone DST path should not be under the SRC path")
@@ -155,6 +178,11 @@ func clone(ctx *cli.Context) error {
 		return fmt.Errorf("clone failed: %v", errno)
 	}
 	return nil
+}
+
+func pathWithinCloneMountpointHint(hint string, target string) bool {
+	relative, err := filepath.Rel(hint, target)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func findMountpoint(fpath string) (string, error) {
