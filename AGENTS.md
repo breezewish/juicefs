@@ -53,14 +53,8 @@ Related files:
   using pipelined reads and one atomic publish. This keeps run9 snap forks from
   issuing one Redis transaction per Badger metadata file under burst load.
 
-- The hidden clone `--mountpoint-hint` option lets run9rt provide its configured
-  shared metadata directory. The command discovers the mount root from that
-  common ancestor once instead of walking every source and destination ancestor
-  through uncached FUSE metadata.
-
 Related files:
 
-- `cmd/clone.go`
 - `pkg/meta/redis_batch_clone_run9.go`
 
 ### Immutable Read View Server
