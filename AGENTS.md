@@ -47,6 +47,16 @@ Related files:
 - `pkg/meta/tkv_badger_options_test.go`
 - `go.mod`
 
+### Redis Batch Clone
+
+- Redis metadata clones all non-directory entries in one watched transaction,
+  using pipelined reads and one atomic publish. This keeps run9 snap forks from
+  issuing one Redis transaction per Badger metadata file under burst load.
+
+Related files:
+
+- `pkg/meta/redis_batch_clone_run9.go`
+
 ### Immutable Read View Server
 
 - The hidden `serve-read-view` command holds one immutable Badger generation and its object storage client open, and serves GET, HEAD, Range, conditional requests, and bounded directory listings over a mode-0600 Unix socket.
