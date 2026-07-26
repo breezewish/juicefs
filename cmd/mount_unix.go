@@ -517,8 +517,10 @@ func genFuseOpt(c *cli.Context, name string) string {
 	case "darwin":
 		fuseOpt += ",allow_recursion"
 	case "linux":
-		// nonempty has been removed since 3.0.0
-		if getFuserMountVersion() < "3.0.0" {
+		// nonempty has been removed since 3.0.0. A run9 mount always owns a
+		// freshly prepared mountpoint, so it never needs this compatibility
+		// option and should not spawn fusermount just to discover its version.
+		if os.Getenv(run9SupervisorRecordEnv) == "" && getFuserMountVersion() < "3.0.0" {
 			fuseOpt += ",nonempty"
 		}
 	}
