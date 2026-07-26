@@ -17,7 +17,6 @@
 package chunk
 
 import (
-	"context"
 	"errors"
 	"runtime"
 	"sync"
@@ -103,18 +102,6 @@ func (c *memcache) cache(key string, p *Page, force, dropCache bool) {
 	if c.full() && c.eviction != EvictionNone {
 		c.cleanup()
 	}
-}
-
-func (c *memcache) cacheSync(key string, p *Page, dropCache bool) {
-	c.cache(key, p, true, dropCache)
-}
-
-func (c *memcache) sharedRead(string) bool {
-	return false
-}
-
-func (c *memcache) withSharedReadLock(_ context.Context, _ string, fn func() error) error {
-	return fn()
 }
 
 func (c *memcache) delete(key string, p *Page) {

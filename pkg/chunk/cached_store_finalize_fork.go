@@ -174,7 +174,7 @@ func (store *cachedStore) listStagingRoots() ([]string, error) {
 			if s == nil {
 				continue
 			}
-			roots = append(roots, s.stagingDir)
+			roots = append(roots, filepath.Join(s.dir, stagingDir))
 		}
 		m.Unlock()
 		return roots, nil

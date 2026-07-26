@@ -163,29 +163,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		} else {
 			tmp.Acquire()
 		}
-		cache := s.store.shouldCache(blockSize)
-		if s.store.bcache.sharedRead(key) {
-			err = s.store.bcache.withSharedReadLock(ctx, key, func() error {
-				if r, loadErr := s.store.bcache.load(key); loadErr == nil {
-					_, loadErr = r.ReadAt(tmp.Data, 0)
-					_ = r.Close()
-					if loadErr == nil {
-						return nil
-					}
-					s.store.bcache.remove(key, false)
-				}
-
-				if loadErr := s.store.load(ctx, key, tmp, false, false); loadErr != nil {
-					return loadErr
-				}
-				if cache {
-					s.store.bcache.cacheSync(key, tmp, !s.store.conf.OSCache)
-				}
-				return nil
-			})
-		} else {
-			err = s.store.load(ctx, key, tmp, cache, false)
-		}
+		err = s.store.load(ctx, key, tmp, s.store.shouldCache(blockSize), false)
 		return tmp, err
 	})
 	defer block.Release()
@@ -542,10 +520,7 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir string
-	// StagingDir isolates writeback files from the read cache when set.
-	// Multiple cache devices use numbered subdirectories below this path.
-	StagingDir             string
+	CacheDir               string
 	CacheMode              os.FileMode
 	CacheSize              uint64
 	CacheItems             int64
@@ -611,9 +586,6 @@ func (c *Config) SelfCheck(uuid string) {
 			ds[i] = filepath.Join(ds[i], uuid)
 		}
 		c.CacheDir = strings.Join(ds, string(os.PathListSeparator))
-		if c.StagingDir != "" {
-			c.StagingDir = filepath.Join(c.StagingDir, uuid)
-		}
 		if cs := []string{CsNone, CsFull, CsShrink, CsExtend}; !utils.StringContains(cs, c.CacheChecksum) {
 			logger.Warnf("verify-cache-checksum should be one of %v", cs)
 			c.CacheChecksum = CsExtend

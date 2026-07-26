@@ -17,7 +17,6 @@
 package chunk
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -41,14 +40,11 @@ import (
 	"github.com/charlievieth/fastwalk"
 	"github.com/davies/groupcache/consistenthash"
 	"github.com/dustin/go-humanize"
-	"github.com/gofrs/flock"
 	"github.com/google/uuid"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/murmur3"
 )
-
-const sharedReadLockStripes = 256
 
 var (
 	stagingDir          = "rawstaging"
@@ -79,11 +75,7 @@ type cacheStore struct {
 	id         string
 	totalPages int64
 	sync.Mutex
-	dir        string
-	stagingDir string
-	// Separate staging means other mounts can populate the shared read cache
-	// after this process has indexed it. Index misses must still check disk.
-	sharedReadDir bool
+	dir           string
 	mode          os.FileMode
 	maxStageWrite int
 	capacity      int64
@@ -116,22 +108,6 @@ type cacheStore struct {
 }
 
 func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
-	return newCacheStoreWithStagingDir(
-		m,
-		dir,
-		filepath.Join(dir, stagingDir),
-		cacheSize,
-		maxItems,
-		pendingPages,
-		config,
-		uploader,
-	)
-}
-
-// newCacheStoreWithStagingDir keeps writable staging files outside the
-// shareable read cache. The two paths should be on the same filesystem so a
-// staged block can be hard-linked into the read cache after upload.
-func newCacheStoreWithStagingDir(m *cacheManagerMetrics, dir, writebackDir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
 	if config.CacheMode == 0 {
 		config.CacheMode = 0600 // only owner can read/write cache
 	}
@@ -147,8 +123,6 @@ func newCacheStoreWithStagingDir(m *cacheManagerMetrics, dir, writebackDir strin
 	c := &cacheStore{
 		m:                   m,
 		dir:                 dir,
-		stagingDir:          writebackDir,
-		sharedReadDir:       filepath.Clean(writebackDir) != filepath.Clean(filepath.Join(dir, stagingDir)),
 		mode:                config.CacheMode,
 		capacity:            cacheSize,
 		maxItems:            maxItems,
@@ -173,7 +147,6 @@ func newCacheStoreWithStagingDir(m *cacheManagerMetrics, dir, writebackDir strin
 	}
 
 	c.createDir(c.dir)
-	c.createDir(c.stagingDir)
 	usage := c.curFreeRatio()
 	if usage.br < c.freeRatio || usage.fr < c.freeRatio {
 		logger.Warnf("not enough space (%d%%) or inodes (%d%%) for caching in %s: free ratio should be >= %d%%", int(usage.br*100), int(usage.fr*100), c.dir, int(c.freeRatio*100))
@@ -500,50 +473,6 @@ func (cache *cacheStore) cache(key string, p *Page, force, dropCache bool) {
 	}
 }
 
-// cacheSync publishes a shared read block before the filesystem lock is
-// released. The normal asynchronous writer remains the cheaper path for
-// process-private caches.
-func (cache *cacheStore) cacheSync(key string, p *Page, dropCache bool) {
-	if !cache.enabled() {
-		return
-	}
-	if cache.rawFull && cache.keys.name() == EvictionNone {
-		cache.m.cacheDrops.Add(1)
-		return
-	}
-	if r, err := cache.load(key); err == nil {
-		_ = r.Close()
-		return
-	}
-	path := cache.cachePath(key)
-	if cache.flushPage(path, p.Data, dropCache) == nil {
-		cache.add(key, int32(len(p.Data)), uint32(time.Now().Unix()))
-	}
-}
-
-func (cache *cacheStore) withSharedReadLock(ctx context.Context, key string, fn func() error) error {
-	if !cache.sharedReadDir {
-		return fn()
-	}
-	lockDir := filepath.Join(cache.dir, ".shared-read-locks")
-	cache.createDir(lockDir)
-	lockPath := filepath.Join(lockDir, fmt.Sprintf("%02x.lock", murmur3.Sum32([]byte(key))%sharedReadLockStripes))
-	fileLock := flock.New(lockPath)
-	locked, err := fileLock.TryLockContext(ctx, 2*time.Millisecond)
-	if err != nil {
-		return err
-	}
-	if !locked {
-		return ctx.Err()
-	}
-	defer func() {
-		if err := fileLock.Unlock(); err != nil {
-			logger.Warnf("unlock shared cache stripe %s: %s", lockPath, err)
-		}
-	}()
-	return fn()
-}
-
 type DiskFreeRatio struct {
 	br       float32
 	fr       float32
@@ -716,7 +645,7 @@ func (cache *cacheStore) load(key string) (ReadCloser, error) {
 		return NewPageReader(p), nil
 	}
 	k := cache.getCacheKey(key)
-	if cache.scanned && cache.keys.get(k) == nil && !cache.sharedReadDir {
+	if cache.scanned && cache.keys.get(k) == nil {
 		return nil, errNotCached
 	}
 	cache.Unlock()
@@ -763,7 +692,7 @@ func (cache *cacheStore) exist(key string) (bool, error) {
 		return true, nil
 	}
 	k := cache.getCacheKey(key)
-	if cache.scanned && cache.keys.get(k) == nil && !cache.sharedReadDir {
+	if cache.scanned && cache.keys.get(k) == nil {
 		return false, errNotCached
 	}
 	cache.Unlock()
@@ -790,7 +719,7 @@ func (cache *cacheStore) cachePath(key string) string {
 }
 
 func (cache *cacheStore) stagePath(key string) string {
-	return filepath.Join(cache.stagingDir, key)
+	return filepath.Join(cache.dir, stagingDir, key)
 }
 
 // flush cached block into disk
@@ -1058,7 +987,7 @@ func (cache *cacheStore) scanStaging() {
 	var start = time.Now()
 	var oneMinAgo = start.Add(-time.Minute)
 	var count, usage uint64
-	stagingPrefix := cache.stagingDir
+	stagingPrefix := filepath.Join(cache.dir, stagingDir)
 	logger.Debugf("Scan %s to find staging blocks", stagingPrefix)
 	_ = fastwalk.Walk(nil, stagingPrefix, func(path string, d fs.DirEntry, err error) error {
 		// this func should be concurrent safe
@@ -1159,9 +1088,6 @@ func expandDir(pattern string) []string {
 
 type CacheManager interface {
 	cache(key string, p *Page, force, dropCache bool)
-	cacheSync(key string, p *Page, dropCache bool)
-	sharedRead(key string) bool
-	withSharedReadLock(ctx context.Context, key string, fn func() error) error
 	remove(key string, staging bool)
 	load(key string) (ReadCloser, error)
 	exist(key string) (string, bool)
@@ -1211,14 +1137,7 @@ func newCacheManager(config *Config, reg prometheus.Registerer, uploader func(ke
 	// 20% of buffer could be used for pending pages
 	pendingPages := int(config.BufferSize) * 2 / 10 / config.BlockSize / len(dirs)
 	for i, d := range dirs {
-		writebackDir := filepath.Join(strings.TrimSpace(d), stagingDir)
-		if config.StagingDir != "" {
-			writebackDir = config.StagingDir
-			if len(dirs) > 1 {
-				writebackDir = filepath.Join(writebackDir, fmt.Sprintf("store-%d", i))
-			}
-		}
-		store := newCacheStoreWithStagingDir(metrics, strings.TrimSpace(d)+string(filepath.Separator), writebackDir, dirCacheSize, dirCacheItems, pendingPages, config, uploader)
+		store := newCacheStore(metrics, strings.TrimSpace(d)+string(filepath.Separator), dirCacheSize, dirCacheItems, pendingPages, config, uploader)
 		m.stores[i] = store
 		m.storeMap[store.id] = store
 		m.consistentMap.Add(store.id)
@@ -1328,26 +1247,6 @@ func (m *cacheManager) cache(key string, p *Page, force, dropCache bool) {
 	if store != nil {
 		store.cache(key, p, force, dropCache)
 	}
-}
-
-func (m *cacheManager) cacheSync(key string, p *Page, dropCache bool) {
-	store := m.getStore(key)
-	if store != nil {
-		store.cacheSync(key, p, dropCache)
-	}
-}
-
-func (m *cacheManager) sharedRead(key string) bool {
-	store := m.getStore(key)
-	return store != nil && store.sharedReadDir
-}
-
-func (m *cacheManager) withSharedReadLock(ctx context.Context, key string, fn func() error) error {
-	store := m.getStore(key)
-	if store == nil {
-		return fn()
-	}
-	return store.withSharedReadLock(ctx, key, fn)
 }
 
 type ReadCloser interface {

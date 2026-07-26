@@ -33,14 +33,6 @@ func newFinalizeTestCacheManager(t *testing.T, checksum string) *finalizeTestCac
 
 func (m *finalizeTestCacheManager) cache(string, *Page, bool, bool) {}
 
-func (m *finalizeTestCacheManager) cacheSync(string, *Page, bool) {}
-
-func (m *finalizeTestCacheManager) sharedRead(string) bool { return false }
-
-func (m *finalizeTestCacheManager) withSharedReadLock(_ context.Context, _ string, fn func() error) error {
-	return fn()
-}
-
 func (m *finalizeTestCacheManager) remove(string, bool) {}
 
 func (m *finalizeTestCacheManager) load(key string) (ReadCloser, error) {
