@@ -520,7 +520,10 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir               string
+	CacheDir string
+	// StagingDir isolates writeback files from the read cache when set.
+	// Multiple cache devices use numbered subdirectories below this path.
+	StagingDir             string
 	CacheMode              os.FileMode
 	CacheSize              uint64
 	CacheItems             int64
@@ -586,6 +589,9 @@ func (c *Config) SelfCheck(uuid string) {
 			ds[i] = filepath.Join(ds[i], uuid)
 		}
 		c.CacheDir = strings.Join(ds, string(os.PathListSeparator))
+		if c.StagingDir != "" {
+			c.StagingDir = filepath.Join(c.StagingDir, uuid)
+		}
 		if cs := []string{CsNone, CsFull, CsShrink, CsExtend}; !utils.StringContains(cs, c.CacheChecksum) {
 			logger.Warnf("verify-cache-checksum should be one of %v", cs)
 			c.CacheChecksum = CsExtend

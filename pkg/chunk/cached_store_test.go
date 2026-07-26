@@ -33,6 +33,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestConfigSelfCheckSeparatesReadCacheAndStagingByVolume(t *testing.T) {
+	root := t.TempDir()
+	conf := Config{
+		CacheDir:    filepath.Join(root, "read"),
+		StagingDir:  filepath.Join(root, "staging"),
+		CacheSize:   1,
+		MaxUpload:   1,
+		MaxDownload: 1,
+		BufferSize:  32 << 20,
+		BlockSize:   4 << 20,
+	}
+
+	conf.SelfCheck("volume-id")
+
+	require.Equal(t, filepath.Join(root, "read", "volume-id"), conf.CacheDir)
+	require.Equal(t, filepath.Join(root, "staging", "volume-id"), conf.StagingDir)
+}
+
 func forgetSlice(store ChunkStore, sliceId uint64, size int) error {
 	w := store.NewWriter(sliceId)
 	buf := bytes.Repeat([]byte{0x41}, size)

@@ -173,6 +173,21 @@ Related files:
 - `pkg/vfs/vfs.go`
 - `pkg/vfs/vfs_test.go`
 
+### Separate Run9 Read Cache and Writeback Staging
+
+- `--staging-dir` keeps writable `rawstaging` files outside `--cache-dir`.
+  run9 shares immutable read blocks across mounted snaps in one lineage while
+  retaining a private staging directory for each writable snap.
+
+Related files:
+
+- `cmd/flags.go`
+- `cmd/mount.go`
+- `cmd/umount.go`
+- `pkg/chunk/cached_store.go`
+- `pkg/chunk/disk_cache.go`
+- `pkg/chunk/cached_store_finalize_fork.go`
+
 ### Run9 Deleted Snap Object GC
 
 - Hidden internal commands `list-live-slices`, `describe-format`, and `gc-slice-ranges` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC.

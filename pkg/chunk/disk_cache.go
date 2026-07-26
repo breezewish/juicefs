@@ -75,7 +75,11 @@ type cacheStore struct {
 	id         string
 	totalPages int64
 	sync.Mutex
-	dir           string
+	dir        string
+	stagingDir string
+	// Separate staging means other mounts can populate the shared read cache
+	// after this process has indexed it. Index misses must still check disk.
+	sharedReadDir bool
 	mode          os.FileMode
 	maxStageWrite int
 	capacity      int64
@@ -108,6 +112,22 @@ type cacheStore struct {
 }
 
 func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
+	return newCacheStoreWithStagingDir(
+		m,
+		dir,
+		filepath.Join(dir, stagingDir),
+		cacheSize,
+		maxItems,
+		pendingPages,
+		config,
+		uploader,
+	)
+}
+
+// newCacheStoreWithStagingDir keeps writable staging files outside the
+// shareable read cache. The two paths should be on the same filesystem so a
+// staged block can be hard-linked into the read cache after upload.
+func newCacheStoreWithStagingDir(m *cacheManagerMetrics, dir, writebackDir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
 	if config.CacheMode == 0 {
 		config.CacheMode = 0600 // only owner can read/write cache
 	}
@@ -123,6 +143,8 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 	c := &cacheStore{
 		m:                   m,
 		dir:                 dir,
+		stagingDir:          writebackDir,
+		sharedReadDir:       filepath.Clean(writebackDir) != filepath.Clean(filepath.Join(dir, stagingDir)),
 		mode:                config.CacheMode,
 		capacity:            cacheSize,
 		maxItems:            maxItems,
@@ -147,6 +169,7 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 	}
 
 	c.createDir(c.dir)
+	c.createDir(c.stagingDir)
 	usage := c.curFreeRatio()
 	if usage.br < c.freeRatio || usage.fr < c.freeRatio {
 		logger.Warnf("not enough space (%d%%) or inodes (%d%%) for caching in %s: free ratio should be >= %d%%", int(usage.br*100), int(usage.fr*100), c.dir, int(c.freeRatio*100))
@@ -645,7 +668,7 @@ func (cache *cacheStore) load(key string) (ReadCloser, error) {
 		return NewPageReader(p), nil
 	}
 	k := cache.getCacheKey(key)
-	if cache.scanned && cache.keys.get(k) == nil {
+	if cache.scanned && cache.keys.get(k) == nil && !cache.sharedReadDir {
 		return nil, errNotCached
 	}
 	cache.Unlock()
@@ -692,7 +715,7 @@ func (cache *cacheStore) exist(key string) (bool, error) {
 		return true, nil
 	}
 	k := cache.getCacheKey(key)
-	if cache.scanned && cache.keys.get(k) == nil {
+	if cache.scanned && cache.keys.get(k) == nil && !cache.sharedReadDir {
 		return false, errNotCached
 	}
 	cache.Unlock()
@@ -719,7 +742,7 @@ func (cache *cacheStore) cachePath(key string) string {
 }
 
 func (cache *cacheStore) stagePath(key string) string {
-	return filepath.Join(cache.dir, stagingDir, key)
+	return filepath.Join(cache.stagingDir, key)
 }
 
 // flush cached block into disk
@@ -987,7 +1010,7 @@ func (cache *cacheStore) scanStaging() {
 	var start = time.Now()
 	var oneMinAgo = start.Add(-time.Minute)
 	var count, usage uint64
-	stagingPrefix := filepath.Join(cache.dir, stagingDir)
+	stagingPrefix := cache.stagingDir
 	logger.Debugf("Scan %s to find staging blocks", stagingPrefix)
 	_ = fastwalk.Walk(nil, stagingPrefix, func(path string, d fs.DirEntry, err error) error {
 		// this func should be concurrent safe
@@ -1137,7 +1160,14 @@ func newCacheManager(config *Config, reg prometheus.Registerer, uploader func(ke
 	// 20% of buffer could be used for pending pages
 	pendingPages := int(config.BufferSize) * 2 / 10 / config.BlockSize / len(dirs)
 	for i, d := range dirs {
-		store := newCacheStore(metrics, strings.TrimSpace(d)+string(filepath.Separator), dirCacheSize, dirCacheItems, pendingPages, config, uploader)
+		writebackDir := filepath.Join(strings.TrimSpace(d), stagingDir)
+		if config.StagingDir != "" {
+			writebackDir = config.StagingDir
+			if len(dirs) > 1 {
+				writebackDir = filepath.Join(writebackDir, fmt.Sprintf("store-%d", i))
+			}
+		}
+		store := newCacheStoreWithStagingDir(metrics, strings.TrimSpace(d)+string(filepath.Separator), writebackDir, dirCacheSize, dirCacheItems, pendingPages, config, uploader)
 		m.stores[i] = store
 		m.storeMap[store.id] = store
 		m.consistentMap.Add(store.id)

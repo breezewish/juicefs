@@ -389,6 +389,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		UploadHours:            c.String("upload-hours"),
 
 		CacheDir:          c.String("cache-dir"),
+		StagingDir:        c.String("staging-dir"),
 		CacheSize:         utils.ParseBytes(c, "cache-size", 'M'),
 		CacheItems:        c.Int64("cache-items"),
 		FreeSpace:         float32(c.Float64("free-space-ratio")),

@@ -226,6 +226,10 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "directory paths of local cache, use colon to separate multiple paths",
 		},
 		&cli.StringFlag{
+			Name:  "staging-dir",
+			Usage: "separate directory for writeback staging files",
+		},
+		&cli.StringFlag{
 			Name:  "cache-mode",
 			Value: "0600", // only owner can read/write cache
 			Usage: "file permissions for cached blocks",
