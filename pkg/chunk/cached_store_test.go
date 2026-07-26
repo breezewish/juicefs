@@ -33,6 +33,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestConfigSelfCheckSeparatesReadCacheAndStagingByVolume(t *testing.T) {
+	root := t.TempDir()
+	conf := Config{
+		CacheDir:    filepath.Join(root, "read"),
+		StagingDir:  filepath.Join(root, "staging"),
+		CacheSize:   1,
+		MaxUpload:   1,
+		MaxDownload: 1,
+		BufferSize:  32 << 20,
+		BlockSize:   4 << 20,
+	}
+
+	conf.SelfCheck("volume-id")
+
+	require.Equal(t, filepath.Join(root, "read", "volume-id"), conf.CacheDir)
+	require.Equal(t, filepath.Join(root, "staging", "volume-id"), conf.StagingDir)
+}
+
 func forgetSlice(store ChunkStore, sliceId uint64, size int) error {
 	w := store.NewWriter(sliceId)
 	buf := bytes.Repeat([]byte{0x41}, size)
@@ -479,4 +497,52 @@ func TestStoreRetry(t *testing.T) {
 	defer p.Release()
 	cs.(*cachedStore).load(context.TODO(), "non", p, false, false) // wont retry
 	require.Equal(t, int32(1), s.cnt)
+}
+
+type delayedCountingStore struct {
+	object.ObjectStorage
+	gets atomic.Int32
+}
+
+func (s *delayedCountingStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	s.gets.Add(1)
+	time.Sleep(20 * time.Millisecond)
+	return s.ObjectStorage.Get(ctx, key, off, limit, getters...)
+}
+
+func TestSharedReadCacheCoalescesConcurrentStores(t *testing.T) {
+	blob, err := object.CreateStorage("mem", "", "", "", "")
+	require.NoError(t, err)
+	require.NoError(t, blob.Put(context.Background(), "chunks/0/0/1_0_4", bytes.NewReader([]byte("data"))))
+	storage := &delayedCountingStore{ObjectStorage: blob}
+
+	cacheRoot := t.TempDir()
+	firstConf := defaultConf
+	firstConf.CacheDir = filepath.Join(cacheRoot, "read")
+	firstConf.StagingDir = filepath.Join(cacheRoot, "staging-a")
+	secondConf := firstConf
+	secondConf.StagingDir = filepath.Join(cacheRoot, "staging-b")
+
+	first := NewCachedStore(storage, firstConf, nil)
+	second := NewCachedStore(storage, secondConf, nil)
+	start := make(chan struct{})
+	results := make(chan string, 2)
+	for _, store := range []ChunkStore{first, second} {
+		go func() {
+			<-start
+			page := NewPage(make([]byte, 4))
+			defer page.Release()
+			n, readErr := store.NewReader(1, 4).ReadAt(context.Background(), page, 0)
+			if readErr != nil {
+				results <- readErr.Error()
+				return
+			}
+			results <- string(page.Data[:n])
+		}()
+	}
+	close(start)
+
+	require.Equal(t, "data", <-results)
+	require.Equal(t, "data", <-results)
+	require.EqualValues(t, 1, storage.gets.Load())
 }

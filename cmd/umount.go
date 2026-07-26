@@ -115,6 +115,9 @@ func umount(ctx *cli.Context) error {
 		}
 		if conf.Chunk.Writeback {
 			stagingDir := path.Join(conf.Chunk.CacheDir, "rawstaging")
+			if conf.Chunk.StagingDir != "" {
+				stagingDir = conf.Chunk.StagingDir
+			}
 			if err := waitWritebackComplete(stagingDir); err != nil {
 				return err
 			}

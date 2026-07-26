@@ -87,6 +87,56 @@ func TestNewCacheStore(t *testing.T) {
 	}
 }
 
+func TestSeparateStagingDirsShareReadCache(t *testing.T) {
+	root := t.TempDir()
+	readCacheDir := filepath.Join(root, "read")
+	firstStagingDir := filepath.Join(root, "staging-a")
+	secondStagingDir := filepath.Join(root, "staging-b")
+	conf := defaultConf
+	conf.CacheExpire = 0
+
+	metrics := new(cacheManagerMetrics)
+	metrics.initMetrics()
+	first := newCacheStoreWithStagingDir(
+		metrics,
+		readCacheDir,
+		firstStagingDir,
+		1<<30,
+		conf.CacheItems,
+		1,
+		&conf,
+		nil,
+	)
+	second := newCacheStoreWithStagingDir(
+		metrics,
+		readCacheDir,
+		secondStagingDir,
+		1<<30,
+		conf.CacheItems,
+		1,
+		&conf,
+		nil,
+	)
+	defer shutdownStore(first)
+	defer shutdownStore(second)
+
+	key := "chunks/1/1/1_0_4"
+	stagingPath, err := first.stage(key, []byte("data"))
+	require.NoError(t, err)
+	require.True(t, filepath.IsAbs(stagingPath))
+	require.FileExists(t, stagingPath)
+	require.NoFileExists(t, second.stagePath(key))
+
+	cached, err := second.load(key)
+	require.NoError(t, err)
+	defer cached.Close()
+	buf := make([]byte, 4)
+	n, err := cached.ReadAt(buf, 0)
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	require.Equal(t, "data", string(buf))
+}
+
 func TestMetrics(t *testing.T) {
 	conf := testConf()
 	defer os.RemoveAll(conf.CacheDir)
