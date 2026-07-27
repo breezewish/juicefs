@@ -120,6 +120,53 @@ type blockingFinalizeSessionShutdowner struct {
 	shutdownCh        <-chan struct{}
 }
 
+func TestRunForkFinalizeOnMain_IncludesSizeFromOpenMetadataClient(t *testing.T) {
+	pid := os.Getpid()
+	starttimeTicks, err := readProcStatStarttimeTicks(pid)
+	if err != nil {
+		t.Fatalf("readProcStatStarttimeTicks: %v", err)
+	}
+
+	ackPath := forkFinalizeAckPath(pid, starttimeTicks)
+	_ = os.Remove(ackPath)
+	t.Cleanup(func() { _ = os.Remove(ackPath) })
+
+	origFlushAll := forkFinalizeFlushAll
+	origMeasureSize := forkFinalizeMeasureSize
+	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
+	forkFinalizeMeasureSize = func(*vfs.VFS) (uint64, uint64, error) {
+		return 8192, 2, nil
+	}
+	defer func() {
+		forkFinalizeFlushAll = origFlushAll
+		forkFinalizeMeasureSize = origMeasureSize
+	}()
+
+	metaCli := &fakeFinalizeSessionShutdowner{}
+	err = runForkFinalizeOnMain(metaCli, &vfs.VFS{Conf: &vfs.Config{}}, nil)
+	if err != nil {
+		t.Fatalf("runForkFinalizeOnMain: %v", err)
+	}
+
+	data, err := os.ReadFile(ackPath)
+	if err != nil {
+		t.Fatalf("ReadFile ack: %v", err)
+	}
+	var ack forkFinalizeAckV1
+	if err := json.Unmarshal(data, &ack); err != nil {
+		t.Fatalf("Unmarshal ack: %v", err)
+	}
+	if ack.UsedBytes == nil || *ack.UsedBytes != 8192 {
+		t.Fatalf("unexpected used bytes: %+v", ack)
+	}
+	if ack.UsedInodes == nil || *ack.UsedInodes != 2 {
+		t.Fatalf("unexpected used inodes: %+v", ack)
+	}
+	if ack.SizeMeasuredAt == "" || ack.SizeError != "" {
+		t.Fatalf("unexpected size result: %+v", ack)
+	}
+}
+
 func (b *blockingFinalizeSessionShutdowner) CloseSession() error {
 	b.closeCalls++
 	if !b.blockCloseSession {

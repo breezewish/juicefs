@@ -25,6 +25,20 @@ var forkFinalizeFlushAll = func(v *vfs.VFS) error {
 	return v.FlushAll("")
 }
 
+var forkFinalizeMeasureSize = func(v *vfs.VFS) (uint64, uint64, error) {
+	if v.Meta == nil {
+		return 0, 0, errors.New("metadata client is unavailable")
+	}
+	var totalSpace, availableSpace, usedInodes, availableInodes uint64
+	if errno := v.Meta.StatFS(meta.Background(), meta.RootInode, &totalSpace, &availableSpace, &usedInodes, &availableInodes); errno != 0 {
+		return 0, 0, fmt.Errorf("statfs: %s", errno)
+	}
+	if availableSpace > totalSpace {
+		return 0, 0, fmt.Errorf("statfs available space %d exceeds total space %d", availableSpace, totalSpace)
+	}
+	return totalSpace - availableSpace, usedInodes, nil
+}
+
 func forkFinalizeDaemonTimeout(requested time.Duration) time.Duration {
 	if requested <= 0 {
 		return forkFinalizeDefaultTimeout
@@ -215,6 +229,16 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 		if finalizeCtx.Err() != nil {
 			return resultErr
 		}
+	}
+
+	writePendingAck("measure_size")
+	usedBytes, usedInodes, sizeErr := forkFinalizeMeasureSize(v)
+	if sizeErr != nil {
+		ack.SizeError = sizeErr.Error()
+	} else {
+		ack.UsedBytes = &usedBytes
+		ack.UsedInodes = &usedInodes
+		ack.SizeMeasuredAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 
 	writePendingAck("close_session")
