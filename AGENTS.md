@@ -31,7 +31,7 @@ Related files:
 
 - When `nextchunk` is set, run9 also writes `Crun9NextChunkLimit` and rejects `NewSlice` after that writable epoch range is exhausted. This keeps one prepared metadata lineage inside one owned slice-id epoch range.
 
-- A customized Badger dependency to support SkipWAL.
+- A customized Badger dependency supports SkipWAL and avoids directory size scans when metrics are disabled. run9 disables Badger metrics for per-snap metadata, so the scan would add remote filesystem round trips without producing metrics.
 
 - run9 forces badger `ValueLogFileSize` down to `64 MiB` when opening metadata. run9 keeps badger directories inside the shared_meta JuiceFS mount, and the upstream `1 GiB` default preallocates `2 GiB` `*.vlog` files. In production this has surfaced as dangling vlog entries and `DB.Close` truncate `ENOENT` on the outer JuiceFS/FUSE layer during finalize, so run9 keeps the value logs small to stay on the boring path.
 
