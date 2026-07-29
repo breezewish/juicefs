@@ -356,7 +356,7 @@ replace github.com/mattn/go-colorable v0.1.9 => github.com/juicedata/go-colorabl
 
 replace github.com/mattn/go-colorable v0.0.9 => github.com/juicedata/go-colorable v0.0.0-20250208072043-a97a0c2023db
 
-replace github.com/dgraph-io/badger/v4 => github.com/breezewish/badger/v4 v4.0.0-20260728101841-54ea6c4339c6
+replace github.com/dgraph-io/badger/v4 => github.com/breezewish/badger/v4 v4.0.0-20260729035226-78201182884a
 
 replace github.com/cloudsoda/go-smb2 => github.com/juicedata/go-smb2 v0.0.0-20260310064141-58f27d06634e
 

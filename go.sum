@@ -153,6 +153,8 @@ github.com/breezewish/badger/v4 v4.0.0-20250911022200-529a1844f923 h1:+mCN9kMo97
 github.com/breezewish/badger/v4 v4.0.0-20250911022200-529a1844f923/go.mod h1:5/MEx97uzdPUHR4KtkNt8asfI2T4JiEiQlV7kWUo8c0=
 github.com/breezewish/badger/v4 v4.0.0-20260728101841-54ea6c4339c6 h1:kAYmNvgzim3fCv8MwVovx7ziyo8LPL8Um6jQ7y4XjQY=
 github.com/breezewish/badger/v4 v4.0.0-20260728101841-54ea6c4339c6/go.mod h1:5/MEx97uzdPUHR4KtkNt8asfI2T4JiEiQlV7kWUo8c0=
+github.com/breezewish/badger/v4 v4.0.0-20260729035226-78201182884a h1:YBR7scsRNYYzCT2Z6/18Xrc3qvKam6dbrcRHzUNlTEc=
+github.com/breezewish/badger/v4 v4.0.0-20260729035226-78201182884a/go.mod h1:5/MEx97uzdPUHR4KtkNt8asfI2T4JiEiQlV7kWUo8c0=
 github.com/bsm/ginkgo/v2 v2.12.0 h1:Ny8MWAHyOepLGlLKYmXG4IEkioBysk6GpaRTLC8zwWs=
 github.com/bsm/ginkgo/v2 v2.12.0/go.mod h1:SwYbGRRDovPVboqFv0tPTcG1sN61LM1Z4ARdbAV9g4c=
 github.com/bsm/gomega v1.27.10 h1:yeMWxP2pV2fG3FgAODIY8EiRE3dy0aeFYt4l7wh6yKA=
