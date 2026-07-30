@@ -145,6 +145,49 @@ func TestRun9ReadViewHandlerKeepsSymlinksInsideBoxRoot(t *testing.T) {
 	}
 }
 
+func TestRun9ReadViewHandlerKeepsSymlinksInsideSelectedRoot(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	for _, directory := range []string{"/rootfs", "/rootfs/workspace", "/rootfs/etc"} {
+		if err := jfs.Mkdir(ctx, directory, 0o755, 0); err != 0 {
+			t.Fatalf("mkdir %s: %s", directory, err)
+		}
+	}
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/workspace/inside.txt", "inside")
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/etc/secret", "outside")
+	if errno := jfs.Symlink(ctx, "/inside.txt", "/rootfs/workspace/inside-link"); errno != 0 {
+		t.Fatalf("create inside symlink: %s", errno)
+	}
+	if errno := jfs.Symlink(ctx, "/etc/secret", "/rootfs/workspace/escape-link"); errno != 0 {
+		t.Fatalf("create escape symlink: %s", errno)
+	}
+
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+	insideRequest := httptest.NewRequest(http.MethodGet, "/inside-link", nil)
+	insideRequest.Header.Set(run9ReadViewRootHeader, "/workspace")
+	inside := httptest.NewRecorder()
+	handler.ServeHTTP(inside, insideRequest)
+	if inside.Code != http.StatusOK || inside.Body.String() != "inside" {
+		t.Fatalf("absolute symlink did not resolve inside selected root: status=%d body=%q", inside.Code, inside.Body.String())
+	}
+
+	escapeRequest := httptest.NewRequest(http.MethodGet, "/escape-link", nil)
+	escapeRequest.Header.Set(run9ReadViewRootHeader, "/workspace")
+	escape := httptest.NewRecorder()
+	handler.ServeHTTP(escape, escapeRequest)
+	if escape.Code != http.StatusNotFound || strings.Contains(escape.Body.String(), "outside") {
+		t.Fatalf("symlink escaped selected root: status=%d body=%q", escape.Code, escape.Body.String())
+	}
+
+	invalidRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	invalidRequest.Header.Set(run9ReadViewRootHeader, "/workspace/../etc")
+	invalid := httptest.NewRecorder()
+	handler.ServeHTTP(invalid, invalidRequest)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid root rejection, got status=%d body=%q", invalid.Code, invalid.Body.String())
+	}
+}
+
 func writeRun9ReadViewTestFile(t *testing.T, jfs *juicefs.FileSystem, ctx meta.Context, name string, content string) {
 	t.Helper()
 	file, errno := jfs.Create(ctx, name, 0o644, 0)
@@ -217,6 +260,14 @@ func TestRun9ReadViewHandlerListsBoundedPages(t *testing.T) {
 	handler.ServeHTTP(wrongDirectory, httptest.NewRequest(http.MethodGet, "/?list=1&cursor="+firstPage.Cursor, nil))
 	if wrongDirectory.Code != http.StatusBadRequest {
 		t.Fatalf("expected cross-directory cursor rejection, got status=%d body=%q", wrongDirectory.Code, wrongDirectory.Body.String())
+	}
+
+	wrongRootRequest := httptest.NewRequest(http.MethodGet, "/work?list=1&cursor="+firstPage.Cursor, nil)
+	wrongRootRequest.Header.Set(run9ReadViewRootHeader, "/work")
+	wrongRoot := httptest.NewRecorder()
+	handler.ServeHTTP(wrongRoot, wrongRootRequest)
+	if wrongRoot.Code != http.StatusBadRequest {
+		t.Fatalf("expected cross-root cursor rejection, got status=%d body=%q", wrongRoot.Code, wrongRoot.Body.String())
 	}
 }
 

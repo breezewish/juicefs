@@ -59,7 +59,7 @@ Related files:
 
 ### Immutable Read View Server
 
-- The hidden `serve-read-view` command holds one immutable Badger generation and its object storage client open, and serves GET, HEAD, Range, conditional requests, and bounded directory listings over a mode-0600 Unix socket.
+- The hidden `serve-read-view` command holds one immutable Badger generation and its object storage client open, and serves GET, HEAD, Range, conditional requests, and bounded directory listings over a mode-0600 Unix socket. Requests may select a filesystem root; absolute and relative symlinks remain confined to that root.
 
 - `pkg/fs.FileSystem.ReadDirPage` provides bounded, name-cursor directory reads for the immutable reader. It uses a Badger key scan directly instead of materializing the complete directory; other metadata backends keep their upstream contract unchanged.
 

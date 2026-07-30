@@ -31,6 +31,7 @@ const run9ReadViewMaxListLimit = 1000
 const (
 	run9ReadViewRoot       = "/rootfs"
 	run9ReadViewMaxSymlink = 40
+	run9ReadViewRootHeader = "X-Run9-File-Root"
 )
 
 type run9ReadViewHandler struct {
@@ -82,16 +83,35 @@ func (h *run9ReadViewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if r.URL.Query().Get("list") == "1" {
-		h.serveList(w, r, requestPath)
+	root := r.Header.Get(run9ReadViewRootHeader)
+	if root == "" {
+		root = "/"
+	}
+	root, err = validateRun9ReadViewPath(root)
+	if err != nil {
+		http.Error(w, "file root must be canonical", http.StatusBadRequest)
 		return
 	}
-	h.serveFile(w, r, requestPath)
+	ctx := run9ReadViewContext(r.Context())
+	filesystemRoot, rootStat, errno := resolveRun9ReadViewPath(h.fs, ctx, run9ReadViewRoot, root)
+	if errno != 0 {
+		writeRun9ReadViewError(w, errno)
+		return
+	}
+	if !rootStat.IsDir() {
+		http.Error(w, "file root is not a directory", http.StatusConflict)
+		return
+	}
+	if r.URL.Query().Get("list") == "1" {
+		h.serveList(w, r, filesystemRoot, root, requestPath)
+		return
+	}
+	h.serveFile(w, r, filesystemRoot, requestPath)
 }
 
-func (h *run9ReadViewHandler) serveFile(w http.ResponseWriter, r *http.Request, requestPath string) {
+func (h *run9ReadViewHandler) serveFile(w http.ResponseWriter, r *http.Request, filesystemRoot string, requestPath string) {
 	ctx := run9ReadViewContext(r.Context())
-	fsPath, stat, errno := resolveRun9ReadViewPath(h.fs, ctx, requestPath)
+	fsPath, stat, errno := resolveRun9ReadViewPath(h.fs, ctx, filesystemRoot, requestPath)
 	if errno != 0 {
 		writeRun9ReadViewError(w, errno)
 		return
@@ -124,7 +144,7 @@ func (h *run9ReadViewHandler) serveFile(w http.ResponseWriter, r *http.Request, 
 	http.ServeContent(w, r, path.Base(requestPath), stat.ModTime(), reader)
 }
 
-func (h *run9ReadViewHandler) serveList(w http.ResponseWriter, r *http.Request, requestPath string) {
+func (h *run9ReadViewHandler) serveList(w http.ResponseWriter, r *http.Request, filesystemRoot string, root string, requestPath string) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
 		http.Error(w, "directory listing requires GET", http.StatusMethodNotAllowed)
@@ -139,13 +159,13 @@ func (h *run9ReadViewHandler) serveList(w http.ResponseWriter, r *http.Request, 
 		}
 		limit = parsed
 	}
-	cursor, err := decodeRun9ReadViewCursor(r.URL.Query().Get("cursor"), h.generation, requestPath)
+	cursor, err := decodeRun9ReadViewCursor(r.URL.Query().Get("cursor"), h.generation, root, requestPath)
 	if err != nil {
 		http.Error(w, "invalid cursor", http.StatusBadRequest)
 		return
 	}
 	ctx := run9ReadViewContext(r.Context())
-	fsPath, _, errno := resolveRun9ReadViewPath(h.fs, ctx, requestPath)
+	fsPath, _, errno := resolveRun9ReadViewPath(h.fs, ctx, filesystemRoot, requestPath)
 	if errno != 0 {
 		writeRun9ReadViewError(w, errno)
 		return
@@ -166,30 +186,29 @@ func (h *run9ReadViewHandler) serveList(w http.ResponseWriter, r *http.Request, 
 		})
 	}
 	if next != "" {
-		response.Cursor = encodeRun9ReadViewCursor(h.generation, requestPath, next)
+		response.Cursor = encodeRun9ReadViewCursor(h.generation, root, requestPath, next)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-// resolveRun9ReadViewPath follows symlinks as if /rootfs were the filesystem
-// root. FileSystem's normal absolute-symlink handling is mountpoint-oriented;
-// using it directly here would let /foo resolve against the metadata volume
-// root instead of the box root.
-func resolveRun9ReadViewPath(jfs *fs.FileSystem, ctx meta.Context, requestPath string) (string, *fs.FileStat, syscall.Errno) {
+// resolveRun9ReadViewPath follows symlinks as if filesystemRoot were "/".
+// FileSystem's normal absolute-symlink handling is mountpoint-oriented; using
+// it directly here would let an absolute target escape the selected file root.
+func resolveRun9ReadViewPath(jfs *fs.FileSystem, ctx meta.Context, filesystemRoot string, requestPath string) (string, *fs.FileStat, syscall.Errno) {
 	pending := splitRun9ReadViewPath(requestPath)
 	resolved := make([]string, 0, len(pending))
 	if len(pending) == 0 {
-		stat, errno := jfs.Lstat(ctx, run9ReadViewRoot)
-		return run9ReadViewRoot, stat, errno
+		stat, errno := jfs.Lstat(ctx, filesystemRoot)
+		return filesystemRoot, stat, errno
 	}
 
 	symlinks := 0
 	for len(pending) > 0 {
 		name := pending[0]
 		pending = pending[1:]
-		candidate := path.Join(run9ReadViewRoot, strings.Join(resolved, "/"), name)
+		candidate := path.Join(filesystemRoot, strings.Join(resolved, "/"), name)
 		stat, errno := jfs.Lstat(ctx, candidate)
 		if errno != 0 {
 			return "", nil, errno
@@ -246,12 +265,12 @@ func validateRun9ReadViewPath(value string) (string, error) {
 	return clean, nil
 }
 
-func encodeRun9ReadViewCursor(generation uint64, requestPath string, name string) string {
-	value := strconv.FormatUint(generation, 10) + "\x00" + requestPath + "\x00" + name
+func encodeRun9ReadViewCursor(generation uint64, root string, requestPath string, name string) string {
+	value := strconv.FormatUint(generation, 10) + "\x00" + root + "\x00" + requestPath + "\x00" + name
 	return base64.RawURLEncoding.EncodeToString([]byte(value))
 }
 
-func decodeRun9ReadViewCursor(value string, generation uint64, requestPath string) (string, error) {
+func decodeRun9ReadViewCursor(value string, generation uint64, root string, requestPath string) (string, error) {
 	if value == "" {
 		return "", nil
 	}
@@ -259,11 +278,11 @@ func decodeRun9ReadViewCursor(value string, generation uint64, requestPath strin
 	if err != nil {
 		return "", fmt.Errorf("invalid cursor")
 	}
-	parts := strings.SplitN(string(raw), "\x00", 3)
-	if len(parts) != 3 || parts[0] != strconv.FormatUint(generation, 10) || parts[1] != requestPath || parts[2] == "" || strings.ContainsAny(parts[2], "/\x00") {
+	parts := strings.SplitN(string(raw), "\x00", 4)
+	if len(parts) != 4 || parts[0] != strconv.FormatUint(generation, 10) || parts[1] != root || parts[2] != requestPath || parts[3] == "" || strings.ContainsAny(parts[3], "/\x00") {
 		return "", fmt.Errorf("cursor does not belong to this directory generation")
 	}
-	return parts[2], nil
+	return parts[3], nil
 }
 
 func run9ReadViewContext(ctx context.Context) meta.Context {
