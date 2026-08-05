@@ -271,6 +271,88 @@ func TestRun9ReadViewHandlerListsBoundedPages(t *testing.T) {
 	}
 }
 
+func TestRun9ReadViewHandlerSearchesRanksAndExcludesFiles(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	for _, directory := range []string{"/rootfs", "/rootfs/work", "/rootfs/work/src", "/rootfs/work/src/node_modules", "/rootfs/work/.git"} {
+		if err := jfs.Mkdir(ctx, directory, 0o755, 0); err != 0 {
+			t.Fatalf("mkdir %s: %s", directory, err)
+		}
+	}
+	for _, name := range []string{"/rootfs/work/src/search_helper.go", "/rootfs/work/src/session_search.go", "/rootfs/work/src/node_modules/search_vendor.go", "/rootfs/work/.git/search-index"} {
+		writeRun9ReadViewTestFile(t, jfs, ctx, name, "")
+	}
+	if errno := jfs.Symlink(ctx, "search_helper.go", "/rootfs/work/src/search-link"); errno != 0 {
+		t.Fatalf("create symlink: %s", errno)
+	}
+
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/work?search=1&q=search&limit=2&exclude_dir=.git&exclude_dir=node_modules", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("search status=%d body=%q", response.Code, response.Body.String())
+	}
+	var result run9ReadViewSearchResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode search response: %s", err)
+	}
+	want := []run9ReadViewSearchMatch{{Path: "src/search_helper.go"}, {Path: "src/session_search.go"}}
+	if len(result.Matches) != len(want) || result.Matches[0] != want[0] || result.Matches[1] != want[1] || result.Truncated {
+		t.Fatalf("unexpected search response: %+v", result)
+	}
+
+	bounded := httptest.NewRecorder()
+	handler.ServeHTTP(bounded, httptest.NewRequest(http.MethodGet,
+		"/work?search=1&q=&limit=1&exclude_dir=.git&exclude_dir=node_modules", nil))
+	if err := json.Unmarshal(bounded.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode bounded search response: %s", err)
+	}
+	if len(result.Matches) != 1 || !result.Truncated || result.Matches[0].Path == "src/search-link" {
+		t.Fatalf("unexpected bounded response: %+v", result)
+	}
+}
+
+func TestRun9ReadViewHandlerSearchRejectsInvalidRequests(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	if err := jfs.Mkdir(ctx, "/rootfs", 0o755, 0); err != 0 {
+		t.Fatalf("mkdir rootfs: %s", err)
+	}
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/file.go", "")
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+
+	tests := []struct {
+		method string
+		path   string
+		status int
+	}{
+		{method: http.MethodGet, path: "/?search=1&limit=201", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?search=1&exclude_dir=src/generated", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?search=1&list=1", status: http.StatusBadRequest},
+		{method: http.MethodHead, path: "/?search=1", status: http.StatusMethodNotAllowed},
+		{method: http.MethodGet, path: "/file.go?search=1", status: http.StatusConflict},
+	}
+	for _, test := range tests {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(test.method, test.path, nil))
+		if response.Code != test.status {
+			t.Fatalf("%s %s: got status=%d body=%q, want %d", test.method, test.path, response.Code, response.Body.String(), test.status)
+		}
+	}
+}
+
+func TestRun9ReadViewSearchKeepsBestBoundedMatches(t *testing.T) {
+	result := searchRun9ReadViewPaths([]string{
+		"nested/search.go.bak",
+		"deep/search.go",
+		"other/search-guide.md",
+	}, "search.go", 1, false)
+	if len(result.Matches) != 1 || result.Matches[0].Path != "deep/search.go" || !result.Truncated {
+		t.Fatalf("unexpected bounded search response: %+v", result)
+	}
+}
+
 func newRun9ReadViewTestFS(t *testing.T) *juicefs.FileSystem {
 	t.Helper()
 	metadata := meta.NewClient("memkv://", nil)

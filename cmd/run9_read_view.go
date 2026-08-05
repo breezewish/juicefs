@@ -14,6 +14,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,6 +38,8 @@ const (
 type run9ReadViewHandler struct {
 	fs         *fs.FileSystem
 	generation uint64
+	searchMu   sync.Mutex
+	search     run9ReadViewSearchCache
 }
 
 type run9ReadViewFile struct {
@@ -102,7 +105,17 @@ func (h *run9ReadViewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "file root is not a directory", http.StatusConflict)
 		return
 	}
-	if r.URL.Query().Get("list") == "1" {
+	searchRequested := r.URL.Query().Get("search") == "1"
+	listRequested := r.URL.Query().Get("list") == "1"
+	if searchRequested && listRequested {
+		http.Error(w, "file search and directory list cannot be combined", http.StatusBadRequest)
+		return
+	}
+	if searchRequested {
+		h.serveSearch(w, r, filesystemRoot, root, requestPath)
+		return
+	}
+	if listRequested {
 		h.serveList(w, r, filesystemRoot, root, requestPath)
 		return
 	}
