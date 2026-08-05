@@ -38,8 +38,9 @@ const (
 type run9ReadViewHandler struct {
 	fs         *fs.FileSystem
 	generation uint64
-	searchMu   sync.Mutex
-	search     run9ReadViewSearchCache
+	globMu     sync.Mutex
+	glob       run9ReadViewGlobCache
+	globFlight chan struct{}
 }
 
 type run9ReadViewFile struct {
@@ -105,14 +106,15 @@ func (h *run9ReadViewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "file root is not a directory", http.StatusConflict)
 		return
 	}
-	searchRequested := r.URL.Query().Get("search") == "1"
-	listRequested := r.URL.Query().Get("list") == "1"
-	if searchRequested && listRequested {
-		http.Error(w, "file search and directory list cannot be combined", http.StatusBadRequest)
+	query := r.URL.Query()
+	_, globRequested := query["glob"]
+	listRequested := query.Get("list") == "1"
+	if globRequested && listRequested {
+		http.Error(w, "file glob and directory list cannot be combined", http.StatusBadRequest)
 		return
 	}
-	if searchRequested {
-		h.serveSearch(w, r, filesystemRoot, root, requestPath)
+	if globRequested {
+		h.serveGlob(w, r, filesystemRoot, root, requestPath)
 		return
 	}
 	if listRequested {

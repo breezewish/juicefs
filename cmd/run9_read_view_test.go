@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"mime"
@@ -271,7 +272,7 @@ func TestRun9ReadViewHandlerListsBoundedPages(t *testing.T) {
 	}
 }
 
-func TestRun9ReadViewHandlerSearchesRanksAndExcludesFiles(t *testing.T) {
+func TestRun9ReadViewHandlerGlobsBoundsAndExcludesFiles(t *testing.T) {
 	jfs := newRun9ReadViewTestFS(t)
 	ctx := meta.NewContext(1, 0, []uint32{0})
 	for _, directory := range []string{"/rootfs", "/rootfs/work", "/rootfs/work/src", "/rootfs/work/src/node_modules", "/rootfs/work/.git"} {
@@ -289,31 +290,31 @@ func TestRun9ReadViewHandlerSearchesRanksAndExcludesFiles(t *testing.T) {
 	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
-		"/work?search=1&q=search&limit=2&exclude_dir=.git&exclude_dir=node_modules", nil))
+		"/work?glob=**%2F%2Asearch%2A.go&limit=2&exclude_dir=.git&exclude_dir=node_modules", nil))
 	if response.Code != http.StatusOK {
-		t.Fatalf("search status=%d body=%q", response.Code, response.Body.String())
+		t.Fatalf("glob status=%d body=%q", response.Code, response.Body.String())
 	}
-	var result run9ReadViewSearchResponse
+	var result run9ReadViewGlobResponse
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
-		t.Fatalf("decode search response: %s", err)
+		t.Fatalf("decode glob response: %s", err)
 	}
-	want := []run9ReadViewSearchMatch{{Path: "src/search_helper.go"}, {Path: "src/session_search.go"}}
+	want := []run9ReadViewGlobMatch{{Path: "src/search_helper.go"}, {Path: "src/session_search.go"}}
 	if len(result.Matches) != len(want) || result.Matches[0] != want[0] || result.Matches[1] != want[1] || result.Truncated {
-		t.Fatalf("unexpected search response: %+v", result)
+		t.Fatalf("unexpected glob response: %+v", result)
 	}
 
 	bounded := httptest.NewRecorder()
 	handler.ServeHTTP(bounded, httptest.NewRequest(http.MethodGet,
-		"/work?search=1&q=&limit=1&exclude_dir=.git&exclude_dir=node_modules", nil))
+		"/work?glob=**%2F%2A&limit=1&exclude_dir=.git&exclude_dir=node_modules", nil))
 	if err := json.Unmarshal(bounded.Body.Bytes(), &result); err != nil {
-		t.Fatalf("decode bounded search response: %s", err)
+		t.Fatalf("decode bounded glob response: %s", err)
 	}
-	if len(result.Matches) != 1 || !result.Truncated || result.Matches[0].Path == "src/search-link" {
+	if len(result.Matches) != 1 || !result.Truncated || result.Matches[0].Path != "src/search_helper.go" {
 		t.Fatalf("unexpected bounded response: %+v", result)
 	}
 }
 
-func TestRun9ReadViewHandlerSearchRejectsInvalidRequests(t *testing.T) {
+func TestRun9ReadViewHandlerGlobRejectsInvalidRequests(t *testing.T) {
 	jfs := newRun9ReadViewTestFS(t)
 	ctx := meta.NewContext(1, 0, []uint32{0})
 	if err := jfs.Mkdir(ctx, "/rootfs", 0o755, 0); err != 0 {
@@ -327,11 +328,15 @@ func TestRun9ReadViewHandlerSearchRejectsInvalidRequests(t *testing.T) {
 		path   string
 		status int
 	}{
-		{method: http.MethodGet, path: "/?search=1&limit=201", status: http.StatusBadRequest},
-		{method: http.MethodGet, path: "/?search=1&exclude_dir=src/generated", status: http.StatusBadRequest},
-		{method: http.MethodGet, path: "/?search=1&list=1", status: http.StatusBadRequest},
-		{method: http.MethodHead, path: "/?search=1", status: http.StatusMethodNotAllowed},
-		{method: http.MethodGet, path: "/file.go?search=1", status: http.StatusConflict},
+		{method: http.MethodGet, path: "/?glob=", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?glob=%5B", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?glob=%2F%2A.go", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?glob=%7Ba%2Cb%7D.go", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?glob=%2A&limit=201", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?glob=%2A&exclude_dir=src%2Fgenerated", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?glob=%2A&list=1", status: http.StatusBadRequest},
+		{method: http.MethodHead, path: "/?glob=%2A", status: http.StatusMethodNotAllowed},
+		{method: http.MethodGet, path: "/file.go?glob=%2A", status: http.StatusConflict},
 	}
 	for _, test := range tests {
 		response := httptest.NewRecorder()
@@ -342,14 +347,42 @@ func TestRun9ReadViewHandlerSearchRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
-func TestRun9ReadViewSearchKeepsBestBoundedMatches(t *testing.T) {
-	result := searchRun9ReadViewPaths([]string{
-		"nested/search.go.bak",
-		"deep/search.go",
-		"other/search-guide.md",
-	}, "search.go", 1, false)
-	if len(result.Matches) != 1 || result.Matches[0].Path != "deep/search.go" || !result.Truncated {
-		t.Fatalf("unexpected bounded search response: %+v", result)
+func TestRun9ReadViewHandlerGlobPrunesLiteralBase(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	for _, directory := range []string{"/rootfs", "/rootfs/src", "/rootfs/other"} {
+		if errno := jfs.Mkdir(ctx, directory, 0o755, 0); errno != 0 {
+			t.Fatalf("mkdir %s: %s", directory, errno)
+		}
+	}
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/src/src.go", "")
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/other/other.go", "")
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/?glob=src%2F**%2F%2A.go", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("glob status=%d body=%q", response.Code, response.Body.String())
+	}
+	handler.globMu.Lock()
+	defer handler.globMu.Unlock()
+	if len(handler.glob.paths) != 1 || handler.glob.paths[0] != "src/src.go" {
+		t.Fatalf("unexpected cached paths: %v", handler.glob.paths)
+	}
+}
+
+func TestRun9ReadViewGlobKeepsLexicalTopN(t *testing.T) {
+	result, err := globRun9ReadViewPaths(context.Background(), []string{
+		"z.go",
+		"nested/b.go",
+		"a.go",
+		"README.md",
+	}, "**/*.go", 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Matches) != 2 || result.Matches[0].Path != "a.go" || result.Matches[1].Path != "nested/b.go" || !result.Truncated {
+		t.Fatalf("unexpected bounded glob response: %+v", result)
 	}
 }
 
