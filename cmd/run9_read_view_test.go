@@ -347,6 +347,43 @@ func TestRun9ReadViewHandlerGlobRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestRun9ReadViewHandlerGlobMatchesEscapedLiteralBrace(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	if err := jfs.Mkdir(ctx, "/rootfs", 0o755, 0); err != 0 {
+		t.Fatalf("mkdir rootfs: %s", err)
+	}
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/{foo}.go", "")
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/?glob=%5C%7Bfoo%5C%7D.go", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("glob status=%d body=%q", response.Code, response.Body.String())
+	}
+	var result run9ReadViewGlobResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode glob response: %s", err)
+	}
+	if len(result.Matches) != 1 || result.Matches[0].Path != "{foo}.go" || result.Truncated {
+		t.Fatalf("unexpected glob response: %+v", result)
+	}
+
+	characterClass := httptest.NewRecorder()
+	handler.ServeHTTP(characterClass, httptest.NewRequest(http.MethodGet,
+		"/?glob=%5B%7B%5Dfoo%5B%7D%5D.go", nil))
+	if characterClass.Code != http.StatusOK {
+		t.Fatalf("character class glob status=%d body=%q", characterClass.Code, characterClass.Body.String())
+	}
+	if err := json.Unmarshal(characterClass.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode character class glob response: %s", err)
+	}
+	if len(result.Matches) != 1 || result.Matches[0].Path != "{foo}.go" || result.Truncated {
+		t.Fatalf("unexpected character class glob response: %+v", result)
+	}
+}
+
 func TestRun9ReadViewHandlerGlobPrunesLiteralBase(t *testing.T) {
 	jfs := newRun9ReadViewTestFS(t)
 	ctx := meta.NewContext(1, 0, []uint32{0})
@@ -368,6 +405,96 @@ func TestRun9ReadViewHandlerGlobPrunesLiteralBase(t *testing.T) {
 	defer handler.globMu.Unlock()
 	if len(handler.glob.paths) != 1 || handler.glob.paths[0] != "src/src.go" {
 		t.Fatalf("unexpected cached paths: %v", handler.glob.paths)
+	}
+}
+
+func TestRun9ReadViewHandlerGlobDoesNotScanBelowPatternDepth(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	for _, directory := range []string{"/rootfs", "/rootfs/nested"} {
+		if errno := jfs.Mkdir(ctx, directory, 0o755, 0); errno != 0 {
+			t.Fatalf("mkdir %s: %s", directory, errno)
+		}
+	}
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/root.go", "")
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/nested/child.go", "")
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/?glob=%2A.go", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("glob status=%d body=%q", response.Code, response.Body.String())
+	}
+	handler.globMu.Lock()
+	if len(handler.glob.paths) != 1 || handler.glob.paths[0] != "root.go" {
+		t.Fatalf("unexpected cached paths: %v", handler.glob.paths)
+	}
+	handler.globMu.Unlock()
+
+	recursive := httptest.NewRecorder()
+	handler.ServeHTTP(recursive, httptest.NewRequest(http.MethodGet, "/?glob=**%2F%2A.go", nil))
+	var result run9ReadViewGlobResponse
+	if err := json.Unmarshal(recursive.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode recursive glob response: %s", err)
+	}
+	want := []run9ReadViewGlobMatch{{Path: "nested/child.go"}, {Path: "root.go"}}
+	if recursive.Code != http.StatusOK || len(result.Matches) != 2 || result.Matches[0] != want[0] || result.Matches[1] != want[1] {
+		t.Fatalf("unexpected recursive glob response: status=%d result=%+v", recursive.Code, result)
+	}
+}
+
+func TestRun9ReadViewHandlerGlobDoesNotFollowLiteralBaseSymlink(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	for _, directory := range []string{"/rootfs", "/rootfs/target"} {
+		if errno := jfs.Mkdir(ctx, directory, 0o755, 0); errno != 0 {
+			t.Fatalf("mkdir %s: %s", directory, errno)
+		}
+	}
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/target/secret.go", "")
+	if errno := jfs.Symlink(ctx, "target", "/rootfs/alias"); errno != 0 {
+		t.Fatalf("create symlink: %s", errno)
+	}
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/?glob=alias%2F**%2F%2A.go", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("glob status=%d body=%q", response.Code, response.Body.String())
+	}
+	var result run9ReadViewGlobResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode glob response: %s", err)
+	}
+	if len(result.Matches) != 0 || result.Truncated {
+		t.Fatalf("unexpected glob response: %+v", result)
+	}
+}
+
+func TestRun9ReadViewHandlerGlobUnescapesLiteralBase(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	for _, directory := range []string{"/rootfs", "/rootfs/fooa"} {
+		if errno := jfs.Mkdir(ctx, directory, 0o755, 0); errno != 0 {
+			t.Fatalf("mkdir %s: %s", directory, errno)
+		}
+	}
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/fooa/file.go", "")
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/?glob=foo%5Ca%2F%2A.go", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("glob status=%d body=%q", response.Code, response.Body.String())
+	}
+	var result run9ReadViewGlobResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode glob response: %s", err)
+	}
+	if len(result.Matches) != 1 || result.Matches[0].Path != "fooa/file.go" || result.Truncated {
+		t.Fatalf("unexpected glob response: %+v", result)
 	}
 }
 

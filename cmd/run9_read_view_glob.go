@@ -30,12 +30,14 @@ const (
 )
 
 type run9ReadViewGlobRequest struct {
-	pattern              string
-	limit                int
-	scanBase             string
-	scanPrefix           []string
-	excludedDirectories  []string
-	excludedDirectorySet map[string]struct{}
+	pattern               string
+	limit                 int
+	scanBase              string
+	maximumDepth          int
+	depthLimitTruncates   bool
+	baseExceedsDepthLimit bool
+	excludedDirectories   []string
+	excludedDirectorySet  map[string]struct{}
 }
 
 type run9ReadViewGlobMatch struct {
@@ -112,7 +114,9 @@ func (h *run9ReadViewHandler) serveGlob(w http.ResponseWriter, r *http.Request, 
 		writeRun9ReadViewError(w, err)
 		return
 	}
-	writeRun9ReadViewGlobResponse(w, result)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 func parseRun9ReadViewGlobRequest(r *http.Request) (run9ReadViewGlobRequest, error) {
@@ -126,7 +130,7 @@ func parseRun9ReadViewGlobRequest(r *http.Request) (run9ReadViewGlobRequest, err
 	if strings.HasPrefix(pattern, "/") {
 		return run9ReadViewGlobRequest{}, fmt.Errorf("glob pattern must be relative to the requested directory")
 	}
-	if strings.Contains(pattern, "{") {
+	if hasRun9ReadViewGlobBraceAlternative(pattern) {
 		return run9ReadViewGlobRequest{}, fmt.Errorf("glob brace alternatives are not supported")
 	}
 	if !doublestar.ValidatePattern(pattern) {
@@ -157,26 +161,87 @@ func parseRun9ReadViewGlobRequest(r *http.Request) (run9ReadViewGlobRequest, err
 		normalizedExcluded = append(normalizedExcluded, name)
 	}
 	sort.Strings(normalizedExcluded)
-	scanBase, _ := doublestar.SplitPattern(pattern)
+	scanBase, remainingPattern := doublestar.SplitPattern(pattern)
 	if scanBase == "." {
 		scanBase = ""
+	} else {
+		scanBase = unescapeRun9ReadViewGlobBase(scanBase)
 	}
-	var scanPrefix []string
-	if scanBase != "" {
-		scanPrefix = strings.Split(scanBase, "/")
-	}
+	maximumDepth, depthLimitTruncates, baseExceedsDepthLimit := run9ReadViewGlobDepthLimit(scanBase, remainingPattern)
 	return run9ReadViewGlobRequest{
-		pattern:              pattern,
-		limit:                limit,
-		scanBase:             scanBase,
-		scanPrefix:           scanPrefix,
-		excludedDirectories:  normalizedExcluded,
-		excludedDirectorySet: excludedSet,
+		pattern:               pattern,
+		limit:                 limit,
+		scanBase:              scanBase,
+		maximumDepth:          maximumDepth,
+		depthLimitTruncates:   depthLimitTruncates,
+		baseExceedsDepthLimit: baseExceedsDepthLimit,
+		excludedDirectories:   normalizedExcluded,
+		excludedDirectorySet:  excludedSet,
 	}, nil
 }
 
+// SplitPattern only unescapes metacharacters, while Match treats a backslash
+// before any byte as an escape. The directory lookup needs the latter form.
+func unescapeRun9ReadViewGlobBase(scanBase string) string {
+	var unescaped strings.Builder
+	unescaped.Grow(len(scanBase))
+	for index := 0; index < len(scanBase); index++ {
+		if scanBase[index] == '\\' && index+1 < len(scanBase) {
+			index++
+		}
+		unescaped.WriteByte(scanBase[index])
+	}
+	return unescaped.String()
+}
+
+func hasRun9ReadViewGlobBraceAlternative(pattern string) bool {
+	inCharacterClass := false
+	for index := 0; index < len(pattern); index++ {
+		if pattern[index] == '\\' {
+			index++
+			continue
+		}
+		if pattern[index] == '[' && !inCharacterClass {
+			inCharacterClass = true
+			continue
+		}
+		if pattern[index] == ']' && inCharacterClass {
+			inCharacterClass = false
+			continue
+		}
+		if pattern[index] == '{' && !inCharacterClass {
+			return true
+		}
+	}
+	return false
+}
+
+// run9ReadViewGlobDepthLimit avoids descending below levels the pattern can
+// match. depthLimitTruncates is true only when the 64-level safety bound, not
+// the pattern shape, is what stops traversal.
+func run9ReadViewGlobDepthLimit(scanBase string, remainingPattern string) (maximumDepth int, depthLimitTruncates bool, baseExceedsDepthLimit bool) {
+	baseDepth := 0
+	if scanBase != "" {
+		baseDepth = strings.Count(scanBase, "/") + 1
+	}
+	if baseDepth > run9ReadViewGlobMaximumDepth {
+		return 0, true, true
+	}
+	safetyDepth := run9ReadViewGlobMaximumDepth - baseDepth
+	for _, segment := range strings.Split(remainingPattern, "/") {
+		if segment == "**" {
+			return safetyDepth, true, false
+		}
+	}
+	patternDepth := strings.Count(remainingPattern, "/")
+	if patternDepth > safetyDepth {
+		return safetyDepth, true, false
+	}
+	return patternDepth, false, false
+}
+
 func (h *run9ReadViewHandler) globPaths(ctx meta.Context, fsPath string, root string, requestPath string, request run9ReadViewGlobRequest) ([]string, bool, syscall.Errno) {
-	key := root + "\x00" + requestPath + "\x00" + request.scanBase + "\x00" + strings.Join(request.excludedDirectories, "\x00")
+	key := root + "\x00" + requestPath + "\x00" + request.scanBase + "\x00" + strconv.Itoa(request.maximumDepth) + "\x00" + strconv.FormatBool(request.depthLimitTruncates) + "\x00" + strings.Join(request.excludedDirectories, "\x00")
 	var ownedFlight chan struct{}
 	for {
 		h.globMu.Lock()
@@ -208,8 +273,18 @@ func (h *run9ReadViewHandler) globPaths(ctx meta.Context, fsPath string, root st
 	}()
 
 	scan := run9ReadViewGlobScan{paths: make([]string, 0, 1024)}
-	if errno := collectRun9ReadViewGlobPaths(h.fs, ctx, fsPath, "", 0, request.scanPrefix, request.excludedDirectorySet, &scan); errno != 0 {
-		return nil, false, errno
+	if request.baseExceedsDepthLimit {
+		scan.incomplete = true
+	} else {
+		scanPath, found, errno := openRun9ReadViewGlobBase(h.fs, ctx, fsPath, request.scanBase, request.excludedDirectorySet)
+		if errno != 0 {
+			return nil, false, errno
+		}
+		if found {
+			if errno := collectRun9ReadViewGlobPaths(h.fs, ctx, scanPath, request.scanBase, 0, request.maximumDepth, request.depthLimitTruncates, request.excludedDirectorySet, &scan); errno != 0 {
+				return nil, false, errno
+			}
+		}
 	}
 	h.globMu.Lock()
 	h.glob = run9ReadViewGlobCache{key: key, paths: scan.paths, incomplete: scan.incomplete}
@@ -217,10 +292,37 @@ func (h *run9ReadViewHandler) globPaths(ctx meta.Context, fsPath string, root st
 	return scan.paths, scan.incomplete, 0
 }
 
+func openRun9ReadViewGlobBase(jfs *fs.FileSystem, ctx meta.Context, directory string, scanBase string, excluded map[string]struct{}) (string, bool, syscall.Errno) {
+	current := directory
+	if scanBase == "" {
+		return current, true, 0
+	}
+	for _, component := range strings.Split(scanBase, "/") {
+		if component == "" || component == "." || component == ".." {
+			return "", false, 0
+		}
+		if _, skip := excluded[component]; skip {
+			return "", false, 0
+		}
+		current = path.Join(current, component)
+		stat, errno := jfs.Lstat(ctx, current)
+		if errno == syscall.ENOENT || errno == syscall.ENOTDIR {
+			return "", false, 0
+		}
+		if errno != 0 {
+			return "", false, errno
+		}
+		if !stat.IsDir() || stat.IsSymlink() {
+			return "", false, 0
+		}
+	}
+	return current, true, 0
+}
+
 // collectRun9ReadViewGlobPaths traverses the immutable generation with native
 // bounded metadata pages. Directory entries are never resolved as paths, so
 // symlinks are not followed while collecting candidates for pattern matching.
-func collectRun9ReadViewGlobPaths(jfs *fs.FileSystem, ctx meta.Context, fsDirectory string, relativeDirectory string, depth int, scanPrefix []string, excluded map[string]struct{}, scan *run9ReadViewGlobScan) syscall.Errno {
+func collectRun9ReadViewGlobPaths(jfs *fs.FileSystem, ctx meta.Context, fsDirectory string, relativeDirectory string, depth int, maximumDepth int, depthLimitTruncates bool, excluded map[string]struct{}, scan *run9ReadViewGlobScan) syscall.Errno {
 	cursor := ""
 	for {
 		if err := ctx.Err(); err != nil {
@@ -237,15 +339,9 @@ func collectRun9ReadViewGlobPaths(jfs *fs.FileSystem, ctx meta.Context, fsDirect
 				return 0
 			}
 			scan.visited++
-			if depth < len(scanPrefix) && entry.Name() != scanPrefix[depth] {
-				continue
-			}
 			relativePath := path.Join(relativeDirectory, entry.Name())
 			switch {
 			case entry.Attr().Typ == meta.TypeFile:
-				if depth < len(scanPrefix) {
-					continue
-				}
 				if scan.pathBytes+len(relativePath) > run9ReadViewGlobMaximumPathBytes {
 					scan.incomplete = true
 					scan.stopped = true
@@ -257,11 +353,13 @@ func collectRun9ReadViewGlobPaths(jfs *fs.FileSystem, ctx meta.Context, fsDirect
 				if _, skip := excluded[entry.Name()]; skip {
 					continue
 				}
-				if depth >= run9ReadViewGlobMaximumDepth {
-					scan.incomplete = true
+				if depth >= maximumDepth {
+					if depthLimitTruncates {
+						scan.incomplete = true
+					}
 					continue
 				}
-				if errno := collectRun9ReadViewGlobPaths(jfs, ctx, path.Join(fsDirectory, entry.Name()), relativePath, depth+1, scanPrefix, excluded, scan); errno != 0 {
+				if errno := collectRun9ReadViewGlobPaths(jfs, ctx, path.Join(fsDirectory, entry.Name()), relativePath, depth+1, maximumDepth, depthLimitTruncates, excluded, scan); errno != 0 {
 					return errno
 				}
 				if scan.stopped {
@@ -305,17 +403,4 @@ func globRun9ReadViewPaths(ctx context.Context, paths []string, pattern string, 
 		response.Matches[index] = run9ReadViewGlobMatch{Path: filePath}
 	}
 	return response, nil
-}
-
-func writeRun9ReadViewGlobResponse(w http.ResponseWriter, result run9ReadViewGlobResponse) {
-	body, err := json.Marshal(result)
-	if err != nil {
-		writeRun9ReadViewError(w, err)
-		return
-	}
-	body = append(body, '\n')
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	_, _ = w.Write(body)
 }
