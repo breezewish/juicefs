@@ -290,7 +290,7 @@ func TestRun9ReadViewHandlerGlobsBoundsAndExcludesFiles(t *testing.T) {
 	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
-		"/work?glob=**%2F%2Asearch%2A.go&limit=2&exclude_dir=.git&exclude_dir=node_modules", nil))
+		"/work?glob=**%2F%2Asearch%2A.go&limit=2&ranking_query=search&exclude_dir=.git&exclude_dir=node_modules", nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("glob status=%d body=%q", response.Code, response.Body.String())
 	}
@@ -333,6 +333,7 @@ func TestRun9ReadViewHandlerGlobRejectsInvalidRequests(t *testing.T) {
 		{method: http.MethodGet, path: "/?glob=%2F%2A.go", status: http.StatusBadRequest},
 		{method: http.MethodGet, path: "/?glob=%7Ba%2Cb%7D.go", status: http.StatusBadRequest},
 		{method: http.MethodGet, path: "/?glob=%2A&limit=201", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?glob=%2A&ranking_query=" + strings.Repeat("a", run9ReadViewGlobMaximumRankingBytes+1), status: http.StatusBadRequest},
 		{method: http.MethodGet, path: "/?glob=%2A&exclude_dir=src%2Fgenerated", status: http.StatusBadRequest},
 		{method: http.MethodGet, path: "/?glob=%2A&list=1", status: http.StatusBadRequest},
 		{method: http.MethodHead, path: "/?glob=%2A", status: http.StatusMethodNotAllowed},
@@ -504,12 +505,26 @@ func TestRun9ReadViewGlobKeepsLexicalTopN(t *testing.T) {
 		"nested/b.go",
 		"a.go",
 		"README.md",
-	}, "**/*.go", 2, false)
+	}, "**/*.go", "", 2, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(result.Matches) != 2 || result.Matches[0].Path != "a.go" || result.Matches[1].Path != "nested/b.go" || !result.Truncated {
 		t.Fatalf("unexpected bounded glob response: %+v", result)
+	}
+}
+
+func TestRun9ReadViewGlobRanksBeforeApplyingLimit(t *testing.T) {
+	result, err := globRun9ReadViewPaths(context.Background(), []string{
+		"a-transcriptview/preview.go",
+		"a-transcriptview/viewer.go",
+		"zeta/view.go",
+	}, "**/*view*", "view", 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Matches) != 2 || result.Matches[0].Path != "zeta/view.go" || result.Matches[1].Path != "a-transcriptview/viewer.go" || !result.Truncated {
+		t.Fatalf("unexpected ranked glob response: %+v", result)
 	}
 }
 

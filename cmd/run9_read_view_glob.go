@@ -21,6 +21,7 @@ const (
 	run9ReadViewGlobDefaultLimit         = 50
 	run9ReadViewGlobMaximumLimit         = 200
 	run9ReadViewGlobMaximumPatternBytes  = 256
+	run9ReadViewGlobMaximumRankingBytes  = 256
 	run9ReadViewGlobMaximumExcludes      = 32
 	run9ReadViewGlobMaximumEntries       = 100_000
 	run9ReadViewGlobMaximumPathBytes     = 16 << 20
@@ -31,6 +32,7 @@ const (
 
 type run9ReadViewGlobRequest struct {
 	pattern               string
+	rankingQuery          string
 	limit                 int
 	scanBase              string
 	maximumDepth          int
@@ -63,23 +65,28 @@ type run9ReadViewGlobScan struct {
 	stopped    bool
 }
 
-type run9ReadViewGlobHeap []string
-
-func (files run9ReadViewGlobHeap) Len() int { return len(files) }
-
-// Less reverses lexical order so the largest retained path is the heap root.
-func (files run9ReadViewGlobHeap) Less(left, right int) bool { return files[left] > files[right] }
-
-func (files run9ReadViewGlobHeap) Swap(left, right int) {
-	files[left], files[right] = files[right], files[left]
+type run9ReadViewGlobHeap struct {
+	paths        []string
+	rankingQuery string
 }
 
-func (files *run9ReadViewGlobHeap) Push(value any) { *files = append(*files, value.(string)) }
+func (files run9ReadViewGlobHeap) Len() int { return len(files.paths) }
+
+// Less keeps the worst retained match at the heap root.
+func (files run9ReadViewGlobHeap) Less(left, right int) bool {
+	return compareRun9ReadViewGlobPaths(files.paths[left], files.paths[right], files.rankingQuery) > 0
+}
+
+func (files run9ReadViewGlobHeap) Swap(left, right int) {
+	files.paths[left], files.paths[right] = files.paths[right], files.paths[left]
+}
+
+func (files *run9ReadViewGlobHeap) Push(value any) { files.paths = append(files.paths, value.(string)) }
 
 func (files *run9ReadViewGlobHeap) Pop() any {
-	old := *files
+	old := files.paths
 	last := old[len(old)-1]
-	*files = old[:len(old)-1]
+	files.paths = old[:len(old)-1]
 	return last
 }
 
@@ -109,7 +116,7 @@ func (h *run9ReadViewHandler) serveGlob(w http.ResponseWriter, r *http.Request, 
 		writeRun9ReadViewError(w, errno)
 		return
 	}
-	result, err := globRun9ReadViewPaths(r.Context(), paths, globRequest.pattern, globRequest.limit, incomplete)
+	result, err := globRun9ReadViewPaths(r.Context(), paths, globRequest.pattern, globRequest.rankingQuery, globRequest.limit, incomplete)
 	if err != nil {
 		writeRun9ReadViewError(w, err)
 		return
@@ -135,6 +142,10 @@ func parseRun9ReadViewGlobRequest(r *http.Request) (run9ReadViewGlobRequest, err
 	}
 	if !doublestar.ValidatePattern(pattern) {
 		return run9ReadViewGlobRequest{}, fmt.Errorf("invalid glob pattern")
+	}
+	rankingQuery := r.URL.Query().Get("ranking_query")
+	if len(rankingQuery) > run9ReadViewGlobMaximumRankingBytes {
+		return run9ReadViewGlobRequest{}, fmt.Errorf("ranking query must be at most %d bytes", run9ReadViewGlobMaximumRankingBytes)
 	}
 
 	limit := run9ReadViewGlobDefaultLimit
@@ -170,6 +181,7 @@ func parseRun9ReadViewGlobRequest(r *http.Request) (run9ReadViewGlobRequest, err
 	maximumDepth, depthLimitTruncates, baseExceedsDepthLimit := run9ReadViewGlobDepthLimit(scanBase, remainingPattern)
 	return run9ReadViewGlobRequest{
 		pattern:               pattern,
+		rankingQuery:          rankingQuery,
 		limit:                 limit,
 		scanBase:              scanBase,
 		maximumDepth:          maximumDepth,
@@ -374,8 +386,8 @@ func collectRun9ReadViewGlobPaths(jfs *fs.FileSystem, ctx meta.Context, fsDirect
 	}
 }
 
-func globRun9ReadViewPaths(ctx context.Context, paths []string, pattern string, limit int, incomplete bool) (run9ReadViewGlobResponse, error) {
-	best := make(run9ReadViewGlobHeap, 0, limit)
+func globRun9ReadViewPaths(ctx context.Context, paths []string, pattern string, rankingQuery string, limit int, incomplete bool) (run9ReadViewGlobResponse, error) {
+	best := run9ReadViewGlobHeap{paths: make([]string, 0, limit), rankingQuery: rankingQuery}
 	heap.Init(&best)
 	truncated := incomplete
 	for index, filePath := range paths {
@@ -387,19 +399,21 @@ func globRun9ReadViewPaths(ctx context.Context, paths []string, pattern string, 
 		if !doublestar.MatchUnvalidated(pattern, filePath) {
 			continue
 		}
-		if len(best) < limit {
+		if best.Len() < limit {
 			heap.Push(&best, filePath)
 			continue
 		}
 		truncated = true
-		if filePath < best[0] {
+		if compareRun9ReadViewGlobPaths(filePath, best.paths[0], rankingQuery) < 0 {
 			heap.Pop(&best)
 			heap.Push(&best, filePath)
 		}
 	}
-	sort.Strings(best)
-	response := run9ReadViewGlobResponse{Matches: make([]run9ReadViewGlobMatch, len(best)), Truncated: truncated}
-	for index, filePath := range best {
+	sort.Slice(best.paths, func(left, right int) bool {
+		return compareRun9ReadViewGlobPaths(best.paths[left], best.paths[right], rankingQuery) < 0
+	})
+	response := run9ReadViewGlobResponse{Matches: make([]run9ReadViewGlobMatch, len(best.paths)), Truncated: truncated}
+	for index, filePath := range best.paths {
 		response.Matches[index] = run9ReadViewGlobMatch{Path: filePath}
 	}
 	return response, nil
