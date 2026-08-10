@@ -528,6 +528,19 @@ func TestRun9ReadViewGlobRanksBeforeApplyingLimit(t *testing.T) {
 	}
 }
 
+func TestRun9ReadViewGlobOrdersSameNamesByDirectory(t *testing.T) {
+	result, err := globRun9ReadViewPaths(context.Background(), []string{
+		"src/bravo/view.go",
+		"src/alpha/view.go",
+	}, "**/view.go", "view.go", 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Matches) != 2 || result.Matches[0].Path != "src/alpha/view.go" || result.Matches[1].Path != "src/bravo/view.go" || result.Truncated {
+		t.Fatalf("unexpected same-name glob response: %+v", result)
+	}
+}
+
 func newRun9ReadViewTestFS(t *testing.T) *juicefs.FileSystem {
 	t.Helper()
 	metadata := meta.NewClient("memkv://", nil)
