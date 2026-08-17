@@ -125,15 +125,19 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	}
 
 	key := s.key(indx)
+	readCachedBlock := func(r ReadCloser) (int, error) {
+		n, readErr := r.ReadAt(p, int64(boff))
+		if !s.store.conf.OSCache {
+			dropOSCache(r)
+		}
+		_ = r.Close()
+		return n, readErr
+	}
 	if s.store.conf.CacheEnabled() {
 		start := time.Now()
 		r, err := s.store.bcache.load(key)
 		if err == nil {
-			n, err = r.ReadAt(p, int64(boff))
-			if !s.store.conf.OSCache {
-				dropOSCache(r)
-			}
-			_ = r.Close()
+			n, err = readCachedBlock(r)
 			if err == nil {
 				s.store.cacheHits.Add(1)
 				s.store.cacheHitBytes.Add(float64(n))
@@ -142,6 +146,27 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 			}
 			logger.Warnf("remove partial cached block %s: %d %s", key, n, err)
 			s.store.bcache.remove(key, false)
+		}
+	}
+	if s.store.sharedCache != nil {
+		start := time.Now()
+		r, sharedErr := s.store.sharedCache.load(key)
+		if sharedErr == nil {
+			n, sharedErr = readCachedBlock(r)
+			if sharedErr == nil {
+				s.store.cacheHits.Add(1)
+				s.store.cacheHitBytes.Add(float64(n))
+				s.store.sharedCacheHits.Add(1)
+				s.store.sharedCacheHitBytes.Add(float64(n))
+				s.store.cacheReadHist.Observe(time.Since(start).Seconds())
+				return n, nil
+			}
+		}
+		if os.IsNotExist(sharedErr) {
+			s.store.sharedCacheMisses.Add(1)
+		} else {
+			s.store.sharedCacheErrors.Add(1)
+			logger.Warnf("ignore invalid shared cached block %s: %s", key, sharedErr)
 		}
 	}
 
@@ -520,7 +545,10 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir               string
+	CacheDir string
+	// SharedCacheDir is an optional pre-populated read-only block cache. JuiceFS
+	// never writes, evicts, removes, or repairs files below this directory.
+	SharedCacheDir         string
 	CacheMode              os.FileMode
 	CacheSize              uint64
 	CacheItems             int64
@@ -594,6 +622,9 @@ func (c *Config) SelfCheck(uuid string) {
 		logger.Warnf("writeback is not supported in memory cache mode")
 		c.Writeback = false
 	}
+	if c.SharedCacheDir != "" {
+		c.SharedCacheDir = filepath.Join(c.SharedCacheDir, uuid)
+	}
 	if c.Writeback {
 		if !c.CacheFullBlock {
 			logger.Warnf("cache-partial-only is ineffective for stage blocks with writeback enabled")
@@ -660,6 +691,7 @@ func (c *Config) CacheEnabled() bool {
 type cachedStore struct {
 	storage         object.ObjectStorage
 	bcache          CacheManager
+	sharedCache     *sharedDiskCache
 	fetcher         *prefetcher
 	conf            Config
 	group           *Controller
@@ -680,6 +712,10 @@ type cachedStore struct {
 	cacheHitBytes       prometheus.Counter
 	cacheMissBytes      prometheus.Counter
 	cacheReadHist       prometheus.Histogram
+	sharedCacheHits     prometheus.Counter
+	sharedCacheHitBytes prometheus.Counter
+	sharedCacheMisses   prometheus.Counter
+	sharedCacheErrors   prometheus.Counter
 	objectReqsHistogram *prometheus.HistogramVec
 	objectReqErrors     prometheus.Counter
 	objectDataBytes     *prometheus.CounterVec
@@ -850,6 +886,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		store.downLimit = ratelimit.NewBucketWithRate(float64(config.DownloadLimit)*0.85, config.DownloadLimit/10)
 	}
 	store.initMetrics()
+	store.sharedCache = newSharedDiskCache(config.SharedCacheDir, config.CacheChecksum)
 	if store.conf.Writeback {
 		store.startHour, store.endHour, _ = config.parseHours()
 		if store.startHour != store.endHour {
@@ -944,6 +981,22 @@ func (store *cachedStore) initMetrics() {
 		Help:    "read cached block latency distribution",
 		Buckets: prometheus.ExponentialBuckets(0.00001, 2, 20),
 	})
+	store.sharedCacheHits = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "shared_blockcache_hits",
+		Help: "read from the immutable shared block cache",
+	})
+	store.sharedCacheHitBytes = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "shared_blockcache_hit_bytes",
+		Help: "bytes read from the immutable shared block cache",
+	})
+	store.sharedCacheMisses = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "shared_blockcache_miss",
+		Help: "blocks absent from the immutable shared block cache",
+	})
+	store.sharedCacheErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "shared_blockcache_errors",
+		Help: "invalid or unreadable blocks in the immutable shared block cache",
+	})
 	store.objectReqsHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "object_request_durations_histogram_seconds",
 		Help:    "Object requests latency distributions.",
@@ -976,6 +1029,10 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.cacheMiss)
 	reg.MustRegister(store.cacheMissBytes)
 	reg.MustRegister(store.cacheReadHist)
+	reg.MustRegister(store.sharedCacheHits)
+	reg.MustRegister(store.sharedCacheHitBytes)
+	reg.MustRegister(store.sharedCacheMisses)
+	reg.MustRegister(store.sharedCacheErrors)
 	reg.MustRegister(store.objectReqsHistogram)
 	reg.MustRegister(store.objectReqErrors)
 	reg.MustRegister(store.objectDataBytes)

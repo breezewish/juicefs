@@ -90,6 +90,21 @@ Related files:
 
 - `cmd/flags.go`
 
+### Immutable Shared Block Cache
+
+- `--shared-cache-dir` adds one pre-populated read-only cache source after the
+  mount's private cache. JuiceFS never writes, stages, evicts, removes, or
+  repairs files there; misses continue through the normal object-store path and
+  any downloaded block is cached only in the private cache directory.
+
+Related files:
+
+- `cmd/flags.go`
+- `cmd/mount.go`
+- `pkg/chunk/cached_store.go`
+- `pkg/chunk/cached_store_shared_cache_fork.go`
+- `pkg/chunk/cached_store_shared_cache_fork_test.go`
+
 ### Badger Close Safely
 
 - Metadata client is explicitly shut down after format via `m.Shutdown()`. It prevents a bug where badger is not properly closed when format exits. As badger is customized without WAL, not closing it properly can cause data corruption as data is still in memtable and not flushed to disk.
