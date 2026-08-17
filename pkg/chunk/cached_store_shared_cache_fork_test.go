@@ -140,6 +140,10 @@ func TestCorruptSharedCacheBlockFallsThroughWithoutMutation(t *testing.T) {
 	require.Equal(t, data, readSharedCacheTestSlice(t, store, 104, len(data)))
 	require.Equal(t, int64(1), storage.gets.Load())
 	require.Equal(t, float64(1), toFloat64(store.sharedCacheErrors))
+	require.Eventually(t, func() bool {
+		_, statErr := os.Stat(filepath.Join(privateDir, cacheDir, filepath.FromSlash(key)))
+		return statErr == nil
+	}, time.Second, 10*time.Millisecond)
 	require.Equal(t, []byte("bad"), requireFileContents(t, sharedPath))
 }
 
