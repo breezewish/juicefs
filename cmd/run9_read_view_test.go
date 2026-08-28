@@ -314,6 +314,84 @@ func TestRun9ReadViewHandlerGlobsBoundsAndExcludesFiles(t *testing.T) {
 	}
 }
 
+func TestRun9ReadViewHandlerGlobRespectsNestedGitIgnoreRules(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	for _, directory := range []string{"/rootfs", "/rootfs/generated", "/rootfs/src"} {
+		if errno := jfs.Mkdir(ctx, directory, 0o755, 0); errno != 0 {
+			t.Fatalf("mkdir %s: %s", directory, errno)
+		}
+	}
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/.gitignore", "generated/\n*.tmp\n*.log\n!keep.log\n")
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/src/.gitignore", "!important.tmp\nignored.go\n")
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/generated/.gitignore", "!keep.go\n")
+	for _, name := range []string{
+		"/rootfs/main.go",
+		"/rootfs/debug.log",
+		"/rootfs/keep.log",
+		"/rootfs/generated/keep.go",
+		"/rootfs/src/main.go",
+		"/rootfs/src/drop.tmp",
+		"/rootfs/src/important.tmp",
+		"/rootfs/src/ignored.go",
+	} {
+		writeRun9ReadViewTestFile(t, jfs, ctx, name, "")
+	}
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/?glob=**%2F%2A.go&respect_gitignore=1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("glob status=%d body=%q", response.Code, response.Body.String())
+	}
+	var result run9ReadViewGlobResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode glob response: %s", err)
+	}
+	want := []run9ReadViewGlobMatch{{Path: "main.go"}, {Path: "src/main.go"}}
+	if len(result.Matches) != len(want) || result.Matches[0] != want[0] || result.Matches[1] != want[1] {
+		t.Fatalf("unexpected gitignore glob response: %+v", result)
+	}
+
+	literalBase := httptest.NewRecorder()
+	handler.ServeHTTP(literalBase, httptest.NewRequest(http.MethodGet,
+		"/?glob=src%2F**%2F%2A.tmp&respect_gitignore=1", nil))
+	if err := json.Unmarshal(literalBase.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode literal-base response: %s", err)
+	}
+	if literalBase.Code != http.StatusOK || len(result.Matches) != 1 || result.Matches[0].Path != "src/important.tmp" {
+		t.Fatalf("unexpected literal-base response: status=%d result=%+v", literalBase.Code, result)
+	}
+
+	excludedParent := httptest.NewRecorder()
+	handler.ServeHTTP(excludedParent, httptest.NewRequest(http.MethodGet,
+		"/?glob=generated%2F**%2F%2A.go&respect_gitignore=1", nil))
+	if err := json.Unmarshal(excludedParent.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode excluded-parent response: %s", err)
+	}
+	if excludedParent.Code != http.StatusOK || len(result.Matches) != 0 {
+		t.Fatalf("unexpected excluded-parent response: status=%d result=%+v", excludedParent.Code, result)
+	}
+
+	unfiltered := httptest.NewRecorder()
+	handler.ServeHTTP(unfiltered, httptest.NewRequest(http.MethodGet,
+		"/?glob=generated%2F**%2F%2A.go", nil))
+	if err := json.Unmarshal(unfiltered.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode unfiltered response: %s", err)
+	}
+	if unfiltered.Code != http.StatusOK || len(result.Matches) != 1 || result.Matches[0].Path != "generated/keep.go" {
+		t.Fatalf("unexpected unfiltered response: status=%d result=%+v", unfiltered.Code, result)
+	}
+}
+
+func TestRun9ReadViewGlobRejectsOversizedGitIgnore(t *testing.T) {
+	rules := newRun9ReadViewGlobIgnoreRules()
+	if err := rules.add("", make([]byte, run9ReadViewGlobMaximumGitIgnoreFileBytes+1)); err == nil || err.Error() != "gitignore data exceeds file glob limits" {
+		t.Fatalf("unexpected oversized gitignore error: %v", err)
+	}
+}
+
 func TestRun9ReadViewHandlerGlobRejectsInvalidRequests(t *testing.T) {
 	jfs := newRun9ReadViewTestFS(t)
 	ctx := meta.NewContext(1, 0, []uint32{0})
@@ -335,6 +413,8 @@ func TestRun9ReadViewHandlerGlobRejectsInvalidRequests(t *testing.T) {
 		{method: http.MethodGet, path: "/?glob=%2A&limit=201", status: http.StatusBadRequest},
 		{method: http.MethodGet, path: "/?glob=%2A&ranking_query=" + strings.Repeat("a", run9ReadViewGlobMaximumRankingBytes+1), status: http.StatusBadRequest},
 		{method: http.MethodGet, path: "/?glob=%2A&exclude_dir=src%2Fgenerated", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?glob=%2A&respect_gitignore=invalid", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/?glob=%2A&respect_gitignore=1&respect_gitignore=1", status: http.StatusBadRequest},
 		{method: http.MethodGet, path: "/?glob=%2A&list=1", status: http.StatusBadRequest},
 		{method: http.MethodHead, path: "/?glob=%2A", status: http.StatusMethodNotAllowed},
 		{method: http.MethodGet, path: "/file.go?glob=%2A", status: http.StatusConflict},

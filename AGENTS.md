@@ -59,7 +59,7 @@ Related files:
 
 ### Immutable Read View Server
 
-- The hidden `serve-read-view` command holds one immutable Badger generation and its object storage client open, and serves GET, HEAD, Range, conditional requests, bounded directory listings, and bounded doublestar globs over regular files through a mode-0600 Unix socket. Requests may select a filesystem root; absolute and relative symlinks remain confined to that root. Glob traversal stays inside the reader so remote callers need only one request.
+- The hidden `serve-read-view` command holds one immutable Badger generation and its object storage client open, and serves GET, HEAD, Range, conditional requests, bounded directory listings, and bounded doublestar globs over regular files through a mode-0600 Unix socket. Requests may select a filesystem root; absolute and relative symlinks remain confined to that root. Glob traversal stays inside the reader so remote callers need only one request. A Glob may apply root and nested `.gitignore` files before matching and limiting, with semantics and resource bounds kept identical to run9's online reader.
 
 - `pkg/fs.FileSystem.ReadDirPage` provides bounded, name-cursor directory reads for the immutable reader. It uses a Badger key scan directly instead of materializing the complete directory; other metadata backends keep their upstream contract unchanged.
 
@@ -68,6 +68,7 @@ Related files:
 - `cmd/main.go`
 - `cmd/run9_read_view.go`
 - `cmd/run9_read_view_glob.go`
+- `cmd/run9_read_view_glob_gitignore.go`
 - `cmd/run9_read_view_test.go`
 - `pkg/meta/run9_readdir_page.go`
 - `pkg/fs/run9_readdir_page.go`

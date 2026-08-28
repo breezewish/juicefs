@@ -1,6 +1,6 @@
 module github.com/juicedata/juicefs
 
-go 1.23.0
+go 1.25
 
 require (
 	cloud.google.com/go/compute/metadata v0.5.2
@@ -10,6 +10,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.3.1
 	github.com/DataDog/zstd v1.5.6
 	github.com/IBM/ibm-cos-sdk-go v1.12.1
+	github.com/Sriram-PR/go-ignore v0.9.1
 	github.com/agiledragon/gomonkey/v2 v2.6.0
 	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.2.1
 	github.com/aliyun/credentials-go v1.4.5

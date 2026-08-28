@@ -63,6 +63,8 @@ github.com/IBM/ibm-cos-sdk-go v1.12.1 h1:pWs5c5/j9PNJE1lIQhYtzpdCxu2fpvCq9PHs6/n
 github.com/IBM/ibm-cos-sdk-go v1.12.1/go.mod h1:7vmUThyAq4+AD1eEyGZi90ir06Z9YhsEzLBsdGPfcqo=
 github.com/PuerkitoBio/goquery v1.5.1/go.mod h1:GsLWisAFVj4WgDibEWF4pvYnkVQBpKBKeU+7zCJoLcc=
 github.com/QcloudApi/qcloud_sign_golang v0.0.0-20141224014652-e4130a326409/go.mod h1:1pk82RBxDY/JZnPQrtqHlUFfCctgdorsd9M06fMynOM=
+github.com/Sriram-PR/go-ignore v0.9.1 h1:fg52c/wI32A+cv04O7e3yaSa8Y3dB6OBl1bslHBLHb0=
+github.com/Sriram-PR/go-ignore v0.9.1/go.mod h1:h5wvxkxSvVo0jb8n5I5S0DnQGQx/NiEny0WHsdKwL2A=
 github.com/VividCortex/ewma v1.2.0 h1:f58SaIzcDXrSy3kWaHNvuJgJ3Nmz59Zji6XoJR/q1ow=
 github.com/VividCortex/ewma v1.2.0/go.mod h1:nz4BbCtbLyFDeC9SUHbtcT5644juEuWfUAUnGx7j5l4=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d h1:licZJFw2RwpHMqeKTCYkitsPqHNxTmd4SNR5r94FGM8=
