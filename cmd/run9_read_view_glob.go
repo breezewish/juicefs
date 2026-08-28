@@ -59,11 +59,14 @@ type run9ReadViewGlobCache struct {
 }
 
 type run9ReadViewGlobScan struct {
-	paths      []string
-	pathBytes  int
-	visited    int
-	incomplete bool
-	stopped    bool
+	maximumDepth        int
+	depthLimitTruncates bool
+	excluded            map[string]struct{}
+	paths               []string
+	pathBytes           int
+	visited             int
+	incomplete          bool
+	stopped             bool
 }
 
 type run9ReadViewGlobHeap struct {
@@ -293,23 +296,30 @@ func (h *run9ReadViewHandler) globPaths(ctx meta.Context, fsPath string, root st
 		h.globMu.Unlock()
 	}()
 
-	scan := run9ReadViewGlobScan{paths: make([]string, 0, 1024)}
+	scan := run9ReadViewGlobScan{
+		maximumDepth:        request.maximumDepth,
+		depthLimitTruncates: request.depthLimitTruncates,
+		excluded:            request.excludedDirectorySet,
+		paths:               make([]string, 0, 1024),
+	}
 	if request.baseExceedsDepthLimit {
 		scan.incomplete = true
 	} else {
 		var ignoreRules *run9ReadViewGlobIgnoreRules
 		if request.respectGitIgnore {
 			ignoreRules = newRun9ReadViewGlobIgnoreRules()
-			if err := loadRun9ReadViewGlobIgnore(h.fs, ctx, fsPath, "", ignoreRules); err != nil {
+			loadedRules, err := loadRun9ReadViewGlobIgnore(h.fs, ctx, fsPath, "", ignoreRules)
+			if err != nil {
 				return nil, false, err
 			}
+			ignoreRules = loadedRules
 		}
-		scanPath, found, err := openRun9ReadViewGlobBase(h.fs, ctx, fsPath, request.scanBase, request.excludedDirectorySet, ignoreRules)
+		scanPath, ignoreRules, found, err := openRun9ReadViewGlobBase(h.fs, ctx, fsPath, request.scanBase, request.excludedDirectorySet, ignoreRules)
 		if err != nil {
 			return nil, false, err
 		}
 		if found {
-			if err := collectRun9ReadViewGlobPaths(h.fs, ctx, scanPath, request.scanBase, 0, request.maximumDepth, request.depthLimitTruncates, request.excludedDirectorySet, ignoreRules, &scan); err != nil {
+			if err := collectRun9ReadViewGlobPaths(h.fs, ctx, scanPath, request.scanBase, 0, ignoreRules, &scan); err != nil {
 				return nil, false, err
 			}
 		}
@@ -320,46 +330,51 @@ func (h *run9ReadViewHandler) globPaths(ctx meta.Context, fsPath string, root st
 	return scan.paths, scan.incomplete, nil
 }
 
-func openRun9ReadViewGlobBase(jfs *fs.FileSystem, ctx meta.Context, directory string, scanBase string, excluded map[string]struct{}, ignoreRules *run9ReadViewGlobIgnoreRules) (string, bool, error) {
+func openRun9ReadViewGlobBase(jfs *fs.FileSystem, ctx meta.Context, directory string, scanBase string, excluded map[string]struct{}, ignoreRules *run9ReadViewGlobIgnoreRules) (string, *run9ReadViewGlobIgnoreRules, bool, error) {
 	current := directory
 	if scanBase == "" {
-		return current, true, nil
+		return current, ignoreRules, true, nil
 	}
 	relativeDirectory := ""
 	for _, component := range strings.Split(scanBase, "/") {
 		if component == "" || component == "." || component == ".." {
-			return "", false, nil
+			return "", nil, false, nil
 		}
 		if _, skip := excluded[component]; skip {
-			return "", false, nil
+			return "", nil, false, nil
 		}
 		relativePath := path.Join(relativeDirectory, component)
-		if ignoreRules.ignores(relativePath, true) {
-			return "", false, nil
+		ignored, err := ignoreRules.ignores(relativePath, true)
+		if err != nil {
+			return "", nil, false, err
+		}
+		if ignored {
+			return "", nil, false, nil
 		}
 		current = path.Join(current, component)
 		stat, errno := jfs.Lstat(ctx, current)
 		if errno == syscall.ENOENT || errno == syscall.ENOTDIR {
-			return "", false, nil
+			return "", nil, false, nil
 		}
 		if errno != 0 {
-			return "", false, errno
+			return "", nil, false, errno
 		}
 		if !stat.IsDir() || stat.IsSymlink() {
-			return "", false, nil
+			return "", nil, false, nil
 		}
 		relativeDirectory = relativePath
-		if err := loadRun9ReadViewGlobIgnore(jfs, ctx, current, relativePath, ignoreRules); err != nil {
-			return "", false, err
+		ignoreRules, err = loadRun9ReadViewGlobIgnore(jfs, ctx, current, relativePath, ignoreRules)
+		if err != nil {
+			return "", nil, false, err
 		}
 	}
-	return current, true, nil
+	return current, ignoreRules, true, nil
 }
 
 // collectRun9ReadViewGlobPaths traverses the immutable generation with native
 // bounded metadata pages. Directory entries are never resolved as paths, so
 // symlinks are not followed while collecting candidates for pattern matching.
-func collectRun9ReadViewGlobPaths(jfs *fs.FileSystem, ctx meta.Context, fsDirectory string, relativeDirectory string, depth int, maximumDepth int, depthLimitTruncates bool, excluded map[string]struct{}, ignoreRules *run9ReadViewGlobIgnoreRules, scan *run9ReadViewGlobScan) error {
+func collectRun9ReadViewGlobPaths(jfs *fs.FileSystem, ctx meta.Context, fsDirectory string, relativeDirectory string, depth int, ignoreRules *run9ReadViewGlobIgnoreRules, scan *run9ReadViewGlobScan) error {
 	cursor := ""
 	for {
 		if err := ctx.Err(); err != nil {
@@ -385,28 +400,37 @@ func collectRun9ReadViewGlobPaths(jfs *fs.FileSystem, ctx meta.Context, fsDirect
 					return nil
 				}
 				scan.pathBytes += len(relativePath)
-				if ignoreRules.ignores(relativePath, false) {
+				ignored, err := ignoreRules.ignores(relativePath, false)
+				if err != nil {
+					return err
+				}
+				if ignored {
 					continue
 				}
 				scan.paths = append(scan.paths, relativePath)
 			case entry.IsDir():
-				if _, skip := excluded[entry.Name()]; skip {
+				if _, skip := scan.excluded[entry.Name()]; skip {
 					continue
 				}
-				if ignoreRules.ignores(relativePath, true) {
+				ignored, err := ignoreRules.ignores(relativePath, true)
+				if err != nil {
+					return err
+				}
+				if ignored {
 					continue
 				}
-				if depth >= maximumDepth {
-					if depthLimitTruncates {
+				if depth >= scan.maximumDepth {
+					if scan.depthLimitTruncates {
 						scan.incomplete = true
 					}
 					continue
 				}
 				childPath := path.Join(fsDirectory, entry.Name())
-				if err := loadRun9ReadViewGlobIgnore(jfs, ctx, childPath, relativePath, ignoreRules); err != nil {
+				childRules, err := loadRun9ReadViewGlobIgnore(jfs, ctx, childPath, relativePath, ignoreRules)
+				if err != nil {
 					return err
 				}
-				if err := collectRun9ReadViewGlobPaths(jfs, ctx, childPath, relativePath, depth+1, maximumDepth, depthLimitTruncates, excluded, ignoreRules, scan); err != nil {
+				if err := collectRun9ReadViewGlobPaths(jfs, ctx, childPath, relativePath, depth+1, childRules, scan); err != nil {
 					return err
 				}
 				if scan.stopped {

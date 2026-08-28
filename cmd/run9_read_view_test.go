@@ -387,8 +387,49 @@ func TestRun9ReadViewHandlerGlobRespectsNestedGitIgnoreRules(t *testing.T) {
 
 func TestRun9ReadViewGlobRejectsOversizedGitIgnore(t *testing.T) {
 	rules := newRun9ReadViewGlobIgnoreRules()
-	if err := rules.add("", make([]byte, run9ReadViewGlobMaximumGitIgnoreFileBytes+1)); err == nil || err.Error() != "gitignore data exceeds file glob limits" {
+	if _, err := rules.add("", make([]byte, run9ReadViewGlobMaximumGitIgnoreFileBytes+1)); err == nil || err.Error() != "gitignore data exceeds file glob limits" {
 		t.Fatalf("unexpected oversized gitignore error: %v", err)
+	}
+	if _, err := rules.add("", []byte(strings.Repeat("x", run9ReadViewGlobMaximumGitIgnorePatternBytes+1)+"\n")); err == nil || err.Error() != "gitignore pattern exceeds file glob limits" {
+		t.Fatalf("unexpected oversized gitignore pattern error: %v", err)
+	}
+	if _, err := newRun9ReadViewGlobIgnoreRules().add("", append([]byte{0xef, 0xbb, 0xbf}, []byte(strings.Repeat("x", run9ReadViewGlobMaximumGitIgnorePatternBytes)+"\r\n")...)); err != nil {
+		t.Fatalf("unexpected normalized gitignore pattern error: %v", err)
+	}
+	if _, err := newRun9ReadViewGlobIgnoreRules().add("", []byte(strings.Repeat("x\r", 5000))); err != nil {
+		t.Fatalf("unexpected CR-separated gitignore pattern error: %v", err)
+	}
+	if _, err := newRun9ReadViewGlobIgnoreRules().add("", []byte(strings.Repeat("x\n", run9ReadViewGlobMaximumGitIgnorePatterns))); err != nil {
+		t.Fatalf("unexpected gitignore pattern count error at limit: %v", err)
+	}
+	if _, err := newRun9ReadViewGlobIgnoreRules().add("", []byte(strings.Repeat("x\n", run9ReadViewGlobMaximumGitIgnorePatterns+1))); err == nil || err.Error() != "gitignore pattern count exceeds file glob limits" {
+		t.Fatalf("unexpected gitignore pattern count error: %v", err)
+	}
+}
+
+func TestRun9ReadViewGlobIgnoreRulesKeepSiblingScopesSeparate(t *testing.T) {
+	rules := newRun9ReadViewGlobIgnoreRules()
+	left, err := rules.add("left", []byte("*.tmp\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := rules.add("right", []byte("*.log\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left.matchers) != 1 || len(right.matchers) != 1 || rules.budget.patterns != 2 {
+		t.Fatalf("sibling scopes share matchers: left=%d right=%d patterns=%d", len(left.matchers), len(right.matchers), rules.budget.patterns)
+	}
+}
+
+func TestRun9ReadViewGlobIgnoreRulesBoundMatchingWork(t *testing.T) {
+	rules, err := newRun9ReadViewGlobIgnoreRules().add("", []byte("*.tmp\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules.budget.ruleEvaluations = run9ReadViewGlobMaximumGitIgnoreRuleEvaluations - 1
+	if _, err := rules.ignores("dir/file.tmp", false); err == nil || err.Error() != "gitignore matching work exceeds file glob limits" {
+		t.Fatalf("unexpected gitignore matching work error: %v", err)
 	}
 }
 
