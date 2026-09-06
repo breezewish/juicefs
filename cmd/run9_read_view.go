@@ -40,7 +40,7 @@ const (
 
 type run9ReadViewHandler struct {
 	fs         run9ReadFilesystem
-	dataMount  string
+	dataMounts []string
 	generation uint64
 	globMu     sync.Mutex
 	glob       run9ReadViewGlobCache
@@ -361,10 +361,7 @@ func cmdRun9ServeReadView() *cli.Command {
 			&cli.StringFlag{Name: "cache-dir", Required: true},
 			&cli.StringFlag{Name: "clean-cache-dir"},
 			&cli.Uint64Flag{Name: "generation", Required: true},
-			&cli.StringFlag{Name: "data-meta-url"},
-			&cli.Uint64Flag{Name: "data-generation"},
-			&cli.StringFlag{Name: "data-mount-path"},
-			&cli.StringFlag{Name: "data-clean-cache-dir"},
+			&cli.StringFlag{Name: "data-volumes", Value: "[]"},
 		},
 		Action: serveRun9ReadView,
 	}
@@ -388,23 +385,42 @@ func serveRun9ReadView(c *cli.Context) error {
 	}
 	defer closeRoot()
 	handler := &run9ReadViewHandler{fs: jfs, generation: c.Uint64("generation")}
-	dataURL, mountPath := c.String("data-meta-url"), c.String("data-mount-path")
-	if dataURL != "" || mountPath != "" || c.Uint64("data-generation") != 0 || c.String("data-clean-cache-dir") != "" {
-		if dataURL == "" || mountPath == "" || c.Uint64("data-generation") == 0 {
+	var volumes []run9ReadMount
+	identity := sha256.New()
+	fmt.Fprintf(identity, "%s\x00%d", metaURL, handler.generation)
+	var configs []struct {
+		MetaURL       string `json:"meta_url"`
+		MountPath     string `json:"mount_path"`
+		Generation    uint64 `json:"generation"`
+		CleanCacheDir string `json:"clean_cache_dir"`
+	}
+	// Use one JSON array, not a CSV-aware slice flag: metadata URLs and
+	// legitimate mount paths may themselves contain commas.
+	if err := json.Unmarshal([]byte(c.String("data-volumes")), &configs); err != nil {
+		return fmt.Errorf("invalid data volumes: %w", err)
+	}
+	for i, config := range configs {
+		if config.MetaURL == "" || config.MountPath == "" || config.Generation == 0 {
 			return fmt.Errorf("data metadata URL, generation and mount path must be supplied together")
 		}
-		data, closeData, err := openRun9ReadFilesystem(dataURL, filepath.Join(c.String("cache-dir"), "data"), c.String("data-clean-cache-dir"))
+		data, closeData, err := openRun9ReadFilesystem(config.MetaURL, filepath.Join(c.String("cache-dir"), fmt.Sprintf("data-%d", i)), config.CleanCacheDir)
 		if err != nil {
 			return fmt.Errorf("open data read view: %w", err)
 		}
 		defer closeData()
-		mounted, err := newRun9MountedReadFilesystem(run9ReadViewContext(c.Context), jfs, data, mountPath)
+		volumes = append(volumes, run9ReadMount{data: data, mount: config.MountPath})
+		fmt.Fprintf(identity, "\x00%s\x00%d\x00%s", config.MetaURL, config.Generation, config.MountPath)
+	}
+	if len(volumes) != 0 {
+		mounted, err := newRun9MountedReadFilesystem(run9ReadViewContext(c.Context), jfs, volumes)
 		if err != nil {
 			return err
 		}
-		handler.fs, handler.dataMount = mounted, mounted.mount
-		identity := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%d\x00%s", metaURL, handler.generation, dataURL, c.Uint64("data-generation"), mountPath)))
-		handler.generation = binary.BigEndian.Uint64(identity[:8])
+		handler.fs = mounted
+		for _, volume := range mounted.volumes {
+			handler.dataMounts = append(handler.dataMounts, volume.mount)
+		}
+		handler.generation = binary.BigEndian.Uint64(identity.Sum(nil)[:8])
 	}
 
 	if err := removeRun9ReadViewSocket(listenPath); err != nil {
