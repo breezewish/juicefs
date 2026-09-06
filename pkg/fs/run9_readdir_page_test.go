@@ -42,6 +42,15 @@ func TestReadDirPageUsesStableNameCursor(t *testing.T) {
 	if cursor != "" {
 		t.Fatalf("expected terminal cursor, got %q", cursor)
 	}
+
+	between, _, err := jfs.ReadDirPage(ctx, "/site", 1, "b")
+	if err != 0 || len(between) != 1 || between[0].Name() != "m.js" {
+		t.Fatalf("nonexistent name cursor skipped a real entry: entries=%v error=%v", between, err)
+	}
+	end, cursor, err := jfs.ReadDirPage(ctx, "/site", 1, "zzz")
+	if err != 0 || len(end) != 0 || cursor != "" {
+		t.Fatalf("cursor after last entry: entries=%v cursor=%q error=%v", end, cursor, err)
+	}
 }
 
 func TestReadDirPageValidatesDirectoryAndLimit(t *testing.T) {

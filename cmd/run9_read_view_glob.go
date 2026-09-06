@@ -13,7 +13,6 @@ import (
 	"syscall"
 
 	"github.com/bmatcuk/doublestar/v4"
-	"github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/meta"
 )
 
@@ -330,7 +329,7 @@ func (h *run9ReadViewHandler) globPaths(ctx meta.Context, fsPath string, root st
 	return scan.paths, scan.incomplete, nil
 }
 
-func openRun9ReadViewGlobBase(jfs *fs.FileSystem, ctx meta.Context, directory string, scanBase string, excluded map[string]struct{}, ignoreRules *run9ReadViewGlobIgnoreRules) (string, *run9ReadViewGlobIgnoreRules, bool, error) {
+func openRun9ReadViewGlobBase(jfs run9ReadFilesystem, ctx meta.Context, directory string, scanBase string, excluded map[string]struct{}, ignoreRules *run9ReadViewGlobIgnoreRules) (string, *run9ReadViewGlobIgnoreRules, bool, error) {
 	current := directory
 	if scanBase == "" {
 		return current, ignoreRules, true, nil
@@ -374,7 +373,7 @@ func openRun9ReadViewGlobBase(jfs *fs.FileSystem, ctx meta.Context, directory st
 // collectRun9ReadViewGlobPaths traverses the immutable generation with native
 // bounded metadata pages. Directory entries are never resolved as paths, so
 // symlinks are not followed while collecting candidates for pattern matching.
-func collectRun9ReadViewGlobPaths(jfs *fs.FileSystem, ctx meta.Context, fsDirectory string, relativeDirectory string, depth int, ignoreRules *run9ReadViewGlobIgnoreRules, scan *run9ReadViewGlobScan) error {
+func collectRun9ReadViewGlobPaths(jfs run9ReadFilesystem, ctx meta.Context, fsDirectory string, relativeDirectory string, depth int, ignoreRules *run9ReadViewGlobIgnoreRules, scan *run9ReadViewGlobScan) error {
 	cursor := ""
 	for {
 		if err := ctx.Err(); err != nil {

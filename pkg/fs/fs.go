@@ -122,6 +122,14 @@ func AttrToFileInfo(inode Ino, attr *Attr) *FileStat {
 	return &FileStat{inode: inode, attr: attr}
 }
 
+// WithName returns a stat with a directory-entry name, leaving the original
+// unchanged. It is used when exposing a filesystem root as a mounted entry.
+func (fs *FileStat) WithName(name string) *FileStat {
+	copy := *fs
+	copy.name = name
+	return &copy
+}
+
 type entryCache struct {
 	inode  Ino
 	typ    uint8

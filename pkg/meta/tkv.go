@@ -4430,8 +4430,13 @@ func (m *kvMeta) getDirFetcher() dirFetcher {
 			return nil, nil, err
 		}
 
-		if cursor != nil {
+		// Name cursors may have been removed, or may name a virtual mount
+		// supplied by a composed read view. Skip only an actual matching key.
+		if cursor != nil && len(keys) != 0 && bytes.Equal(keys[0], startKey) {
 			keys, vals = keys[1:], vals[1:]
+		}
+		if cursor != nil && len(keys) > limit-1 {
+			keys, vals = keys[:limit-1], vals[:limit-1]
 		}
 
 		if total > limit && offset <= len(keys) {

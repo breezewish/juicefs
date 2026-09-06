@@ -92,6 +92,7 @@ func Main(args []string) error {
 			cmdRun9CountSliceRanges(),
 			cmdRun9GCRetiredSlices(),
 			cmdRun9ServeReadView(),
+			cmdRun9CheckEmptyDirectory(),
 			cmdCleanCachePrune(),
 			cmdSummary(),
 			cmdCompact(),

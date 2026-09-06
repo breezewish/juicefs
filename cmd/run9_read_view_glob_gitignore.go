@@ -10,7 +10,6 @@ import (
 	"syscall"
 
 	ignore "github.com/Sriram-PR/go-ignore"
-	"github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
@@ -106,7 +105,7 @@ func (rules *run9ReadViewGlobIgnoreRules) ignores(relativePath string, directory
 	return false, nil
 }
 
-func loadRun9ReadViewGlobIgnore(jfs *fs.FileSystem, ctx meta.Context, fsDirectory string, relativeDirectory string, rules *run9ReadViewGlobIgnoreRules) (*run9ReadViewGlobIgnoreRules, error) {
+func loadRun9ReadViewGlobIgnore(jfs run9ReadFilesystem, ctx meta.Context, fsDirectory string, relativeDirectory string, rules *run9ReadViewGlobIgnoreRules) (*run9ReadViewGlobIgnoreRules, error) {
 	if rules == nil {
 		return nil, nil
 	}

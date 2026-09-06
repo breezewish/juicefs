@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,7 +39,8 @@ const (
 )
 
 type run9ReadViewHandler struct {
-	fs         *fs.FileSystem
+	fs         run9ReadFilesystem
+	dataMount  string
 	generation uint64
 	globMu     sync.Mutex
 	glob       run9ReadViewGlobCache
@@ -131,7 +135,7 @@ func (h *run9ReadViewHandler) serveFile(w http.ResponseWriter, r *http.Request, 
 		writeRun9ReadViewError(w, errno)
 		return
 	}
-	etag := run9ReadViewETag(h.generation, stat)
+	etag := h.fileETag(fsPath, stat)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
 	w.Header().Set("X-Run9-File-Type", run9ReadViewFileType(stat))
@@ -197,7 +201,7 @@ func (h *run9ReadViewHandler) serveList(w http.ResponseWriter, r *http.Request, 
 			Type:    run9ReadViewFileType(entry),
 			Size:    entry.Size(),
 			ModTime: entry.ModTime().UTC().Format(time.RFC3339Nano),
-			ETag:    run9ReadViewETag(h.generation, entry),
+			ETag:    h.fileETag(path.Join(fsPath, entry.Name()), entry),
 		})
 	}
 	if next != "" {
@@ -211,7 +215,7 @@ func (h *run9ReadViewHandler) serveList(w http.ResponseWriter, r *http.Request, 
 // resolveRun9ReadViewPath follows symlinks as if filesystemRoot were "/".
 // FileSystem's normal absolute-symlink handling is mountpoint-oriented; using
 // it directly here would let an absolute target escape the selected file root.
-func resolveRun9ReadViewPath(jfs *fs.FileSystem, ctx meta.Context, filesystemRoot string, requestPath string) (string, *fs.FileStat, syscall.Errno) {
+func resolveRun9ReadViewPath(jfs run9ReadFilesystem, ctx meta.Context, filesystemRoot string, requestPath string) (string, *fs.FileStat, syscall.Errno) {
 	pending := splitRun9ReadViewPath(requestPath)
 	resolved := make([]string, 0, len(pending))
 	if len(pending) == 0 {
@@ -223,6 +227,15 @@ func resolveRun9ReadViewPath(jfs *fs.FileSystem, ctx meta.Context, filesystemRoo
 	for len(pending) > 0 {
 		name := pending[0]
 		pending = pending[1:]
+		switch name {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) > 0 {
+				resolved = resolved[:len(resolved)-1]
+			}
+			continue
+		}
 		candidate := path.Join(filesystemRoot, strings.Join(resolved, "/"), name)
 		stat, errno := jfs.Lstat(ctx, candidate)
 		if errno != 0 {
@@ -250,19 +263,21 @@ func resolveRun9ReadViewPath(jfs *fs.FileSystem, ctx meta.Context, filesystemRoo
 		if len(target) == 0 || strings.ContainsRune(string(target), '\x00') {
 			return "", nil, syscall.EACCES
 		}
-		virtualParent := "/" + strings.Join(resolved, "/")
 		virtualTarget := string(target)
-		if !strings.HasPrefix(virtualTarget, "/") {
-			virtualTarget = path.Join(virtualParent, virtualTarget)
+		if strings.HasPrefix(virtualTarget, "/") {
+			resolved = resolved[:0]
 		}
+		// Resolve links before processing subsequent '..': lexical path.Clean
+		// would change a target such as "link-to-other-mount/../file".
 		pending = append(splitRun9ReadViewPath(virtualTarget), pending...)
-		resolved = resolved[:0]
 	}
-	return "", nil, syscall.ENOENT
+	result := path.Join(filesystemRoot, strings.Join(resolved, "/"))
+	stat, errno := jfs.Lstat(ctx, result)
+	return result, stat, errno
 }
 
 func splitRun9ReadViewPath(value string) []string {
-	value = strings.Trim(path.Clean("/"+strings.TrimPrefix(value, "/")), "/")
+	value = strings.TrimPrefix(value, "/")
 	if value == "" {
 		return nil
 	}
@@ -346,6 +361,10 @@ func cmdRun9ServeReadView() *cli.Command {
 			&cli.StringFlag{Name: "cache-dir", Required: true},
 			&cli.StringFlag{Name: "clean-cache-dir"},
 			&cli.Uint64Flag{Name: "generation", Required: true},
+			&cli.StringFlag{Name: "data-meta-url"},
+			&cli.Uint64Flag{Name: "data-generation"},
+			&cli.StringFlag{Name: "data-mount-path"},
+			&cli.StringFlag{Name: "data-clean-cache-dir"},
 		},
 		Action: serveRun9ReadView,
 	}
@@ -367,6 +386,31 @@ func serveRun9ReadView(c *cli.Context) error {
 	if listenPath == "" {
 		return fmt.Errorf("listen path is required")
 	}
+	jfs, closeRoot, err := openRun9ReadFilesystem(metaURL, c.String("cache-dir"), c.String("clean-cache-dir"))
+	if err != nil {
+		return err
+	}
+	defer closeRoot()
+	handler := &run9ReadViewHandler{fs: jfs, generation: c.Uint64("generation")}
+	dataURL, mountPath := c.String("data-meta-url"), c.String("data-mount-path")
+	if dataURL != "" || mountPath != "" || c.Uint64("data-generation") != 0 || c.String("data-clean-cache-dir") != "" {
+		if dataURL == "" || mountPath == "" || c.Uint64("data-generation") == 0 {
+			return fmt.Errorf("data metadata URL, generation and mount path must be supplied together")
+		}
+		data, closeData, err := openRun9ReadFilesystem(dataURL, filepath.Join(c.String("cache-dir"), "data"), c.String("data-clean-cache-dir"))
+		if err != nil {
+			return fmt.Errorf("open data read view: %w", err)
+		}
+		defer closeData()
+		mounted, err := newRun9MountedReadFilesystem(run9ReadViewContext(c.Context), jfs, data, mountPath)
+		if err != nil {
+			return err
+		}
+		handler.fs, handler.dataMount = mounted, mounted.mount
+		identity := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%d\x00%s", metaURL, handler.generation, dataURL, c.Uint64("data-generation"), mountPath)))
+		handler.generation = binary.BigEndian.Uint64(identity[:8])
+	}
+
 	if err := removeRun9ReadViewSocket(listenPath); err != nil {
 		return err
 	}
@@ -389,51 +433,8 @@ func serveRun9ReadView(c *cli.Context) error {
 		}
 	}()
 
-	metaConf := meta.DefaultConf()
-	metaConf.ReadOnly = true
-	metaConf.NoBGJob = true
-	metaConf.AtimeMode = meta.NoAtime
-	metaCli := meta.NewClient(metaURL, metaConf)
-	defer metaCli.Shutdown()
-	format, err := metaCli.Load(true)
-	if err != nil {
-		return fmt.Errorf("load read view metadata: %w", err)
-	}
-	blob, err := NewReloadableStorage(format, metaCli, nil)
-	if err != nil {
-		return fmt.Errorf("open read view object storage: %w", err)
-	}
-	defer object.Shutdown(blob)
-	chunkConf := getDefaultChunkConf(format)
-	chunkConf.CacheDir = c.String("cache-dir")
-	chunkConf.CleanCacheDir = c.String("clean-cache-dir")
-	chunkConf.CacheSize = 1024
-	chunkConf.CacheMode = 0o600
-	chunkConf.AutoCreate = true
-	chunkConf.Prefetch = 1
-	chunkConf.SelfCheck(format.UUID)
-	store := chunk.NewCachedStore(blob, *chunkConf, nil)
-	if err := metaCli.NewSession(false); err != nil {
-		return fmt.Errorf("start read-only metadata session: %w", err)
-	}
-	defer metaCli.CloseSession()
-	vfsConf := &vfs.Config{
-		Meta:            metaConf,
-		Format:          *format,
-		Version:         version.Version(),
-		Chunk:           chunkConf,
-		AttrTimeout:     time.Minute,
-		EntryTimeout:    time.Minute,
-		DirEntryTimeout: time.Minute,
-	}
-	jfs, err := fs.NewFileSystem(vfsConf, metaCli, store, nil)
-	if err != nil {
-		return fmt.Errorf("initialize read view filesystem: %w", err)
-	}
-	defer jfs.Close()
-
 	server := &http.Server{
-		Handler:           &run9ReadViewHandler{fs: jfs, generation: c.Uint64("generation")},
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -449,6 +450,76 @@ func serveRun9ReadView(c *cli.Context) error {
 		return err
 	}
 	return nil
+}
+
+func openRun9ReadFilesystem(metaURL, cacheDir, cleanCacheDir string) (jfs *fs.FileSystem, closeView func(), err error) {
+	parsed, err := url.Parse(metaURL)
+	if err != nil || parsed.Scheme != "badger" || len(parsed.Query()["readonly"]) != 1 || parsed.Query().Get("readonly") != "1" {
+		return nil, nil, fmt.Errorf("read view metadata URL must request native read-only mode")
+	}
+	metaConf := meta.DefaultConf()
+	metaConf.ReadOnly = true
+	metaConf.NoBGJob = true
+	metaConf.AtimeMode = meta.NoAtime
+	metaCli := meta.NewClient(metaURL, metaConf)
+	defer func() {
+		if err != nil {
+			metaCli.Shutdown()
+		}
+	}()
+	format, err := metaCli.Load(true)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load read view metadata: %w", err)
+	}
+	blob, err := NewReloadableStorage(format, metaCli, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open read view object storage: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			object.Shutdown(blob)
+		}
+	}()
+	chunkConf := getDefaultChunkConf(format)
+	chunkConf.CacheDir = cacheDir
+	chunkConf.CleanCacheDir = cleanCacheDir
+	chunkConf.CacheSize = 1024
+	chunkConf.CacheMode = 0o600
+	// Match mounted filesystems: immutable block-cache reads should retain
+	// kernel pages unless the operator explicitly disables the OS cache.
+	chunkConf.OSCache = os.Getenv("JFS_DROP_OSCACHE") == ""
+	chunkConf.AutoCreate = true
+	chunkConf.Prefetch = 1
+	chunkConf.SelfCheck(format.UUID)
+	store := chunk.NewCachedStore(blob, *chunkConf, nil)
+	if err = metaCli.NewSession(false); err != nil {
+		return nil, nil, fmt.Errorf("start read-only metadata session: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = metaCli.CloseSession()
+		}
+	}()
+	vfsConf := &vfs.Config{
+		Meta:            metaConf,
+		Format:          *format,
+		Version:         version.Version(),
+		Chunk:           chunkConf,
+		AttrTimeout:     time.Minute,
+		EntryTimeout:    time.Minute,
+		DirEntryTimeout: time.Minute,
+	}
+	jfs, err = fs.NewFileSystem(vfsConf, metaCli, store, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("initialize read view filesystem: %w", err)
+	}
+	return jfs, func() {
+		jfs.Close()
+		_ = metaCli.CloseSession()
+		object.Shutdown(blob)
+		metaCli.Shutdown()
+	}, nil
+
 }
 
 func removeRun9ReadViewSocket(socketPath string) error {
