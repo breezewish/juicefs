@@ -34,28 +34,8 @@ func newRun9MountedReadFilesystem(ctx meta.Context, root, data *fs.FileSystem, m
 		return nil, fmt.Errorf("data mount must be a canonical absolute path other than root")
 	}
 	mount := run9ReadViewRoot + mountPath
-	current := ""
-	for _, name := range strings.Split(strings.TrimPrefix(mount, "/"), "/") {
-		current += "/" + name
-		stat, errno := root.Lstat(ctx, current)
-		if errno == syscall.ENOENT {
-			break
-		}
-		if errno != 0 {
-			return nil, errno
-		}
-		if !stat.IsDir() {
-			return nil, fmt.Errorf("data mount has a non-directory or symlink ancestor: %s", current)
-		}
-		if current == mount {
-			entries, _, errno := root.ReadDirPage(ctx, current, 1, "")
-			if errno != 0 {
-				return nil, errno
-			}
-			if len(entries) != 0 {
-				return nil, fmt.Errorf("data mount is not empty: %s", mountPath)
-			}
-		}
+	if err := checkRun9EmptyDirectoryMetadata(ctx, root.Meta(), mountPath); err != nil {
+		return nil, err
 	}
 	stat, errno := data.Lstat(ctx, run9ReadViewRoot)
 	if errno != 0 {

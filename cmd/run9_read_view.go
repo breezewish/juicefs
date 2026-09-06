@@ -375,10 +375,6 @@ func serveRun9ReadView(c *cli.Context) error {
 		return fmt.Errorf("usage: juicefs serve-read-view --listen <unix-socket> --cache-dir <dir> --generation <n> <badger-meta-url>")
 	}
 	metaURL := c.Args().First()
-	parsedMetaURL, err := url.Parse(metaURL)
-	if err != nil || parsedMetaURL.Scheme != "badger" || len(parsedMetaURL.Query()["readonly"]) != 1 || parsedMetaURL.Query().Get("readonly") != "1" {
-		return fmt.Errorf("read view metadata URL must request native read-only mode")
-	}
 	if c.Uint64("generation") == 0 {
 		return fmt.Errorf("generation must be greater than zero")
 	}
