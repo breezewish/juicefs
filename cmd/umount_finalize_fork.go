@@ -24,6 +24,10 @@ import (
 
 const forkFinalizeAckMaxBytes = 64 * 1024
 
+// Observe completed work promptly: a coarse poll here adds directly to Box
+// Stop latency. This does not change upload drain or the finalize success fence.
+const forkFinalizeObserveInterval = 20 * time.Millisecond
+
 var errForkFinalizeAckPending = errors.New("finalize ack pending")
 
 func cmdUmountFinalizeFork() *cli.Command {
@@ -481,7 +485,7 @@ func waitFinalizeStart(ctx context.Context, ackPath string, expectedPid int, exp
 }
 
 func waitFinalizeAck(ctx context.Context, ackPath string, expectedPid int, expectedStarttime uint64, expectedUID uint32) (*forkFinalizeAckV1, error) {
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(forkFinalizeObserveInterval)
 	defer ticker.Stop()
 	for {
 		dirReady, err := finalizeAckDirReady(filepath.Dir(ackPath), expectedUID)
@@ -603,7 +607,7 @@ func startForceUmountCommand(ctx context.Context, mp string) (*exec.Cmd, error) 
 func waitProcessExit(ctx context.Context, pid int, expectedStarttime uint64, timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(forkFinalizeObserveInterval)
 	defer ticker.Stop()
 	for {
 		if !processMatches(pid, expectedStarttime) {
