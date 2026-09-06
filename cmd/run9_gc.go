@@ -1105,16 +1105,16 @@ func deleteRun9ExactObjectsBulk(ctx context.Context, store run9GCExactObjectsBul
 			close(deleteJobs)
 			wg.Wait()
 			if firstDeleteErr != nil {
-				return 0, 0, firstDeleteErr
+				return deletedObjects.Load(), deletedBytes.Load(), firstDeleteErr
 			}
-			return 0, 0, ctx.Err()
+			return deletedObjects.Load(), deletedBytes.Load(), ctx.Err()
 		case deleteJobs <- objects[start:end]:
 		}
 	}
 	close(deleteJobs)
 	wg.Wait()
 	if firstDeleteErr != nil {
-		return 0, 0, firstDeleteErr
+		return deletedObjects.Load(), deletedBytes.Load(), firstDeleteErr
 	}
 	return deletedObjects.Load(), deletedBytes.Load(), nil
 }
@@ -1211,14 +1211,14 @@ func deleteRun9ExactObjectsSequential(ctx context.Context, store object.ObjectSt
 		case <-ctx.Done():
 			close(deleteJobs)
 			wg.Wait()
-			return 0, 0, ctx.Err()
+			return deletedObjects.Load(), deletedBytes.Load(), ctx.Err()
 		case deleteJobs <- obj:
 		}
 	}
 	close(deleteJobs)
 	wg.Wait()
 	if firstDeleteErr != nil {
-		return 0, 0, firstDeleteErr
+		return deletedObjects.Load(), deletedBytes.Load(), firstDeleteErr
 	}
 	return deletedObjects.Load(), deletedBytes.Load(), nil
 }

@@ -255,19 +255,32 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 		return resultErr
 	}
 
-	writePendingAck("shutdown")
 	// Capture only positive garbage evidence after the metadata session has
 	// closed. A GC scan error does not change the data durability result.
 	if firstErr == nil && retired != nil {
-		truncated, err := retired.collect(finalizeCtx)
+		writePendingAck("retired_slice_scan")
+		var truncated bool
+		var scanErr error
+		// Badger/FUSE reads cannot always be canceled. Like other metadata
+		// phases, a stuck scan must still emit a terminal timeout ack. Do not
+		// close Badger concurrently with an abandoned phase; the mount exits.
+		phaseErr := runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
+			truncated, scanErr = retired.collect(finalizeCtx)
+			return nil
+		})
+		if phaseErr != nil {
+			recordErr("retired_slice_scan", phaseErr)
+			return resultErr
+		}
 		ack.SliceGCTruncated = truncated
-		if err != nil {
-			ack.SliceGCError = err.Error()
-			logger.Errorf("finalize retired slice collection failed: %s", err)
+		if scanErr != nil {
+			ack.SliceGCError = scanErr.Error()
+			logger.Errorf("finalize retired slice collection failed: %s", scanErr)
 		} else {
 			ack.RetiredSlices = len(retired.batch.Slices)
 		}
 	}
+	writePendingAck("shutdown")
 	recordErr("shutdown", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
 		return metaCli.Shutdown()
 	}))

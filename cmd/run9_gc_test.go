@@ -557,6 +557,38 @@ func TestDeleteRun9ExactObjectsUsesBulkDeleteWhenSupported(t *testing.T) {
 	require.Equal(t, "chunks/0/0/0000_0_1", store.bulkCalls[0][0])
 }
 
+type partialRun9BulkDeleteStore struct{}
+
+func (partialRun9BulkDeleteStore) DeleteObjects(_ context.Context, keys []string, _ ...object.AttrGetter) error {
+	if keys[len(keys)-1] == "fail" {
+		return fmt.Errorf("delete rejected")
+	}
+	return nil
+}
+
+func TestDeleteRun9ExactObjectsKeepsConfirmedCountsOnFailure(t *testing.T) {
+	bucket := t.TempDir()
+	store, err := object.CreateStorage("file", bucket+"/", "", "", "")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(bucket, "first"), []byte("data"), 0600))
+	require.NoError(t, os.Mkdir(filepath.Join(bucket, "fail"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(bucket, "fail", "keep"), nil, 0600))
+	n, bytes, err := deleteRun9ExactObjectsSequential(context.Background(), store, []run9GCExactObject{{Key: "first", Size: 4}, {Key: "fail", Size: 1}}, 1)
+	require.Error(t, err)
+	require.EqualValues(t, 1, n)
+	require.EqualValues(t, 4, bytes)
+
+	objects := make([]run9GCExactObject, 1001)
+	for i := range objects {
+		objects[i] = run9GCExactObject{Key: fmt.Sprint(i), Size: 4}
+	}
+	objects[1000].Key = "fail"
+	n, bytes, err = deleteRun9ExactObjectsBulk(context.Background(), partialRun9BulkDeleteStore{}, objects, 1)
+	require.ErrorContains(t, err, "delete rejected")
+	require.EqualValues(t, 1000, n)
+	require.EqualValues(t, 4000, bytes)
+}
+
 type fakeRun9GCExactObjectsRetryBulkDeleteStore struct {
 	object.ObjectStorage
 	mu        sync.Mutex

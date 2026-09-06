@@ -222,6 +222,10 @@ Related files:
   stays disabled; historical shared slices remain governed by coarse GC.
   Scan/publication failures conservatively leak garbage, not fail finalize.
   Implementation: `pkg/meta/run9_retired_slices.go`, `cmd/run9_retired_slices.go`.
+  Low finalize budget skips optional scanning; uninterruptible metadata reads
+  are bounded by the existing finalize phase deadline without concurrent shutdown.
+  Failed batches use future mtime
+  for retry backoff; confirmed partial deletes still count toward the budget.
 
 - Hidden internal commands `list-live-slices`, `describe-format`, and `gc-slice-ranges` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC.
 - `list-live-slices` reports the format name, object block layout, and slice ids/sizes from one metadata DB; run9rt passes `--scan-pending` when materializing manifests from metadata state instead of only the live view.

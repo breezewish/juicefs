@@ -21,7 +21,10 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-const run9RetiredSliceLimit = 4096
+const (
+	run9RetiredSliceLimit       = 4096
+	run9RetiredSliceScanTimeout = 2 * time.Second
+)
 
 type run9RetiredSliceMetadata interface {
 	Run9SliceAllocationCounter() (uint64, error)
@@ -78,13 +81,18 @@ func beginRun9RetiredSliceGC(m meta.Meta, format *meta.Format) (*run9RetiredSlic
 // collect runs after CloseSession and before Shutdown, with no new user I/O.
 // A bounded scan may leave garbage behind, never widen its deletion proof.
 func (gc *run9RetiredSliceGC) collect(ctx context.Context) (bool, error) {
+	// Optional GC must not use the last shutdown budget. Keep at least another
+	// scan-sized window for the correctness-critical metadata close.
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < 2*run9RetiredSliceScanTimeout {
+		return true, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, run9RetiredSliceScanTimeout)
+	defer cancel()
 	end, err := gc.metadata.Run9SliceAllocationCounter()
 	if err != nil {
 		return false, err
 	}
 	gc.batch.End = min(end, (gc.batch.OwnedEpoch+1)<<32)
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 	slices, truncated, err := gc.metadata.Run9RetiredSlices(ctx, gc.batch.Start, gc.batch.End, run9RetiredSliceLimit)
 	if err != nil {
 		return false, err
@@ -169,6 +177,7 @@ type run9RetiredSliceGCResult struct {
 	Busy             bool   `json:"busy,omitempty"`
 	CompletedBatches int    `json:"completed_batches"`
 	FailedBatches    int    `json:"failed_batches"`
+	DeferredBatches  int    `json:"deferred_batches"`
 	DeletedObjects   uint64 `json:"deleted_objects"`
 	// Exact keys encode uncompressed sizes; this is not a provider billing metric.
 	DeletedLogicalBytes uint64 `json:"deleted_logical_bytes"`
@@ -186,7 +195,10 @@ func cmdRun9GCRetiredSlices() *cli.Command {
 			defer cancel()
 			out, err := run9GCRetiredSlices(ctx, c.String("queue-dir"))
 			if err != nil {
-				return err
+				out.OK = false
+				if out.Error == "" {
+					out.Error = err.Error()
+				}
 			}
 			return json.NewEncoder(c.App.Writer).Encode(out)
 		},
@@ -241,19 +253,37 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
-			n, bytes, err := consumeRun9RetiredSliceBatch(ctx, path)
+			info, err := entry.Info()
 			if err != nil {
+				return out, err
+			}
+			// The immutable batch body is deletion authority; future mtime only
+			// delays retries, including across consumer/host restarts.
+			if info.ModTime().After(time.Now()) {
+				out.DeferredBatches++
+				continue
+			}
+			batchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			n, bytes, err := consumeRun9RetiredSliceBatch(batchCtx, path, info)
+			cancel()
+			out.DeletedObjects += n
+			out.DeletedLogicalBytes += bytes
+			if err != nil {
+				if info.Mode().IsRegular() {
+					retryAt := time.Now().Add(5 * time.Minute)
+					if retryErr := os.Chtimes(path, retryAt, retryAt); retryErr != nil {
+						err = fmt.Errorf("%w; defer retry: %v", err, retryErr)
+					}
+				}
 				out.OK = false
 				out.FailedBatches++
 				if out.Error == "" {
 					out.Error = fmt.Sprintf("batch %s: %v", entry.Name(), err)
 				}
 				logger.Errorf("retired slice GC batch %s: %s", entry.Name(), err)
-				continue
+			} else {
+				out.CompletedBatches++
 			}
-			out.CompletedBatches++
-			out.DeletedObjects += n
-			out.DeletedLogicalBytes += bytes
 			if out.DeletedObjects >= 65536 {
 				break
 			}
@@ -262,11 +292,7 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 	return out, nil
 }
 
-func consumeRun9RetiredSliceBatch(ctx context.Context, path string) (uint64, uint64, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return 0, 0, err
-	}
+func consumeRun9RetiredSliceBatch(ctx context.Context, path string, info os.FileInfo) (uint64, uint64, error) {
 	if !info.Mode().IsRegular() || info.Size() > 1<<20 {
 		return 0, 0, fmt.Errorf("invalid batch file")
 	}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/vfs"
@@ -18,6 +19,63 @@ type retiredFinalizeMetadata struct {
 	closed      bool
 	shutdownErr error
 	scanErr     error
+	scanCalls   int
+}
+
+type blockedRetiredFinalizeMetadata struct {
+	retiredFinalizeMetadata
+	release  chan struct{}
+	done     chan struct{}
+	shutdown bool
+}
+
+func (m *blockedRetiredFinalizeMetadata) Run9SliceAllocationCounter() (uint64, error) {
+	<-m.release
+	defer close(m.done)
+	return 0, errors.New("blocked metadata read released")
+}
+
+func (m *blockedRetiredFinalizeMetadata) Shutdown() error {
+	m.shutdown = true
+	return nil
+}
+
+func TestRun9RetiredSlicesBlockedCounterWritesFailureAck(t *testing.T) {
+	flush, measure := forkFinalizeFlushAll, forkFinalizeMeasureSize
+	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
+	forkFinalizeMeasureSize = func(*vfs.VFS) (uint64, uint64, error) { return 0, 0, nil }
+	t.Cleanup(func() { forkFinalizeFlushAll = flush; forkFinalizeMeasureSize = measure })
+	start, err := readProcStatStarttimeTicks(os.Getpid())
+	require.NoError(t, err)
+	ackPath, requestPath := forkFinalizeAckPath(os.Getpid(), start), forkFinalizeRequestPath(os.Getpid(), start)
+	t.Cleanup(func() { _ = os.Remove(ackPath); _ = os.Remove(requestPath) })
+	// Five seconds admits the optional scan; the daemon's 4.5s deadline must
+	// still bound a backend read that cannot observe its two-second context.
+	require.NoError(t, writeForkFinalizeRequest(requestPath, &forkFinalizeRequestV1{SchemaVersion: 1, FinalizeTimeout: "5s"}))
+	m := &blockedRetiredFinalizeMetadata{release: make(chan struct{}), done: make(chan struct{})}
+	t.Cleanup(func() {
+		close(m.release)
+		select {
+		case <-m.done:
+		case <-time.After(time.Second):
+			t.Error("blocked counter did not return")
+		}
+	})
+	gc := &run9RetiredSliceGC{metadata: m, dir: t.TempDir()}
+	before := time.Now()
+	err = runForkFinalizeOnMain(m, &vfs.VFS{Conf: &vfs.Config{}}, nil, gc)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(before), 6*time.Second)
+	require.False(t, m.shutdown, "must not close metadata concurrently with the blocked scan")
+	raw, err := os.ReadFile(ackPath)
+	require.NoError(t, err)
+	var ack forkFinalizeAckV1
+	require.NoError(t, json.Unmarshal(raw, &ack))
+	require.Equal(t, "error", ack.Status)
+	require.Equal(t, "retired_slice_scan", ack.Phase)
+	entries, err := os.ReadDir(gc.dir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
 }
 
 func (m *retiredFinalizeMetadata) CloseSession() error { m.closed = true; return nil }
@@ -26,6 +84,7 @@ func (m *retiredFinalizeMetadata) Run9SliceAllocationCounter() (uint64, error) {
 	return 1<<32 + 4096, nil
 }
 func (m *retiredFinalizeMetadata) Run9RetiredSlices(context.Context, uint64, uint64, int) ([]meta.Slice, bool, error) {
+	m.scanCalls++
 	if !m.closed {
 		return nil, false, errors.New("scan before close session")
 	}
@@ -78,4 +137,20 @@ func TestRun9RetiredSlicesFinalizePublishesOnlyAfterSuccess(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &ack))
 	require.Equal(t, "ok", ack.Status)
 	require.Contains(t, ack.SliceGCError, "invalid reference record")
+
+	// A short remaining finalize budget belongs to Shutdown, not optional GC.
+	requestPath := forkFinalizeRequestPath(os.Getpid(), start)
+	t.Cleanup(func() { _ = os.Remove(requestPath) })
+	require.NoError(t, writeForkFinalizeRequest(requestPath, &forkFinalizeRequestV1{SchemaVersion: 1, FinalizeTimeout: "200ms"}))
+	m.scanErr = nil
+	previousScans := m.scanCalls
+	require.NoError(t, runForkFinalizeOnMain(m, &vfs.VFS{Conf: &vfs.Config{}}, nil, gc))
+	require.Equal(t, previousScans, m.scanCalls)
+	raw, err = os.ReadFile(ackPath)
+	require.NoError(t, err)
+	ack = forkFinalizeAckV1{}
+	require.NoError(t, json.Unmarshal(raw, &ack))
+	require.Equal(t, "ok", ack.Status)
+	require.True(t, ack.SliceGCTruncated)
+	require.Empty(t, ack.SliceGCError)
 }

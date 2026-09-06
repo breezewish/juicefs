@@ -252,12 +252,19 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 		}
 
 		for i, e := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			key := e.Key()
 			if end != "" && key >= end {
 				return nil
 			}
 			if key >= start {
-				listed <- e
+				select {
+				case listed <- e:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			} else if !strings.HasPrefix(start, key) {
 				continue
 			}
@@ -268,6 +275,10 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 			t := &threads[i%concurrent]
 			t.Lock()
 			for !t.ready {
+				if err := ctx.Err(); err != nil {
+					t.Unlock()
+					return err
+				}
 				t.cond.WaitWithTimeout(time.Millisecond * 10)
 			}
 			if t.err != nil {
@@ -304,7 +315,10 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 		defer close(listed)
 		err := walk(prefix, entries)
 		if err != nil {
-			listed <- nil
+			select {
+			case listed <- nil:
+			case <-ctx.Done():
+			}
 		}
 	}()
 	return listed, nil
