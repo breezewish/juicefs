@@ -101,6 +101,9 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 			break
 		}
 		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return out, err
+			}
 			path := filepath.Join(dir, entry.Name())
 			if strings.HasPrefix(entry.Name(), ".done-") {
 				if err := os.RemoveAll(path); err != nil {
@@ -115,20 +118,26 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 			if err != nil {
 				return out, err
 			}
-			if !info.IsDir() {
-				return out, fmt.Errorf("invalid GC snapshot %s", entry.Name())
-			}
 			if info.ModTime().After(time.Now()) {
 				out.DeferredSnapshots++
 				continue
 			}
-			done, err := consumeRun9RetiredSnapshot(ctx, path, 65536-out.DeletedObjects, &out)
+			var done bool
+			if info.IsDir() {
+				done, err = consumeRun9RetiredSnapshot(ctx, path, 65536-out.DeletedObjects, &out)
+			} else {
+				err = fmt.Errorf("GC snapshot is not a directory")
+			}
 			if err != nil {
 				out.OK = false
 				out.FailedSnapshots++
-				retryAt := time.Now().Add(5 * time.Minute)
-				if retryErr := os.Chtimes(path, retryAt, retryAt); retryErr != nil {
-					err = fmt.Errorf("%w; defer retry: %v", err, retryErr)
+				// Only task directories carry retry state. In particular, never
+				// follow an invalid symlink to change another path's timestamps.
+				if info.IsDir() {
+					retryAt := time.Now().Add(5 * time.Minute)
+					if retryErr := os.Chtimes(path, retryAt, retryAt); retryErr != nil {
+						err = fmt.Errorf("%w; defer retry: %v", err, retryErr)
+					}
 				}
 				if out.Error == "" {
 					out.Error = fmt.Sprintf("snapshot %s: %v", entry.Name(), err)

@@ -26,10 +26,16 @@ func OpenRun9RetiredSnapshot(dir string) (*kvMeta, error) {
 // Run9SliceAllocationCounter reads the next reserved slice ID without allocating
 // or resetting anything. The caller captures it before NewSession starts jobs.
 func (m *kvMeta) Run9SliceAllocationCounter() (uint64, error) {
-	v, err := m.en.getCounter("nextChunk")
+	raw, err := m.get(m.counterKey("nextChunk"))
 	if err != nil {
 		return 0, err
 	}
+	// An absent counter is zero in a new volume; malformed persisted values
+	// must fail this task, not panic through the generic counter decoder.
+	if len(raw) != 0 && len(raw) != 8 {
+		return 0, fmt.Errorf("invalid nextChunk counter encoding")
+	}
+	v := parseCounter(raw)
 	if v < 0 {
 		return 0, fmt.Errorf("negative nextChunk counter")
 	}

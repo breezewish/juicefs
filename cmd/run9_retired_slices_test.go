@@ -233,6 +233,49 @@ func TestRun9RetiredSlicesRejectsInvalidCursorBeforeDeleting(t *testing.T) {
 	require.FileExists(t, key)
 }
 
+func TestRun9RetiredSlicesInvalidEntriesDoNotBlockHealthySnapshot(t *testing.T) {
+	queue := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(queue, "gc-file"), nil, 0600))
+	target := filepath.Join(t.TempDir(), "outside-queue")
+	require.NoError(t, os.WriteFile(target, nil, 0600))
+	old := time.Unix(100, 0)
+	require.NoError(t, os.Chtimes(target, old, old))
+	require.NoError(t, os.Symlink(target, filepath.Join(queue, "gc-link")))
+	format := &meta.Format{Name: "healthy", UUID: "volume", Storage: "file", Bucket: t.TempDir() + "/", BlockSize: 4096}
+	makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
+	out, err := run9GCRetiredSlices(context.Background(), queue)
+	require.NoError(t, err)
+	require.False(t, out.OK)
+	require.Equal(t, 2, out.FailedSnapshots)
+	require.Equal(t, 1, out.CompletedSnapshots)
+	require.EqualValues(t, 1, out.DeletedObjects)
+	info, err := os.Stat(target)
+	require.NoError(t, err)
+	require.Equal(t, old, info.ModTime(), "invalid symlinks must not change their targets")
+}
+
+func TestRun9RetiredSlicesCorruptCounterDoesNotBlockHealthySnapshot(t *testing.T) {
+	queue := t.TempDir()
+	format := &meta.Format{Name: "broken-counter", UUID: "volume", Storage: "file", Bucket: t.TempDir() + "/", BlockSize: 4096}
+	broken := makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
+	db, err := badger.Open(badger.DefaultOptions(filepath.Join(broken, "meta")).WithLogger(nil))
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *badger.Txn) error {
+		return tx.Set([]byte("CnextChunk"), []byte{1})
+	}))
+	require.NoError(t, db.Close())
+	format.Name = "healthy-counter"
+	makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
+	out, err := run9GCRetiredSlices(context.Background(), queue)
+	require.NoError(t, err)
+	require.False(t, out.OK)
+	require.Contains(t, out.Error, "invalid nextChunk counter encoding")
+	require.Equal(t, 1, out.FailedSnapshots)
+	require.Equal(t, 1, out.CompletedSnapshots)
+	require.EqualValues(t, 1, out.DeletedObjects)
+	require.NoFileExists(t, filepath.Join(broken, "cursor"))
+}
+
 type retiredSliceDeleteStore struct {
 	object.ObjectStorage
 	deleteFn func(context.Context, string) error
@@ -240,6 +283,28 @@ type retiredSliceDeleteStore struct {
 
 func (s *retiredSliceDeleteStore) Delete(ctx context.Context, key string, _ ...object.AttrGetter) error {
 	return s.deleteFn(ctx, key)
+}
+
+func TestRun9RetiredSlicesCancellationDoesNotOpenNextSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	opened := 0
+	object.Register("retired-stop-test", func(string, string, string, string) (object.ObjectStorage, error) {
+		opened++
+		return &retiredSliceDeleteStore{base, func(context.Context, string) error { cancel(); return nil }}, nil
+	})
+	queue := t.TempDir()
+	format := &meta.Format{Name: "first", UUID: "volume", Storage: "retired-stop-test", Bucket: "test", BlockSize: 4096}
+	makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
+	format.Name = "second"
+	makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
+	out, err := run9GCRetiredSlices(ctx, queue)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 1, opened, "cancellation must stop before opening another snapshot")
+	require.EqualValues(t, 1, out.DeletedObjects)
+	require.Zero(t, out.FailedSnapshots)
 }
 
 func TestRun9RetiredSlicesCommandKeepsCountsOnCancellation(t *testing.T) {
