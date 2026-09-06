@@ -5,20 +5,18 @@ package cmd
 // The mount daemon writes a terminal ack to prove whether the correctness-critical finalize has finished.
 // Status is "ok" on success, otherwise it's a terminal failure status such as "error" or "panic".
 type forkFinalizeAckV1 struct {
-	SchemaVersion     int     `json:"schema_version"`
-	Pid               int     `json:"pid"`
-	PidStarttimeTicks uint64  `json:"pid_starttime_ticks"`
-	Status            string  `json:"status"`
-	Phase             string  `json:"phase,omitempty"`
-	Error             string  `json:"error,omitempty"`
-	FinishedAt        string  `json:"finished_at,omitempty"`
-	UsedBytes         *uint64 `json:"used_bytes,omitempty"`
-	UsedInodes        *uint64 `json:"used_inodes,omitempty"`
-	SizeMeasuredAt    string  `json:"size_measured_at,omitempty"`
-	SizeError         string  `json:"size_error,omitempty"`
-	RetiredSlices     int     `json:"retired_slices,omitempty"`
-	SliceGCTruncated  bool    `json:"slice_gc_truncated,omitempty"`
-	SliceGCError      string  `json:"slice_gc_error,omitempty"`
+	SchemaVersion        int     `json:"schema_version"`
+	Pid                  int     `json:"pid"`
+	PidStarttimeTicks    uint64  `json:"pid_starttime_ticks"`
+	Status               string  `json:"status"`
+	Phase                string  `json:"phase,omitempty"`
+	Error                string  `json:"error,omitempty"`
+	FinishedAt           string  `json:"finished_at,omitempty"`
+	UsedBytes            *uint64 `json:"used_bytes,omitempty"`
+	UsedInodes           *uint64 `json:"used_inodes,omitempty"`
+	SizeMeasuredAt       string  `json:"size_measured_at,omitempty"`
+	SizeError            string  `json:"size_error,omitempty"`
+	SliceAllocationStart *uint64 `json:"slice_allocation_start,omitempty"`
 }
 
 // forkUmountFinalizeResult is the structured JSON output of `juicefs umount-finalize`.

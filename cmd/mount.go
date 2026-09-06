@@ -726,7 +726,7 @@ func mount(c *cli.Context) error {
 
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(metaCli, store, chunkConf)
-	retiredSlices, err := beginRun9RetiredSliceGC(metaCli, format)
+	sliceAllocationStart, err := beginRun9SliceAllocation(metaCli)
 	if err != nil {
 		_ = metaCli.Shutdown()
 		return err
@@ -757,7 +757,7 @@ func mount(c *cli.Context) error {
 	emitRun9StageTrace("mount_stage3_vfs_ready_end", vfsReadyStart, nil)
 	mountMain(v, c)
 	if forkFinalizeInProgress.Load() {
-		return runForkFinalizeOnMain(metaCli, v, blob, retiredSlices)
+		return runForkFinalizeOnMain(metaCli, v, blob, sliceAllocationStart)
 	}
 	if err := v.FlushAll(""); err != nil {
 		logger.Errorf("flush all delayed data: %s", err)

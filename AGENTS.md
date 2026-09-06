@@ -215,17 +215,18 @@ Related files:
 
 ### Run9 Deleted Snap Object GC
 
-- Writable run9 mounts capture a private allocation window before NewSession.
-  After successful finalize and ack they publish bounded, checksummed batches
-  of native negative-reference slices outside meta/. `gc-retired-slices` consumes
-  exact keys without opening metadata or touching staging. In-band DeleteSlice
-  stays disabled; historical shared slices remain governed by coarse GC.
-  Scan/publication failures conservatively leak garbage, not fail finalize.
-  Implementation: `pkg/meta/run9_retired_slices.go`, `cmd/run9_retired_slices.go`.
-  Low finalize budget skips optional scanning; uninterruptible metadata reads
-  are bounded by the existing finalize phase deadline without concurrent shutdown.
-  Failed batches use future mtime
-  for retry backoff; confirmed partial deletes still count toward the budget.
+- Writable run9 mounts capture the allocation start before NewSession and return
+  it only in a successful finalize ack. Finalize never scans slice references.
+  run9rt clones the closed metadata before releasing its existing lifecycle lock.
+  `gc-retired-slices` opens only those immutable clones in native read-only mode,
+  pages through negative K references in the lifecycle's allocation interval,
+  deletes exact object keys, and checkpoints each completely deleted page.
+  Per-turn budgets pause rather than truncate lifetime coverage. Failed tasks
+  use future directory mtime for retry backoff; partial deletes remain counted.
+  No writable metadata, staging, lineage epoch, or online DeleteSlice changes.
+  Snapshot open/scan failures return errors rather than terminating maintenance.
+  Implementation: `pkg/meta/run9_retired_slices.go`, `cmd/run9_retired_slices.go`,
+  `cmd/run9_slice_allocation.go`.
 
 - Hidden internal commands `list-live-slices`, `describe-format`, and `gc-slice-ranges` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC.
 - `list-live-slices` reports the format name, object block layout, and slice ids/sizes from one metadata DB; run9rt passes `--scan-pending` when materializing manifests from metadata state instead of only the live view.

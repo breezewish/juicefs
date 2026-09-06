@@ -26,23 +26,33 @@ func TestRun9RetiredSlicesSelectsOnlyNegativeReferencesInWindow(t *testing.T) {
 		tx.set(m.sliceKey(104, 100), packCounter(-1)) // outside window
 		return nil
 	}, 0))
-	slices, truncated, err := m.Run9RetiredSlices(context.Background(), 100, 104, 10)
+	slices, next, err := m.Run9RetiredSlices(context.Background(), 100, 104, "", 10)
 	require.NoError(t, err)
-	require.False(t, truncated)
+	require.Empty(t, next)
 	require.Equal(t, []Slice{{Id: 100, Size: 100}, {Id: 103, Size: 100}}, slices)
-	slices, truncated, err = m.Run9RetiredSlices(context.Background(), 100, 104, 1)
+	slices, next, err = m.Run9RetiredSlices(context.Background(), 100, 104, "", 1)
 	require.NoError(t, err)
-	require.True(t, truncated)
+	require.NotEmpty(t, next)
 	require.Equal(t, []Slice{{Id: 100, Size: 100}}, slices)
+	slices, next, err = m.Run9RetiredSlices(context.Background(), 100, 104, next, 2)
+	require.NoError(t, err)
+	require.Empty(t, slices) // two live records still advance the cursor
+	require.NotEmpty(t, next)
+	slices, next, err = m.Run9RetiredSlices(context.Background(), 100, 104, next, 2)
+	require.NoError(t, err)
+	require.Equal(t, []Slice{{Id: 103, Size: 100}}, slices)
+	require.Empty(t, next)
+	_, _, err = m.Run9RetiredSlices(context.Background(), 100, 104, "broken", 2)
+	require.ErrorContains(t, err, "cursor")
 	require.NoError(t, m.client.txn(context.Background(), func(tx *kvTxn) error {
 		tx.set(m.sliceKey(103, 100), []byte{1})
 		return nil
 	}, 0))
-	slices, _, err = m.Run9RetiredSlices(context.Background(), 100, 104, 10)
+	slices, _, err = m.Run9RetiredSlices(context.Background(), 100, 104, "", 10)
 	require.ErrorContains(t, err, "malformed")
 	require.Nil(t, slices) // never authorize the prefix of an invalid scan
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err = m.Run9RetiredSlices(ctx, 100, 104, 10)
+	_, _, err = m.Run9RetiredSlices(ctx, 100, 104, "", 10)
 	require.ErrorIs(t, err, context.Canceled)
 }

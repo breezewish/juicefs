@@ -3,14 +3,12 @@ package cmd
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -21,171 +19,30 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-const (
-	run9RetiredSliceLimit       = 4096
-	run9RetiredSliceScanTimeout = 2 * time.Second
-)
-
-type run9RetiredSliceMetadata interface {
-	Run9SliceAllocationCounter() (uint64, error)
-	Run9RetiredSlices(context.Context, uint64, uint64, int) ([]meta.Slice, bool, error)
-}
-
-// A batch is an immutable deletion authorization, not a live-slice manifest.
-// Only a successfully finalized mount may publish it. It lives outside meta/ so
-// fork never copies it; consumption never opens a snap or touches writeback.
-type run9RetiredSliceBatch struct {
-	Version    int                         `json:"version"`
-	Format     string                      `json:"format"`
-	Storage    run9ObjectStorageDescriptor `json:"storage"`
-	Layout     run9ObjectLayout            `json:"layout"`
-	OwnedEpoch uint64                      `json:"owned_epoch"`
-	Start      uint64                      `json:"start"`
-	End        uint64                      `json:"end"`
-	Slices     []run9LiveSlice             `json:"slices"`
-}
-
-type run9RetiredSliceGC struct {
-	metadata run9RetiredSliceMetadata
-	dir      string
-	batch    run9RetiredSliceBatch
-}
-
-func beginRun9RetiredSliceGC(m meta.Meta, format *meta.Format) (*run9RetiredSliceGC, error) {
-	dir := os.Getenv("JFS_RUN9_RETIRED_SLICES_DIR")
-	if dir == "" {
-		return nil, nil
-	}
-	epoch, err := strconv.ParseUint(os.Getenv("JFS_RUN9_OWNED_EPOCH"), 10, 64)
-	if err != nil || epoch == 0 || epoch >= 1<<32-1 || !filepath.IsAbs(dir) {
-		return nil, fmt.Errorf("invalid run9 retired slice GC configuration")
-	}
-	metadata, ok := m.(run9RetiredSliceMetadata)
-	if !ok || m.Name() != "badger" {
-		return nil, fmt.Errorf("run9 retired slice GC requires Badger")
-	}
-	start, err := metadata.Run9SliceAllocationCounter()
-	if err != nil {
-		return nil, err
-	}
-	if start < epoch<<32 || start > (epoch+1)<<32 {
-		return nil, fmt.Errorf("slice allocation counter %d is outside owned epoch %d", start, epoch)
-	}
-	return &run9RetiredSliceGC{metadata: metadata, dir: dir, batch: run9RetiredSliceBatch{
-		Version: 1, Format: format.Name, Storage: run9ObjectStorageDescriptorFromFormat(*format),
-		Layout:     run9ObjectLayout{BlockSizeBytes: format.BlockSize * 1024, HashPrefix: format.HashPrefix},
-		OwnedEpoch: epoch, Start: start,
-	}}, nil
-}
-
-// collect runs after CloseSession and before Shutdown, with no new user I/O.
-// A bounded scan may leave garbage behind, never widen its deletion proof.
-func (gc *run9RetiredSliceGC) collect(ctx context.Context) (bool, error) {
-	// Optional GC must not use the last shutdown budget. Keep at least another
-	// scan-sized window for the correctness-critical metadata close.
-	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < 2*run9RetiredSliceScanTimeout {
-		return true, nil
-	}
-	ctx, cancel := context.WithTimeout(ctx, run9RetiredSliceScanTimeout)
-	defer cancel()
-	end, err := gc.metadata.Run9SliceAllocationCounter()
-	if err != nil {
-		return false, err
-	}
-	gc.batch.End = min(end, (gc.batch.OwnedEpoch+1)<<32)
-	slices, truncated, err := gc.metadata.Run9RetiredSlices(ctx, gc.batch.Start, gc.batch.End, run9RetiredSliceLimit)
-	if err != nil {
-		return false, err
-	}
-	var objects uint64
-	for _, s := range slices {
-		objects += (uint64(s.Size) + uint64(gc.batch.Layout.BlockSizeBytes) - 1) / uint64(gc.batch.Layout.BlockSizeBytes)
-		if objects > 65536 {
-			truncated = true
-			break
-		}
-		gc.batch.Slices = append(gc.batch.Slices, run9LiveSlice{ID: s.Id, Size: s.Size})
-	}
-	return truncated, nil
-}
-
-func (batch run9RetiredSliceBatch) validate() error {
-	if batch.Version != 1 || batch.Format == "" || strings.ContainsAny(batch.Format, "/\\") || batch.Format == "." || batch.Format == ".." || batch.Storage.UUID == "" {
-		return fmt.Errorf("invalid retired slice batch identity")
-	}
-	if err := batch.Layout.validate(); err != nil {
-		return err
-	}
-	if err := batch.Storage.validate(); err != nil {
-		return err
-	}
-	if batch.OwnedEpoch == 0 || batch.OwnedEpoch >= 1<<32-1 || batch.Start < batch.OwnedEpoch<<32 || batch.Start >= batch.End || batch.End > (batch.OwnedEpoch+1)<<32 || len(batch.Slices) == 0 || len(batch.Slices) > run9RetiredSliceLimit {
-		return fmt.Errorf("invalid retired slice batch bounds")
-	}
-	var previous, objects uint64
-	for _, s := range batch.Slices {
-		if s.ID < batch.Start || s.ID >= batch.End || s.ID <= previous || s.Size == 0 || s.Size > meta.ChunkSize {
-			return fmt.Errorf("invalid retired slice %d size %d", s.ID, s.Size)
-		}
-		previous = s.ID
-		objects += (uint64(s.Size) + uint64(batch.Layout.BlockSizeBytes) - 1) / uint64(batch.Layout.BlockSizeBytes)
-		if objects > 65536 {
-			return fmt.Errorf("retired slice batch exceeds object budget")
-		}
-	}
-	return nil
-}
-
-// publish is called only after successful metadata shutdown AND success ack.
-// A crash before publication leaks garbage conservatively; temporary files are
-// never deletion authorization. The content hash also detects disk corruption.
-func (gc *run9RetiredSliceGC) publish() error {
-	if len(gc.batch.Slices) == 0 {
-		return nil
-	}
-	if err := gc.batch.validate(); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(gc.dir, 0700); err != nil {
-		return err
-	}
-	raw, err := json.Marshal(gc.batch)
-	if err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(gc.dir, ".tmp-retired-")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if _, err = f.Write(raw); err == nil {
-		err = f.Sync()
-	}
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	sum := sha256.Sum256(raw)
-	return os.Rename(f.Name(), filepath.Join(gc.dir, hex.EncodeToString(sum[:])+".json"))
+// Published with a CLOSED metadata clone while run9rt holds the source lock.
+// End and storage identity come from this clone, never the later writable source.
+type run9RetiredSliceSnapshot struct {
+	Version    int    `json:"version"`
+	Format     string `json:"format"`
+	OwnedEpoch uint64 `json:"owned_epoch"`
+	Start      uint64 `json:"start"`
 }
 
 type run9RetiredSliceGCResult struct {
-	OK               bool   `json:"ok"`
-	Busy             bool   `json:"busy,omitempty"`
-	CompletedBatches int    `json:"completed_batches"`
-	FailedBatches    int    `json:"failed_batches"`
-	DeferredBatches  int    `json:"deferred_batches"`
-	DeletedObjects   uint64 `json:"deleted_objects"`
-	// Exact keys encode uncompressed sizes; this is not a provider billing metric.
+	OK                  bool   `json:"ok"`
+	Busy                bool   `json:"busy,omitempty"`
+	CompletedSnapshots  int    `json:"completed_snapshots"`
+	PendingSnapshots    int    `json:"pending_snapshots"`
+	FailedSnapshots     int    `json:"failed_snapshots"`
+	DeferredSnapshots   int    `json:"deferred_snapshots"`
+	ScannedPages        int    `json:"scanned_pages"`
+	DeletedObjects      uint64 `json:"deleted_objects"`
 	DeletedLogicalBytes uint64 `json:"deleted_logical_bytes"`
 	Error               string `json:"error,omitempty"`
 }
 
 func cmdRun9GCRetiredSlices() *cli.Command {
-	return &cli.Command{Name: "gc-retired-slices", Hidden: true, Usage: "consume finalized private-slice deletion batches",
+	return &cli.Command{Name: "gc-retired-slices", Hidden: true, Usage: "reclaim lifecycle-private slices from finalized metadata snapshots",
 		Flags: []cli.Flag{&cli.StringFlag{Name: "queue-dir", Required: true}},
 		Action: func(c *cli.Context) error {
 			if c.NArg() != 0 {
@@ -214,17 +71,9 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 	if err != nil {
 		return out, err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	if !info.IsDir() {
 		return out, fmt.Errorf("retired slice queue is not a directory")
 	}
-	f, err := os.Open(dir)
-	if os.IsNotExist(err) {
-		return out, nil
-	}
-	if err != nil {
-		return out, err
-	}
-	defer f.Close()
 	lock := flock.New(filepath.Join(dir, ".gc.lock"))
 	defer lock.Close()
 	locked, err := lock.TryLock()
@@ -235,8 +84,11 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 		out.Busy = true
 		return out, nil
 	}
-	// Stream directory entries, not every snap or every remote object. A corrupt
-	// batch stays visible for diagnosis but does not block healthy batches behind it.
+	f, err := os.Open(dir)
+	if err != nil {
+		return out, err
+	}
+	defer f.Close()
 	for out.DeletedObjects < 65536 {
 		if err := ctx.Err(); err != nil {
 			return out, err
@@ -249,40 +101,52 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 			break
 		}
 		for _, entry := range entries {
-			if !strings.HasSuffix(entry.Name(), ".json") {
+			path := filepath.Join(dir, entry.Name())
+			if strings.HasPrefix(entry.Name(), ".done-") {
+				if err := os.RemoveAll(path); err != nil {
+					return out, err
+				}
 				continue
 			}
-			path := filepath.Join(dir, entry.Name())
+			if !strings.HasPrefix(entry.Name(), "gc-") {
+				continue
+			}
 			info, err := entry.Info()
 			if err != nil {
 				return out, err
 			}
-			// The immutable batch body is deletion authority; future mtime only
-			// delays retries, including across consumer/host restarts.
+			if !info.IsDir() {
+				return out, fmt.Errorf("invalid GC snapshot %s", entry.Name())
+			}
 			if info.ModTime().After(time.Now()) {
-				out.DeferredBatches++
+				out.DeferredSnapshots++
 				continue
 			}
-			batchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			n, bytes, err := consumeRun9RetiredSliceBatch(batchCtx, path, info)
-			cancel()
-			out.DeletedObjects += n
-			out.DeletedLogicalBytes += bytes
+			done, err := consumeRun9RetiredSnapshot(ctx, path, 65536-out.DeletedObjects, &out)
 			if err != nil {
-				if info.Mode().IsRegular() {
-					retryAt := time.Now().Add(5 * time.Minute)
-					if retryErr := os.Chtimes(path, retryAt, retryAt); retryErr != nil {
-						err = fmt.Errorf("%w; defer retry: %v", err, retryErr)
-					}
-				}
 				out.OK = false
-				out.FailedBatches++
-				if out.Error == "" {
-					out.Error = fmt.Sprintf("batch %s: %v", entry.Name(), err)
+				out.FailedSnapshots++
+				retryAt := time.Now().Add(5 * time.Minute)
+				if retryErr := os.Chtimes(path, retryAt, retryAt); retryErr != nil {
+					err = fmt.Errorf("%w; defer retry: %v", err, retryErr)
 				}
-				logger.Errorf("retired slice GC batch %s: %s", entry.Name(), err)
+				if out.Error == "" {
+					out.Error = fmt.Sprintf("snapshot %s: %v", entry.Name(), err)
+				}
+				logger.Errorf("retired slice GC %s: %s", entry.Name(), err)
+			} else if done {
+				// A crash during recursive cleanup must not leave a half-removed
+				// Badger in the runnable namespace.
+				finished := filepath.Join(dir, ".done-"+entry.Name())
+				if err := os.Rename(path, finished); err != nil {
+					return out, err
+				}
+				out.CompletedSnapshots++
+				if err := os.RemoveAll(finished); err != nil {
+					return out, err
+				}
 			} else {
-				out.CompletedBatches++
+				out.PendingSnapshots++
 			}
 			if out.DeletedObjects >= 65536 {
 				break
@@ -292,46 +156,127 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 	return out, nil
 }
 
-func consumeRun9RetiredSliceBatch(ctx context.Context, path string, info os.FileInfo) (uint64, uint64, error) {
-	if !info.Mode().IsRegular() || info.Size() > 1<<20 {
-		return 0, 0, fmt.Errorf("invalid batch file")
-	}
-	raw, err := os.ReadFile(path)
+func consumeRun9RetiredSnapshot(ctx context.Context, path string, objectBudget uint64, out *run9RetiredSliceGCResult) (done bool, err error) {
+	proofPath := filepath.Join(path, "proof.json")
+	info, err := os.Lstat(proofPath)
 	if err != nil {
-		return 0, 0, err
+		return false, err
 	}
-	sum := sha256.Sum256(raw)
-	if filepath.Base(path) != hex.EncodeToString(sum[:])+".json" {
-		return 0, 0, fmt.Errorf("batch checksum mismatch")
+	if !info.Mode().IsRegular() || info.Size() > 4096 {
+		return false, fmt.Errorf("invalid snapshot proof file")
 	}
-	var batch run9RetiredSliceBatch
-	if err := json.Unmarshal(raw, &batch); err != nil {
-		return 0, 0, err
-	}
-	if err := batch.validate(); err != nil {
-		return 0, 0, err
-	}
-	blob, err := run9SliceRangeObjectStorage(batch.Format, batch.Layout, batch.Storage)
+	raw, err := os.ReadFile(proofPath)
 	if err != nil {
-		return 0, 0, err
+		return false, err
+	}
+	if !strings.HasSuffix(filepath.Base(path), fmt.Sprintf("-%x", sha256.Sum256(raw))) {
+		return false, fmt.Errorf("snapshot proof checksum mismatch")
+	}
+	var proof run9RetiredSliceSnapshot
+	if err := json.Unmarshal(raw, &proof); err != nil {
+		return false, err
+	}
+	if proof.Version != 1 || proof.Format == "" || proof.OwnedEpoch == 0 || proof.OwnedEpoch >= 1<<32-1 || proof.Start < proof.OwnedEpoch<<32 || proof.Start > (proof.OwnedEpoch+1)<<32 {
+		return false, fmt.Errorf("invalid snapshot allocation proof")
+	}
+	metaDir := filepath.Join(path, "meta")
+	info, err = os.Lstat(metaDir)
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, fmt.Errorf("snapshot metadata is not a directory")
+	}
+	m, err := meta.OpenRun9RetiredSnapshot(metaDir)
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, m.Shutdown()) }()
+	format, err := m.Load(true)
+	if err != nil {
+		return false, err
+	}
+	if format.Name != proof.Format || format.UUID == "" || format.BlockSize <= 0 {
+		return false, fmt.Errorf("snapshot format mismatch")
+	}
+	end, err := m.Run9SliceAllocationCounter()
+	if err != nil {
+		return false, err
+	}
+	if end < proof.Start || end > (proof.OwnedEpoch+1)<<32 {
+		return false, fmt.Errorf("snapshot allocation counter outside owned epoch")
+	}
+	layout := run9ObjectLayout{BlockSizeBytes: format.BlockSize * 1024, HashPrefix: format.HashPrefix}
+	blob, err := run9SliceRangeObjectStorage(format.Name, layout, run9ObjectStorageDescriptorFromFormat(*format))
+	if err != nil {
+		return false, err
 	}
 	defer object.Shutdown(blob)
-	var objects []run9GCExactObject
-	for _, s := range batch.Slices {
-		for offset, index := uint64(0), uint64(0); offset < uint64(s.Size); index++ {
-			size := min(uint64(batch.Layout.BlockSizeBytes), uint64(s.Size)-offset)
-			objects = append(objects, run9GCExactObject{Key: chunk.FormatObjectBlockKey(s.ID, index, size, batch.Layout.HashPrefix), Size: size})
-			offset += size
+	cursorPath := filepath.Join(path, "cursor")
+	if info, err := os.Lstat(cursorPath); err == nil {
+		if !info.Mode().IsRegular() || info.Size() != 26 {
+			return false, fmt.Errorf("invalid snapshot cursor file")
 		}
+	} else if !os.IsNotExist(err) {
+		return false, err
 	}
-	n, bytes, err := deleteRun9ExactObjects(ctx, blob, objects, 4)
-	if err != nil {
-		return n, bytes, err
+	cursor, err := os.ReadFile(cursorPath)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
 	}
-	// Delete is idempotent, including overlap with whole-subtree GC. Never open
-	// active Badger to remove its K records from this independent worker.
-	if err := os.Remove(path); err != nil {
-		return n, bytes, err
+	// Aim for at most 1,024 DELETEs per page at the maximum slice size. A single
+	// slice with a tiny block layout may exceed that target (at most 65,536).
+	// These limits bound each turn's work, not total lifecycle garbage coverage.
+	blocksPerSlice := (uint64(meta.ChunkSize) + uint64(layout.BlockSizeBytes) - 1) / uint64(layout.BlockSizeBytes)
+	pageSize := int(max(uint64(1), 1024/blocksPerSlice))
+	// Yield between completed pages, not halfway through every slow page. The
+	// invocation context still bounds IO; page checkpoints make retries safe.
+	deadline := time.Now().Add(15 * time.Second)
+	var deleted uint64
+	for deleted < objectBudget && time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		slices, next, err := m.Run9RetiredSlices(ctx, proof.Start, end, string(cursor), pageSize)
+		if err != nil {
+			return false, err
+		}
+		out.ScannedPages++
+		var objects []run9GCExactObject
+		for _, s := range slices {
+			for offset, index := uint64(0), uint64(0); offset < uint64(s.Size); index++ {
+				size := min(uint64(layout.BlockSizeBytes), uint64(s.Size)-offset)
+				objects = append(objects, run9GCExactObject{Key: chunk.FormatObjectBlockKey(s.Id, index, size, layout.HashPrefix), Size: size})
+				offset += size
+			}
+		}
+		n, bytes, err := deleteRun9ExactObjects(ctx, blob, objects, 4)
+		out.DeletedObjects += n
+		out.DeletedLogicalBytes += bytes
+		deleted += n
+		if err != nil {
+			return false, err
+		}
+		if next == "" {
+			return true, nil
+		}
+		// Checkpoint only a completely deleted page. A crash before rename
+		// repeats idempotent DELETEs; it cannot skip uncompleted objects.
+		f, err := os.CreateTemp(path, ".cursor-")
+		if err != nil {
+			return false, err
+		}
+		_, writeErr := f.WriteString(next)
+		closeErr := f.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			_ = os.Remove(f.Name())
+			return false, err
+		}
+		if err := os.Rename(f.Name(), cursorPath); err != nil {
+			_ = os.Remove(f.Name())
+			return false, err
+		}
+		cursor = []byte(next)
 	}
-	return n, bytes, nil
+	return false, nil
 }

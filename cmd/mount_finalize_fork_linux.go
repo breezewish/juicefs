@@ -115,7 +115,7 @@ func installForkFinalizeHandler(_ meta.Meta, v *vfs.VFS, _ object.ObjectStorage)
 	}()
 }
 
-func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.ObjectStorage, retired *run9RetiredSliceGC) (resultErr error) {
+func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.ObjectStorage, sliceAllocationStart *uint64) (resultErr error) {
 	pid := os.Getpid()
 	starttimeTicks, err := readProcStatStarttimeTicks(pid)
 	if err != nil {
@@ -183,6 +183,7 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 		if ack.Status != "panic" {
 			if firstErr == nil {
 				ack.Status = "ok"
+				ack.SliceAllocationStart = sliceAllocationStart
 				ack.Phase = ""
 				ack.Error = ""
 			} else {
@@ -199,12 +200,6 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 			logger.Errorf("finalize: write ack: %s", err)
 			if resultErr == nil {
 				resultErr = fmt.Errorf("finalize: write ack: %w", err)
-			}
-		} else if ack.Status == "ok" && retired != nil && ack.SliceGCError == "" {
-			if err := retired.publish(); err != nil {
-				logger.Errorf("finalize retired slice batch publication failed: %s", err)
-			} else if len(retired.batch.Slices) > 0 {
-				logger.Infof("finalize published %d retired slices", len(retired.batch.Slices))
 			}
 		}
 	}()
@@ -255,31 +250,6 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 		return resultErr
 	}
 
-	// Capture only positive garbage evidence after the metadata session has
-	// closed. A GC scan error does not change the data durability result.
-	if firstErr == nil && retired != nil {
-		writePendingAck("retired_slice_scan")
-		var truncated bool
-		var scanErr error
-		// Badger/FUSE reads cannot always be canceled. Like other metadata
-		// phases, a stuck scan must still emit a terminal timeout ack. Do not
-		// close Badger concurrently with an abandoned phase; the mount exits.
-		phaseErr := runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
-			truncated, scanErr = retired.collect(finalizeCtx)
-			return nil
-		})
-		if phaseErr != nil {
-			recordErr("retired_slice_scan", phaseErr)
-			return resultErr
-		}
-		ack.SliceGCTruncated = truncated
-		if scanErr != nil {
-			ack.SliceGCError = scanErr.Error()
-			logger.Errorf("finalize retired slice collection failed: %s", scanErr)
-		} else {
-			ack.RetiredSlices = len(retired.batch.Slices)
-		}
-	}
 	writePendingAck("shutdown")
 	recordErr("shutdown", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
 		return metaCli.Shutdown()

@@ -3,12 +3,16 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
@@ -16,139 +20,226 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+type retiredTestRecord struct {
+	id         uint64
+	size       uint32
+	references int64
+}
+
+// Build a real closed Badger with native K records. Tests of retirement itself
+// live in pkg/meta and real-FUSE E2E; this fixture isolates queue consumption.
+func makeRetiredTestSnapshot(t *testing.T, queue string, format *meta.Format, records []retiredTestRecord) string {
+	t.Helper()
+	proof := run9RetiredSliceSnapshot{Version: 1, Format: format.Name, OwnedEpoch: 1, Start: 1 << 32}
+	raw, err := json.Marshal(proof)
+	require.NoError(t, err)
+	dir := filepath.Join(queue, fmt.Sprintf("gc-test-%x", sha256.Sum256(raw)))
+	require.NoError(t, os.Mkdir(dir, 0700))
+	metaDir := filepath.Join(dir, "meta")
+	m := meta.NewClient("badger://"+metaDir, meta.DefaultConf())
+	require.NoError(t, m.Init(format, true))
+	require.NoError(t, m.Shutdown())
+	db, err := badger.Open(badger.DefaultOptions(metaDir).WithLogger(nil))
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *badger.Txn) error {
+		counter := make([]byte, 8)
+		binary.LittleEndian.PutUint64(counter, 1<<32+131072)
+		if err := tx.Set([]byte("CnextChunk"), counter); err != nil {
+			return err
+		}
+		for _, r := range records {
+			key, value := make([]byte, 13), make([]byte, 8)
+			key[0] = 'K'
+			binary.BigEndian.PutUint64(key[1:9], r.id)
+			binary.BigEndian.PutUint32(key[9:], r.size)
+			binary.LittleEndian.PutUint64(value, uint64(r.references))
+			if err := tx.Set(key, value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	require.NoError(t, db.Close())
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "proof.json"), raw, 0600))
+	return dir
+}
+
 func TestRun9RetiredSlicesCapturesNewAllocationWindowOnRemount(t *testing.T) {
 	url := "badger://" + t.TempDir()
 	conf := meta.DefaultConf()
 	conf.MaxDeletes = 0
 	m := meta.NewClient(url, conf)
-	format := &meta.Format{Name: "test", UUID: "volume", Storage: "file", Bucket: t.TempDir() + "/", BlockSize: 4}
-	require.NoError(t, m.Init(format, true))
+	require.NoError(t, m.Init(&meta.Format{Name: "test", UUID: "volume", Storage: "file", Bucket: t.TempDir() + "/", BlockSize: 4}, true))
 	require.NoError(t, m.Shutdown())
 	_, err := run9PrepareWritableEpoch(context.Background(), url, 7)
 	require.NoError(t, err)
-	t.Setenv("JFS_RUN9_RETIRED_SLICES_DIR", t.TempDir())
 	t.Setenv("JFS_RUN9_OWNED_EPOCH", "7")
 	m = meta.NewClient(url, conf)
-	gc, err := beginRun9RetiredSliceGC(m, format)
+	start, err := beginRun9SliceAllocation(m)
 	require.NoError(t, err)
-	require.EqualValues(t, 7<<32, gc.batch.Start)
+	require.EqualValues(t, 7<<32, *start)
 	var id uint64
 	require.Zero(t, m.NewSlice(meta.Background(), &id))
-	require.EqualValues(t, 7<<32, id)
 	require.NoError(t, m.Shutdown())
-	// The next mount reads the advanced reservation boundary, not the epoch base.
 	m = meta.NewClient(url, conf)
-	defer func() { require.NoError(t, m.Shutdown()) }()
-	gc, err = beginRun9RetiredSliceGC(m, format)
+	defer m.Shutdown()
+	start, err = beginRun9SliceAllocation(m)
 	require.NoError(t, err)
-	require.EqualValues(t, 7<<32+4096, gc.batch.Start)
-	require.Zero(t, m.NewSlice(meta.Background(), &id))
-	require.EqualValues(t, gc.batch.Start, id)
+	require.EqualValues(t, 7<<32+4096, *start)
 	t.Setenv("JFS_RUN9_OWNED_EPOCH", "8")
-	_, err = beginRun9RetiredSliceGC(m, format)
+	_, err = beginRun9SliceAllocation(m)
 	require.ErrorContains(t, err, "outside owned epoch")
 }
 
-func TestRun9RetiredSlicesDeletesExactKeysAndPreservesOtherEpochs(t *testing.T) {
-	bucket, queue := t.TempDir(), t.TempDir()
-	gc := &run9RetiredSliceGC{dir: queue, batch: run9RetiredSliceBatch{
-		Version: 1, Format: "lineage", Storage: run9ObjectStorageDescriptor{Storage: "file", Bucket: bucket + "/", UUID: "volume"},
-		Layout: run9ObjectLayout{BlockSizeBytes: 4096, HashPrefix: true}, OwnedEpoch: 1, Start: 1 << 32, End: 1<<32 + 4096,
-		Slices: []run9LiveSlice{{ID: 1 << 32, Size: 5000}},
-	}}
-	first := filepath.Join(bucket, "lineage", chunk.FormatObjectBlockKey(1<<32, 0, 4096, true))
-	last := filepath.Join(bucket, "lineage", chunk.FormatObjectBlockKey(1<<32, 1, 904, true))
-	inherited := filepath.Join(bucket, "lineage", chunk.FormatObjectBlockKey(2<<32, 0, 4096, true))
-	otherVolume := filepath.Join(bucket, "other", chunk.FormatObjectBlockKey(1<<32, 0, 4096, true))
+func TestRun9RetiredSlicesResumesBeyondOldTotalLimits(t *testing.T) {
+	queue, bucket := t.TempDir(), t.TempDir()
+	format := &meta.Format{Name: "many", UUID: "volume", Storage: "file", Bucket: bucket + "/", BlockSize: 4096, HashPrefix: true}
+	records := make([]retiredTestRecord, 66000)
+	for i := range records {
+		records[i] = retiredTestRecord{1<<32 + uint64(i), 1, -1}
+	}
+	dir := makeRetiredTestSnapshot(t, queue, format, records)
+	first := filepath.Join(bucket, "many", chunk.FormatObjectBlockKey(1<<32, 0, 1, true))
+	last := filepath.Join(bucket, "many", chunk.FormatObjectBlockKey(1<<32+65999, 0, 1, true))
 	require.NoError(t, os.MkdirAll(filepath.Dir(first), 0700))
-	require.NoError(t, os.WriteFile(first, make([]byte, 4096), 0600))
-	require.NoError(t, os.WriteFile(last, make([]byte, 904), 0600))
-	require.NoError(t, os.MkdirAll(filepath.Dir(inherited), 0700))
-	require.NoError(t, os.WriteFile(inherited, []byte("inherited"), 0600))
-	require.NoError(t, os.MkdirAll(filepath.Dir(otherVolume), 0700))
-	require.NoError(t, os.WriteFile(otherVolume, []byte("another volume"), 0600))
-	require.NoError(t, gc.publish())
-	entries, err := os.ReadDir(queue)
+	require.NoError(t, os.MkdirAll(filepath.Dir(last), 0700))
+	require.NoError(t, os.WriteFile(first, []byte{1}, 0600))
+	require.NoError(t, os.WriteFile(last, []byte{2}, 0600))
+	var firstTurn run9RetiredSliceGCResult
+	done, err := consumeRun9RetiredSnapshot(context.Background(), dir, 8192, &firstTurn)
 	require.NoError(t, err)
-	require.Len(t, entries, 1)
-	batchPath := filepath.Join(queue, entries[0].Name())
-	raw, err := os.ReadFile(batchPath)
+	require.False(t, done)
+	require.EqualValues(t, 8192, firstTurn.DeletedObjects)
+	require.FileExists(t, filepath.Join(dir, "cursor"))
+	require.NoFileExists(t, first)
+	require.FileExists(t, last)
+	// A new consumer reopens the read-only snapshot and continues after the
+	// checkpoint, including records beyond the former 65,536-record scan cap.
+	secondTurn, err := run9GCRetiredSlices(context.Background(), queue)
 	require.NoError(t, err)
-	// Corruption cannot authorize DELETE, even when the file is valid JSON.
-	require.NoError(t, os.WriteFile(batchPath, append(raw, ' '), 0600))
+	require.True(t, secondTurn.OK, secondTurn.Error)
+	require.EqualValues(t, 66000-8192, secondTurn.DeletedObjects)
+	require.Equal(t, 1, secondTurn.CompletedSnapshots)
+	require.NoFileExists(t, last)
+	require.NoDirExists(t, dir)
+}
+
+func TestRun9RetiredSlicesKeepsLiveHistoricalAndOtherEpochObjects(t *testing.T) {
+	queue, bucket := t.TempDir(), t.TempDir()
+	format := &meta.Format{Name: "lineage", UUID: "volume", Storage: "file", Bucket: bucket + "/", BlockSize: 4}
+	dir := makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{
+		{1<<32 - 1, 1, -1}, {1 << 32, 5000, -1}, {1<<32 + 1, 1, 0}, {2 << 32, 1, -1},
+	})
+	old := filepath.Join(bucket, "lineage", chunk.FormatObjectBlockKey(1<<32-1, 0, 1, false))
+	live := filepath.Join(bucket, "lineage", chunk.FormatObjectBlockKey(1<<32+1, 0, 1, false))
+	other := filepath.Join(bucket, "lineage", chunk.FormatObjectBlockKey(2<<32, 0, 1, false))
+	for _, path := range []string{old, live, other} {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
+		require.NoError(t, os.WriteFile(path, []byte{1}, 0600))
+	}
+	out, err := run9GCRetiredSlices(context.Background(), queue)
+	require.NoError(t, err)
+	require.True(t, out.OK, out.Error)
+	require.EqualValues(t, 2, out.DeletedObjects)
+	require.EqualValues(t, 5000, out.DeletedLogicalBytes)
+	require.FileExists(t, old)
+	require.FileExists(t, live)
+	require.FileExists(t, other)
+	require.NoDirExists(t, dir)
+}
+
+func TestRun9RetiredSlicesRejectsCorruptProofAndRetriesFailedDelete(t *testing.T) {
+	queue, bucket := t.TempDir(), t.TempDir()
+	format := &meta.Format{Name: "lineage", UUID: "volume", Storage: "file", Bucket: bucket + "/", BlockSize: 4096}
+	dir := makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
+	proofPath := filepath.Join(dir, "proof.json")
+	raw, err := os.ReadFile(proofPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(proofPath, append(raw, ' '), 0600))
 	out, err := run9GCRetiredSlices(context.Background(), queue)
 	require.NoError(t, err)
 	require.False(t, out.OK)
 	require.Contains(t, out.Error, "checksum")
-	require.FileExists(t, first)
-	require.NoError(t, os.WriteFile(batchPath, raw, 0600))
-	require.NoError(t, os.WriteFile(filepath.Join(queue, ".tmp-retired-crashed"), raw, 0600))
+	require.Zero(t, out.DeletedObjects)
+	require.NoError(t, os.WriteFile(proofPath, raw, 0600))
+	key := filepath.Join(bucket, "lineage", chunk.FormatObjectBlockKey(1<<32, 0, 1, false))
+	require.NoError(t, os.MkdirAll(key, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(key, "obstacle"), nil, 0600))
+	now := time.Now()
+	require.NoError(t, os.Chtimes(dir, now, now))
 	out, err = run9GCRetiredSlices(context.Background(), queue)
 	require.NoError(t, err)
-	require.True(t, out.OK)
-	require.EqualValues(t, 2, out.DeletedObjects)
-	require.EqualValues(t, 5000, out.DeletedLogicalBytes)
-	require.NoFileExists(t, first)
-	require.NoFileExists(t, last)
-	require.FileExists(t, inherited)
-	require.FileExists(t, otherVolume)
-	require.NoFileExists(t, batchPath)
-	// Lost completion / concurrent coarse GC: deleting already missing objects succeeds.
-	require.NoError(t, gc.publish())
+	require.False(t, out.OK)
+	require.Equal(t, 1, out.FailedSnapshots)
+	require.NoFileExists(t, filepath.Join(dir, "cursor"))
 	out, err = run9GCRetiredSlices(context.Background(), queue)
 	require.NoError(t, err)
-	require.True(t, out.OK)
-	require.Equal(t, 1, out.CompletedBatches)
-	gc.batch.Slices[0].ID = 2 << 32
-	require.ErrorContains(t, gc.publish(), "invalid retired slice")
+	require.Equal(t, 1, out.DeferredSnapshots)
+	require.NoError(t, os.Remove(filepath.Join(key, "obstacle")))
+	require.NoError(t, os.Remove(key))
+	require.NoError(t, os.Chtimes(dir, now, now))
+	out, err = run9GCRetiredSlices(context.Background(), queue)
+	require.NoError(t, err)
+	require.True(t, out.OK, out.Error)
+	require.Equal(t, 1, out.CompletedSnapshots)
 }
 
-func TestRun9RetiredSlicesFailedDeleteRetainsBatchForRetry(t *testing.T) {
-	bucket, queue := t.TempDir(), t.TempDir()
-	gc := &run9RetiredSliceGC{dir: queue, batch: run9RetiredSliceBatch{
-		Version: 1, Format: "lineage", Storage: run9ObjectStorageDescriptor{Storage: "file", Bucket: bucket + "/", UUID: "volume"},
-		Layout: run9ObjectLayout{BlockSizeBytes: 4096}, OwnedEpoch: 1, Start: 1 << 32, End: 1<<32 + 4096,
-		Slices: []run9LiveSlice{{ID: 1 << 32, Size: 4096}},
-	}}
-	key := filepath.Join(bucket, "lineage", chunk.FormatObjectBlockKey(1<<32, 0, 4096, false))
-	// A nonempty directory makes the file backend reject DELETE, even as root.
-	require.NoError(t, os.MkdirAll(key, 0700))
-	obstacle := filepath.Join(key, "not-an-object")
-	require.NoError(t, os.WriteFile(obstacle, nil, 0600))
-	require.NoError(t, gc.publish())
-	batchPaths, err := filepath.Glob(filepath.Join(queue, "*.json"))
-	require.NoError(t, err)
-	require.Len(t, batchPaths, 1)
-	// A healthy batch behind a failed one can still finish.
-	gc.batch.Slices = []run9LiveSlice{{ID: 1<<32 + 1, Size: 4096}}
-	require.NoError(t, gc.publish())
+func TestRun9RetiredSlicesCorruptMetadataDoesNotBlockOtherSnapshots(t *testing.T) {
+	queue := t.TempDir()
+	format := &meta.Format{Name: "broken", UUID: "volume", Storage: "file", Bucket: t.TempDir() + "/", BlockSize: 4096}
+	broken := makeRetiredTestSnapshot(t, queue, format, nil)
+	metaDir := filepath.Join(broken, "meta")
+	require.NoError(t, os.RemoveAll(metaDir))
+	require.NoError(t, os.Mkdir(metaDir, 0700))
+	format.Name = "healthy"
+	healthy := makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
+	// A crash after the completion rename can leave only some metadata files.
+	finished := filepath.Join(queue, ".done-interrupted")
+	require.NoError(t, os.Mkdir(finished, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(finished, "partial"), nil, 0600))
+	unpublished := filepath.Join(queue, ".tmp-unpublished")
+	require.NoError(t, os.Mkdir(unpublished, 0700))
 	out, err := run9GCRetiredSlices(context.Background(), queue)
 	require.NoError(t, err)
 	require.False(t, out.OK)
-	require.Equal(t, 1, out.FailedBatches)
-	require.Equal(t, 1, out.CompletedBatches)
-	require.FileExists(t, batchPaths[0])
-	out, err = run9GCRetiredSlices(context.Background(), queue)
+	require.Equal(t, 1, out.FailedSnapshots)
+	require.Equal(t, 1, out.CompletedSnapshots)
+	require.EqualValues(t, 1, out.DeletedObjects)
+	require.NoDirExists(t, healthy)
+	require.NoDirExists(t, finished)
+	require.DirExists(t, unpublished)
+	entries, err := os.ReadDir(metaDir)
 	require.NoError(t, err)
-	require.True(t, out.OK)
-	require.Equal(t, 1, out.DeferredBatches)
-	require.Zero(t, out.CompletedBatches)
-	require.NoError(t, os.Remove(obstacle))
-	require.NoError(t, os.Remove(key))
-	require.NoError(t, os.WriteFile(key, make([]byte, 4096), 0600))
-	now := time.Now()
-	require.NoError(t, os.Chtimes(batchPaths[0], now, now)) // retry becomes due
-	out, err = run9GCRetiredSlices(context.Background(), queue)
-	require.NoError(t, err)
-	require.True(t, out.OK)
-	require.Equal(t, 1, out.CompletedBatches)
-	require.NoFileExists(t, key)
-	require.NoFileExists(t, batchPaths[0])
+	require.Empty(t, entries, "opening an invalid snapshot must not initialize metadata")
+}
+
+func TestRun9RetiredSlicesRejectsInvalidCursorBeforeDeleting(t *testing.T) {
+	queue, bucket := t.TempDir(), t.TempDir()
+	format := &meta.Format{Name: "cursor", UUID: "volume", Storage: "file", Bucket: bucket + "/", BlockSize: 4096}
+	dir := makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
+	key := filepath.Join(bucket, "cursor", chunk.FormatObjectBlockKey(1<<32, 0, 1, false))
+	require.NoError(t, os.MkdirAll(filepath.Dir(key), 0700))
+	require.NoError(t, os.WriteFile(key, []byte{1}, 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "cursor"), []byte("4b000000020000000000000001"), 0600)) // outside lifecycle
+	var out run9RetiredSliceGCResult
+	done, err := consumeRun9RetiredSnapshot(context.Background(), dir, 1, &out)
+	require.ErrorContains(t, err, "invalid retired slice cursor")
+	require.False(t, done)
+	require.Zero(t, out.DeletedObjects)
+	require.FileExists(t, key)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "cursor"), []byte("partial"), 0600))
+	_, err = consumeRun9RetiredSnapshot(context.Background(), dir, 1, &out)
+	require.ErrorContains(t, err, "invalid snapshot cursor file")
+	require.FileExists(t, key)
 }
 
 type retiredSliceDeleteStore struct {
 	object.ObjectStorage
 	deleteFn func(context.Context, string) error
+}
+
+func (s *retiredSliceDeleteStore) Delete(ctx context.Context, key string, _ ...object.AttrGetter) error {
+	return s.deleteFn(ctx, key)
 }
 
 func TestRun9RetiredSlicesCommandKeepsCountsOnCancellation(t *testing.T) {
@@ -157,93 +248,17 @@ func TestRun9RetiredSlicesCommandKeepsCountsOnCancellation(t *testing.T) {
 	base, err := object.CreateStorage("mem", "test", "", "", "")
 	require.NoError(t, err)
 	object.Register("retired-cancel-test", func(string, string, string, string) (object.ObjectStorage, error) {
-		return &retiredSliceDeleteStore{ObjectStorage: base, deleteFn: func(context.Context, string) error {
-			cancel()
-			return nil // DELETE completed just before cancellation was observed
-		}}, nil
+		return &retiredSliceDeleteStore{base, func(context.Context, string) error { cancel(); return nil }}, nil
 	})
-	gc := &run9RetiredSliceGC{dir: t.TempDir(), batch: run9RetiredSliceBatch{
-		Version: 1, Format: "lineage", Storage: run9ObjectStorageDescriptor{Storage: "retired-cancel-test", Bucket: "test", UUID: "volume"},
-		Layout: run9ObjectLayout{BlockSizeBytes: 4096}, OwnedEpoch: 1, Start: 1 << 32, End: 1<<32 + 4096,
-		Slices: []run9LiveSlice{{ID: 1 << 32, Size: 4096}},
-	}}
-	require.NoError(t, gc.publish())
+	queue := t.TempDir()
+	format := &meta.Format{Name: "cancel", UUID: "volume", Storage: "retired-cancel-test", Bucket: "test", BlockSize: 4096}
+	makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
 	var output bytes.Buffer
 	app := &cli.App{Writer: &output, Commands: []*cli.Command{cmdRun9GCRetiredSlices()}}
-	require.NoError(t, app.RunContext(ctx, []string{"juicefs", "gc-retired-slices", "--queue-dir", gc.dir}))
+	require.NoError(t, app.RunContext(ctx, []string{"juicefs", "gc-retired-slices", "--queue-dir", queue}))
 	var result run9RetiredSliceGCResult
 	require.NoError(t, json.Unmarshal(output.Bytes(), &result))
 	require.False(t, result.OK)
 	require.Contains(t, result.Error, "context canceled")
 	require.EqualValues(t, 1, result.DeletedObjects)
-	require.EqualValues(t, 4096, result.DeletedLogicalBytes)
-}
-
-func (s *retiredSliceDeleteStore) Delete(ctx context.Context, key string, _ ...object.AttrGetter) error {
-	return s.deleteFn(ctx, key)
-}
-
-func TestRun9RetiredSlicesSlowBatchDefersAcrossConsumerRestart(t *testing.T) {
-	base, err := object.CreateStorage("mem", "test", "", "", "")
-	require.NoError(t, err)
-	object.Register("retired-slow-test", func(string, string, string, string) (object.ObjectStorage, error) {
-		return &retiredSliceDeleteStore{ObjectStorage: base, deleteFn: func(ctx context.Context, _ string) error {
-			<-ctx.Done()
-			return ctx.Err()
-		}}, nil
-	})
-	gc := &run9RetiredSliceGC{dir: t.TempDir(), batch: run9RetiredSliceBatch{
-		Version: 1, Format: "lineage", Storage: run9ObjectStorageDescriptor{Storage: "retired-slow-test", Bucket: "test", UUID: "volume"},
-		Layout: run9ObjectLayout{BlockSizeBytes: 4096}, OwnedEpoch: 1, Start: 1 << 32, End: 1<<32 + 4096,
-		Slices: []run9LiveSlice{{ID: 1 << 32, Size: 4096}},
-	}}
-	require.NoError(t, gc.publish())
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	out, err := run9GCRetiredSlices(ctx, gc.dir)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.Equal(t, 1, out.FailedBatches)
-	gc.batch.Storage.Storage = "file"
-	gc.batch.Storage.Bucket = t.TempDir() + "/"
-	require.NoError(t, gc.publish())
-	out, err = run9GCRetiredSlices(context.Background(), gc.dir)
-	require.NoError(t, err)
-	require.True(t, out.OK)
-	require.Equal(t, 1, out.DeferredBatches)
-	require.Equal(t, 1, out.CompletedBatches)
-}
-
-func TestRun9RetiredSlicesCountsDeletesWhenCompletionFails(t *testing.T) {
-	base, err := object.CreateStorage("mem", "test", "", "", "")
-	require.NoError(t, err)
-	var batchPath string
-	object.Register("retired-completion-test", func(string, string, string, string) (object.ObjectStorage, error) {
-		return &retiredSliceDeleteStore{ObjectStorage: base, deleteFn: func(context.Context, string) error {
-			// Replace the test batch with a nonempty directory: DELETE succeeds,
-			// but the consumer cannot remove its completion marker afterward.
-			if err := os.Remove(batchPath); err != nil {
-				return err
-			}
-			if err := os.Mkdir(batchPath, 0700); err != nil {
-				return err
-			}
-			return os.WriteFile(filepath.Join(batchPath, "keep"), nil, 0600)
-		}}, nil
-	})
-	gc := &run9RetiredSliceGC{dir: t.TempDir(), batch: run9RetiredSliceBatch{
-		Version: 1, Format: "lineage", Storage: run9ObjectStorageDescriptor{Storage: "retired-completion-test", Bucket: "test", UUID: "volume"},
-		Layout: run9ObjectLayout{BlockSizeBytes: 4096}, OwnedEpoch: 1, Start: 1 << 32, End: 1<<32 + 4096,
-		Slices: []run9LiveSlice{{ID: 1 << 32, Size: 4096}},
-	}}
-	require.NoError(t, gc.publish())
-	paths, err := filepath.Glob(filepath.Join(gc.dir, "*.json"))
-	require.NoError(t, err)
-	require.Len(t, paths, 1)
-	batchPath = paths[0]
-	out, err := run9GCRetiredSlices(context.Background(), gc.dir)
-	require.NoError(t, err)
-	require.False(t, out.OK)
-	require.Equal(t, 1, out.FailedBatches)
-	require.EqualValues(t, 1, out.DeletedObjects)
-	require.EqualValues(t, 4096, out.DeletedLogicalBytes)
 }
