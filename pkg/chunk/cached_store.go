@@ -404,7 +404,7 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	}
 	bufSize := store.compressor.CompressBound(blen)
 	var buf *Page
-	if bufSize > blen || cacheUploaded {
+	if bufSize > blen || (cacheUploaded && !store.seekable) {
 		buf = NewOffPage(max(bufSize, blen))
 	} else {
 		buf = block

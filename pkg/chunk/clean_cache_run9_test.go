@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/juicedata/juicefs/pkg/compress"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/stretchr/testify/require"
 )
@@ -174,6 +175,42 @@ func TestCleanCacheFailedPutNeverPublishes(t *testing.T) {
 	require.NoError(t, err)
 	require.ErrorContains(t, writer.Finish(6), "test PUT failure")
 	require.NoFileExists(t, filepath.Join(conf.CleanCacheDir, cacheDir, FormatObjectBlockKey(401, 0, 6, false)))
+}
+
+type cleanCacheCheckingCompressor struct {
+	compress.Compressor
+	t *testing.T
+}
+
+func (c cleanCacheCheckingCompressor) Compress(dst, src []byte) (int, error) {
+	require.Same(c.t, &src[0], &dst[0], "uncompressed uploads should reuse the original block")
+	return c.Compressor.Compress(dst, src)
+}
+
+func TestCleanCacheUncompressedUploadReusesBlock(t *testing.T) {
+	mem, err := object.CreateStorage("mem", "", "", "", "")
+	require.NoError(t, err)
+	conf := defaultConf
+	conf.CacheDir, conf.CleanCacheDir = t.TempDir(), t.TempDir()
+	conf.Compress = "none"
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+	store.compressor = cleanCacheCheckingCompressor{store.compressor, t}
+	data := []byte("uncompressed remote-backed block")
+	key := FormatObjectBlockKey(402, 0, uint64(len(data)), false)
+	require.NoError(t, store.upload(key, NewPage(data), &wSlice{}))
+	r, err := store.cleanCache.load(key)
+	require.NoError(t, err)
+	defer r.Close()
+	got := make([]byte, len(data))
+	_, err = r.ReadAt(got, 0)
+	require.NoError(t, err)
+	require.Equal(t, data, got)
+	raw, err := mem.Get(context.Background(), key, 0, -1)
+	require.NoError(t, err)
+	defer raw.Close()
+	got, err = io.ReadAll(raw)
+	require.NoError(t, err)
+	require.Equal(t, data, got)
 }
 
 func TestCleanCacheScopesVolumeAndPreservesPrewarmPrecedence(t *testing.T) {
