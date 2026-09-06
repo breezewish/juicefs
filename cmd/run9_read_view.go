@@ -344,6 +344,7 @@ func cmdRun9ServeReadView() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "listen", Required: true},
 			&cli.StringFlag{Name: "cache-dir", Required: true},
+			&cli.StringFlag{Name: "clean-cache-dir"},
 			&cli.Uint64Flag{Name: "generation", Required: true},
 		},
 		Action: serveRun9ReadView,
@@ -405,6 +406,7 @@ func serveRun9ReadView(c *cli.Context) error {
 	defer object.Shutdown(blob)
 	chunkConf := getDefaultChunkConf(format)
 	chunkConf.CacheDir = c.String("cache-dir")
+	chunkConf.CleanCacheDir = c.String("clean-cache-dir")
 	chunkConf.CacheSize = 1024
 	chunkConf.CacheMode = 0o600
 	chunkConf.AutoCreate = true

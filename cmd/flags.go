@@ -230,6 +230,10 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "pre-populated read-only cache directory shared by mounts",
 		},
 		&cli.StringFlag{
+			Name:  "clean-cache-dir",
+			Usage: "host-managed shared cache of remote-backed blocks; cache-dir stays private for writeback",
+		},
+		&cli.StringFlag{
 			Name:  "cache-mode",
 			Value: "0600", // only owner can read/write cache
 			Usage: "file permissions for cached blocks",

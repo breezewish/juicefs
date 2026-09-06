@@ -169,6 +169,26 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 			logger.Warnf("ignore invalid shared cached block %s: %s", key, sharedErr)
 		}
 	}
+	if s.store.cleanCache != nil {
+		start := time.Now()
+		r, cacheErr := s.store.cleanCache.load(key)
+		if cacheErr == nil {
+			n, cacheErr = readCachedBlock(r)
+			if cacheErr == nil {
+				s.store.cacheHits.Inc()
+				s.store.cacheHitBytes.Add(float64(n))
+				s.store.cleanCacheHits.Inc()
+				s.store.cleanCacheHitBytes.Add(float64(n))
+				s.store.cacheReadHist.Observe(time.Since(start).Seconds())
+				return n, nil
+			}
+		}
+		if !os.IsNotExist(cacheErr) {
+			s.store.cleanCacheErrors.Inc()
+			logger.Warnf("Remove invalid clean cache block %s: %s", key, cacheErr)
+			_ = os.Remove(filepath.Join(s.store.cleanCache.dir, cacheDir, key))
+		}
+	}
 
 	s.store.cacheMiss.Add(1)
 	s.store.cacheMissBytes.Add(float64(len(p)))
@@ -376,16 +396,22 @@ func (store *cachedStore) delete(key string) error {
 func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	sync := s != nil
 	blen := len(block.Data)
+	cacheUploaded := store.cleanCache != nil && (!sync || blen < store.conf.BlockSize || store.conf.CacheLargeWrite)
+	if cacheUploaded {
+		// Keep the uncompressed bytes until PUT confirms this is a clean block.
+		block.Acquire()
+		defer block.Release()
+	}
 	bufSize := store.compressor.CompressBound(blen)
 	var buf *Page
-	if bufSize > blen {
-		buf = NewOffPage(bufSize)
+	if bufSize > blen || cacheUploaded {
+		buf = NewOffPage(max(bufSize, blen))
 	} else {
 		buf = block
 		buf.Acquire()
 	}
 	defer buf.Release()
-	if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
+	if store.cleanCache == nil && sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
 		// block will be freed after written into disk
 		store.bcache.cache(key, block, false, false)
 	}
@@ -413,6 +439,9 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	}
 	if err != nil && try >= max {
 		err = fmt.Errorf("(max tries) upload block %s: %s (after %d tries)", key, err, try)
+	}
+	if err == nil && cacheUploaded {
+		store.cacheBlock(key, block, false, false)
 	}
 	return err
 }
@@ -465,7 +494,7 @@ func (s *wSlice) upload(indx int) {
 					case s.store.currentUpload <- struct{}{}:
 						defer func() { <-s.store.currentUpload }()
 						if err = s.store.upload(key, block, nil); err == nil {
-							s.store.bcache.uploaded(key, blen)
+							s.store.uploadedBlock(key, blen)
 							if err := s.store.bcache.removeStage(key); err != nil {
 								logger.Warnf("failed to remove stage %s in upload", stagingPath)
 							}
@@ -546,6 +575,9 @@ func (s *wSlice) Abort() {
 // Config contains options for cachedStore
 type Config struct {
 	CacheDir string
+	// CleanCacheDir shares remote-backed blocks across mounts. CacheDir remains
+	// private for writeback; eviction of this directory is owned by the host.
+	CleanCacheDir string
 	// SharedCacheDir is an optional pre-populated read-only block cache. JuiceFS
 	// never writes, evicts, removes, or repairs files below this directory.
 	SharedCacheDir         string
@@ -625,6 +657,9 @@ func (c *Config) SelfCheck(uuid string) {
 	if c.SharedCacheDir != "" {
 		c.SharedCacheDir = filepath.Join(c.SharedCacheDir, uuid)
 	}
+	if c.CleanCacheDir != "" {
+		c.CleanCacheDir = filepath.Join(c.CleanCacheDir, uuid)
+	}
 	if c.Writeback {
 		if !c.CacheFullBlock {
 			logger.Warnf("cache-partial-only is ineffective for stage blocks with writeback enabled")
@@ -692,6 +727,7 @@ type cachedStore struct {
 	storage         object.ObjectStorage
 	bcache          CacheManager
 	sharedCache     *sharedDiskCache
+	cleanCache      *cleanDiskCache
 	fetcher         *prefetcher
 	conf            Config
 	group           *Controller
@@ -716,6 +752,9 @@ type cachedStore struct {
 	sharedCacheHitBytes prometheus.Counter
 	sharedCacheMisses   prometheus.Counter
 	sharedCacheErrors   prometheus.Counter
+	cleanCacheHits      prometheus.Counter
+	cleanCacheHitBytes  prometheus.Counter
+	cleanCacheErrors    prometheus.Counter
 	objectReqsHistogram *prometheus.HistogramVec
 	objectReqErrors     prometheus.Counter
 	objectDataBytes     *prometheus.CounterVec
@@ -847,7 +886,7 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 		return fmt.Errorf("read %s fully: %v (%d < %d) after %s", key, err, n, len(page.Data), used)
 	}
 	if cache {
-		store.bcache.cache(key, page, forceCache, !store.conf.OSCache)
+		store.cacheBlock(key, page, forceCache, !store.conf.OSCache)
 	}
 	return nil
 }
@@ -901,6 +940,12 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 			return false
 		}
 	})
+	if config.CleanCacheDir != "" && config.CacheEnabled() {
+		store.cleanCache = &cleanDiskCache{
+			dir: config.CleanCacheDir, mode: config.CacheMode,
+			freeRatio: config.FreeSpace, metrics: store.bcache.getMetrics(),
+		}
+	}
 
 	go func() {
 		for {
@@ -918,6 +963,12 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		config.Prefetch = 0 // disable prefetch if cache is disabled
 	}
 	store.fetcher = newPrefetcher(config.Prefetch, func(key string) {
+		if store.cleanCache != nil {
+			if r, err := store.cleanCache.load(key); err == nil {
+				_ = r.Close()
+				return
+			}
+		}
 		size := parseObjOrigSize(key)
 		if size == 0 || size > store.conf.BlockSize {
 			return
@@ -931,7 +982,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		})
 		defer block.Release()
 		if err == nil && block == p {
-			store.bcache.cache(key, block, true, !store.conf.OSCache)
+			store.cacheBlock(key, block, true, !store.conf.OSCache)
 		}
 	})
 
@@ -960,6 +1011,15 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 }
 
 func (store *cachedStore) initMetrics() {
+	store.cleanCacheHits = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "clean_blockcache_hits", Help: "reads served by the host's dynamic clean cache",
+	})
+	store.cleanCacheHitBytes = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "clean_blockcache_hit_bytes", Help: "bytes served by the host's dynamic clean cache",
+	})
+	store.cleanCacheErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "clean_blockcache_errors", Help: "invalid or unreadable dynamic clean cache blocks",
+	})
 	store.cacheHits = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockcache_hits",
 		Help: "read from cached block",
@@ -1033,6 +1093,9 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.sharedCacheHitBytes)
 	reg.MustRegister(store.sharedCacheMisses)
 	reg.MustRegister(store.sharedCacheErrors)
+	reg.MustRegister(store.cleanCacheHits)
+	reg.MustRegister(store.cleanCacheHitBytes)
+	reg.MustRegister(store.cleanCacheErrors)
 	reg.MustRegister(store.objectReqsHistogram)
 	reg.MustRegister(store.objectReqErrors)
 	reg.MustRegister(store.objectDataBytes)
@@ -1123,7 +1186,7 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 			err := store.delete(key)
 			logger.Infof("Key %s is not needed, abandoned, err: %v", key, err)
 		} else {
-			store.bcache.uploaded(key, blen)
+			store.uploadedBlock(key, blen)
 			store.removePending(key)
 			if err := store.bcache.removeStage(key); err != nil {
 				logger.Warnf("failed to remove stage %s, in upload staging file", stagingPath)
@@ -1269,6 +1332,12 @@ func (store *cachedStore) FillCache(id uint64, length uint32) error {
 		if _, existed := store.bcache.exist(k); existed { // already cached
 			continue
 		}
+		if store.cleanCache != nil {
+			if r, e := store.cleanCache.load(k); e == nil {
+				_ = r.Close()
+				continue
+			}
+		}
 		size := parseObjOrigSize(k)
 		if size == 0 || size > store.conf.BlockSize {
 			logger.Warnf("Invalid size: %s %d", k, size)
@@ -1289,6 +1358,9 @@ func (store *cachedStore) EvictCache(id uint64, length uint32) error {
 	keys := r.keys()
 	for _, k := range keys {
 		store.bcache.remove(k, false)
+		if store.cleanCache != nil {
+			_ = os.Remove(filepath.Join(store.cleanCache.dir, cacheDir, k))
+		}
 	}
 	return nil
 }
@@ -1300,6 +1372,12 @@ func (store *cachedStore) CheckCache(id uint64, length uint32, handler func(exis
 	var existed bool
 	for i, k := range keys {
 		loc, existed = store.bcache.exist(k)
+		if !existed && store.cleanCache != nil {
+			if reader, err := store.cleanCache.load(k); err == nil {
+				_ = reader.Close()
+				loc, existed = filepath.Join(store.cleanCache.dir, cacheDir, k), true
+			}
+		}
 		if handler != nil {
 			handler(existed, loc, r.blockSize(i))
 		}

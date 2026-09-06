@@ -96,7 +96,7 @@ Related files:
 - `--shared-cache-dir` adds one pre-populated read-only cache source after the
   mount's private cache. JuiceFS never writes, stages, evicts, removes, or
   repairs files there; misses continue through the normal object-store path and
-  any downloaded block is cached only in the private cache directory.
+  downloaded blocks follow the normal clean/private cache destination below.
 
 Related files:
 
@@ -105,6 +105,29 @@ Related files:
 - `pkg/chunk/cached_store.go`
 - `pkg/chunk/cached_store_shared_cache_fork.go`
 - `pkg/chunk/cached_store_shared_cache_fork_test.go`
+
+### Remote-backed Clean Cache
+
+- `--clean-cache-dir` shares immutable blocks by volume UUID and object key,
+  after private writeback and read-only prewarm lookup. Normal remote reads and
+  admitted successful uploads populate it instead of private read-cache copies.
+- Raw staging stays mount-private. Only successful PUT permits clean publication
+  and removal of private recovery links; cache admission never proves durability.
+- Complete checksummed blocks use unique temporary files and atomic no-replace
+  links. There is no per-process existence index or cross-process download lock.
+- `clean-cache-prune` owns host-wide byte/item watermarks and disk/inode headroom;
+  its only lock serializes cleaners. It never visits staging or prewarm roots.
+- Private cache free-space flags are atomic because the background checker and
+  staging/cache admission run concurrently (covered by clean-cache race tests).
+
+Related files:
+
+- `pkg/chunk/clean_cache_run9.go`
+- `pkg/chunk/clean_cache_prune_run9.go`
+- `pkg/chunk/clean_cache_run9_test.go`
+- `cmd/clean_cache_run9.go`
+- `cmd/run9_read_view.go`
+- `pkg/chunk/disk_cache.go`
 
 ### Badger Close Safely
 

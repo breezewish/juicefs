@@ -5,9 +5,8 @@ import (
 )
 
 // sharedDiskCache is an immutable secondary cache populated outside JuiceFS.
-// It deliberately exposes only reads: misses fall through to object storage,
-// while all cache writes, staging, eviction, and repair stay in the mount's
-// private cache directory.
+// It deliberately exposes only reads: misses continue to dynamic clean cache
+// and object storage. No cache writes, staging, eviction, or repair touch it.
 type sharedDiskCache struct {
 	dir      string
 	checksum string

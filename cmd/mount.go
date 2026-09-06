@@ -390,6 +390,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 
 		CacheDir:          c.String("cache-dir"),
 		SharedCacheDir:    c.String("shared-cache-dir"),
+		CleanCacheDir:     c.String("clean-cache-dir"),
 		CacheSize:         utils.ParseBytes(c, "cache-size", 'M'),
 		CacheItems:        c.Int64("cache-items"),
 		FreeSpace:         float32(c.Float64("free-space-ratio")),
