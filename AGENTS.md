@@ -215,11 +215,21 @@ Related files:
 
 ### Run9 Deleted Snap Object GC
 
+- Writable run9 mounts capture a private allocation window before NewSession.
+  After successful finalize and ack they publish bounded, checksummed batches
+  of native negative-reference slices outside meta/. `gc-retired-slices` consumes
+  exact keys without opening metadata or touching staging. In-band DeleteSlice
+  stays disabled; historical shared slices remain governed by coarse GC.
+  Scan/publication failures conservatively leak garbage, not fail finalize.
+  Implementation: `pkg/meta/run9_retired_slices.go`, `cmd/run9_retired_slices.go`.
+
 - Hidden internal commands `list-live-slices`, `describe-format`, and `gc-slice-ranges` expose the minimal metadata and object-store operations needed by run9rt deleted snap object GC.
 - `list-live-slices` reports the format name, object block layout, and slice ids/sizes from one metadata DB; run9rt passes `--scan-pending` when materializing manifests from metadata state instead of only the live view.
 - `describe-format` reports the persisted object storage descriptor and object layout so runtime can operate after candidate metadata has been removed, and also seeds a prepared writable epoch through the `?nextchunk=` badger path.
 - `gc-slice-ranges` lists only the loaded format prefix, parses `slice_id` from object keys, and deletes only keys whose `slice_id` falls within the requested ranges. It may stop early at `max_delete_objects` and return `has_more=true`.
 - When the loaded storage is sharded, range deletion reuses bulk delete and fans out independent shard groups in parallel so GC does not serialize shard-local deletes.
+- Delimited listing workers observe a cancellable context instead of racing on
+  the recursive walker's error variable; coarse-GC race tests cover this path.
 
 Related files:
 

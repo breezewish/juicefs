@@ -214,6 +214,9 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 	listed := make(chan Object, 10240)
 	var walk func(string, []Object) error
 	walk = func(prefix string, entries []Object) error {
+		// Workers must observe cancellation, not the walker's unsynchronized error.
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
 		var concurrent = 10
 		var err error
 		threads := make([]listThread, concurrent)
@@ -238,7 +241,7 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 					t.cond.Signal()
 					for t.ready {
 						t.cond.WaitWithTimeout(time.Second)
-						if err != nil {
+						if ctx.Err() != nil {
 							t.Unlock()
 							return
 						}

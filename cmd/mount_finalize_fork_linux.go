@@ -115,7 +115,7 @@ func installForkFinalizeHandler(_ meta.Meta, v *vfs.VFS, _ object.ObjectStorage)
 	}()
 }
 
-func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.ObjectStorage) (resultErr error) {
+func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.ObjectStorage, retired *run9RetiredSliceGC) (resultErr error) {
 	pid := os.Getpid()
 	starttimeTicks, err := readProcStatStarttimeTicks(pid)
 	if err != nil {
@@ -200,6 +200,12 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 			if resultErr == nil {
 				resultErr = fmt.Errorf("finalize: write ack: %w", err)
 			}
+		} else if ack.Status == "ok" && retired != nil && ack.SliceGCError == "" {
+			if err := retired.publish(); err != nil {
+				logger.Errorf("finalize retired slice batch publication failed: %s", err)
+			} else if len(retired.batch.Slices) > 0 {
+				logger.Infof("finalize published %d retired slices", len(retired.batch.Slices))
+			}
 		}
 	}()
 
@@ -250,6 +256,18 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 	}
 
 	writePendingAck("shutdown")
+	// Capture only positive garbage evidence after the metadata session has
+	// closed. A GC scan error does not change the data durability result.
+	if firstErr == nil && retired != nil {
+		truncated, err := retired.collect(finalizeCtx)
+		ack.SliceGCTruncated = truncated
+		if err != nil {
+			ack.SliceGCError = err.Error()
+			logger.Errorf("finalize retired slice collection failed: %s", err)
+		} else {
+			ack.RetiredSlices = len(retired.batch.Slices)
+		}
+	}
 	recordErr("shutdown", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
 		return metaCli.Shutdown()
 	}))

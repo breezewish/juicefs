@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -112,8 +113,8 @@ func (f *fakeFinalizeSessionShutdowner) Shutdown() error {
 }
 
 type blockingFinalizeSessionShutdowner struct {
-	closeCalls        int
-	shutdownCalls     int
+	closeCalls        atomic.Int32
+	shutdownCalls     atomic.Int32
 	blockCloseSession bool
 	blockShutdown     bool
 	closeCh           <-chan struct{}
@@ -143,7 +144,7 @@ func TestRunForkFinalizeOnMain_IncludesSizeFromOpenMetadataClient(t *testing.T) 
 	}()
 
 	metaCli := &fakeFinalizeSessionShutdowner{}
-	err = runForkFinalizeOnMain(metaCli, &vfs.VFS{Conf: &vfs.Config{}}, nil)
+	err = runForkFinalizeOnMain(metaCli, &vfs.VFS{Conf: &vfs.Config{}}, nil, nil)
 	if err != nil {
 		t.Fatalf("runForkFinalizeOnMain: %v", err)
 	}
@@ -168,7 +169,7 @@ func TestRunForkFinalizeOnMain_IncludesSizeFromOpenMetadataClient(t *testing.T) 
 }
 
 func (b *blockingFinalizeSessionShutdowner) CloseSession() error {
-	b.closeCalls++
+	b.closeCalls.Add(1)
 	if !b.blockCloseSession {
 		return nil
 	}
@@ -177,7 +178,7 @@ func (b *blockingFinalizeSessionShutdowner) CloseSession() error {
 }
 
 func (b *blockingFinalizeSessionShutdowner) Shutdown() error {
-	b.shutdownCalls++
+	b.shutdownCalls.Add(1)
 	if !b.blockShutdown {
 		return nil
 	}
@@ -291,7 +292,7 @@ func TestRunForkFinalizeOnMain_WritesUploadDrainErrorAck(t *testing.T) {
 	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
 	defer func() { forkFinalizeFlushAll = origFlushAll }()
 
-	err = runForkFinalizeOnMain(metaCli, v, nil)
+	err = runForkFinalizeOnMain(metaCli, v, nil, nil)
 	if !errors.Is(err, drainErr) {
 		t.Fatalf("runForkFinalizeOnMain should return upload drain error, got %v", err)
 	}
@@ -366,7 +367,7 @@ func TestRunForkFinalizeOnMain_TimesOutUploadDrainWritesAck(t *testing.T) {
 	defer func() { forkFinalizeFlushAll = origFlushAll }()
 
 	done := make(chan error, 1)
-	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil) }()
+	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
 
 	select {
 	case err := <-done:
@@ -434,7 +435,7 @@ func TestRunForkFinalizeOnMain_FlushAllPanicWritesPanicAck(t *testing.T) {
 	}
 	defer func() { forkFinalizeFlushAll = origFlushAll }()
 
-	err = runForkFinalizeOnMain(metaCli, v, nil)
+	err = runForkFinalizeOnMain(metaCli, v, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "finalize panic") {
 		t.Fatalf("runForkFinalizeOnMain should return finalize panic, got %v", err)
 	}
@@ -493,18 +494,21 @@ func TestRunForkFinalizeOnMain_TimesOutFlushAllWritesAck(t *testing.T) {
 	v := &vfs.VFS{Conf: &vfs.Config{}}
 
 	flushCh := make(chan struct{})
+	flushDone := make(chan struct{})
 	origFlushAll := forkFinalizeFlushAll
 	forkFinalizeFlushAll = func(*vfs.VFS) error {
+		defer close(flushDone)
 		<-flushCh
 		return nil
 	}
 	defer func() {
 		close(flushCh)
+		<-flushDone
 		forkFinalizeFlushAll = origFlushAll
 	}()
 
 	done := make(chan error, 1)
-	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil) }()
+	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
 
 	select {
 	case err := <-done:
@@ -587,7 +591,7 @@ func TestRunForkFinalizeOnMain_TimesOutCloseSessionWritesAck(t *testing.T) {
 	}()
 
 	done := make(chan error, 1)
-	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil) }()
+	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
 
 	select {
 	case err := <-done:
@@ -601,11 +605,11 @@ func TestRunForkFinalizeOnMain_TimesOutCloseSessionWritesAck(t *testing.T) {
 		t.Fatalf("runForkFinalizeOnMain blocked in close_session")
 	}
 
-	if metaCli.closeCalls != 1 {
-		t.Fatalf("CloseSession should be called once, got %d", metaCli.closeCalls)
+	if metaCli.closeCalls.Load() != 1 {
+		t.Fatalf("CloseSession should be called once, got %d", metaCli.closeCalls.Load())
 	}
-	if metaCli.shutdownCalls != 0 {
-		t.Fatalf("Shutdown should not be called after close_session timeout, got %d", metaCli.shutdownCalls)
+	if metaCli.shutdownCalls.Load() != 0 {
+		t.Fatalf("Shutdown should not be called after close_session timeout, got %d", metaCli.shutdownCalls.Load())
 	}
 
 	data, err := os.ReadFile(ackPath)
@@ -670,7 +674,7 @@ func TestRunForkFinalizeOnMain_TimesOutShutdownWritesAck(t *testing.T) {
 	}()
 
 	done := make(chan error, 1)
-	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil) }()
+	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
 
 	select {
 	case err := <-done:
@@ -684,11 +688,11 @@ func TestRunForkFinalizeOnMain_TimesOutShutdownWritesAck(t *testing.T) {
 		t.Fatalf("runForkFinalizeOnMain blocked in shutdown")
 	}
 
-	if metaCli.closeCalls != 1 {
-		t.Fatalf("CloseSession should be called once, got %d", metaCli.closeCalls)
+	if metaCli.closeCalls.Load() != 1 {
+		t.Fatalf("CloseSession should be called once, got %d", metaCli.closeCalls.Load())
 	}
-	if metaCli.shutdownCalls != 1 {
-		t.Fatalf("Shutdown should be called once, got %d", metaCli.shutdownCalls)
+	if metaCli.shutdownCalls.Load() != 1 {
+		t.Fatalf("Shutdown should be called once, got %d", metaCli.shutdownCalls.Load())
 	}
 
 	data, err := os.ReadFile(ackPath)

@@ -16,6 +16,9 @@ type forkFinalizeAckV1 struct {
 	UsedInodes        *uint64 `json:"used_inodes,omitempty"`
 	SizeMeasuredAt    string  `json:"size_measured_at,omitempty"`
 	SizeError         string  `json:"size_error,omitempty"`
+	RetiredSlices     int     `json:"retired_slices,omitempty"`
+	SliceGCTruncated  bool    `json:"slice_gc_truncated,omitempty"`
+	SliceGCError      string  `json:"slice_gc_error,omitempty"`
 }
 
 // forkUmountFinalizeResult is the structured JSON output of `juicefs umount-finalize`.
