@@ -85,6 +85,10 @@ Details: https://juicefs.com/docs/community/quick_start_guide`,
 			formatFlags(),
 			formatManagementFlags(),
 			[]cli.Flag{
+				&cli.Uint64Flag{
+					Name: "run9-init-empty-epoch", Hidden: true,
+					Usage: "initialize a fresh run9 filesystem without mounting",
+				},
 				&cli.BoolFlag{
 					Name:  "force",
 					Usage: "overwrite existing format",
@@ -404,6 +408,9 @@ func readKerbConf(file string) string {
 func format(c *cli.Context) error {
 	setup(c, 2)
 	metaURI := c.Args().Get(0)
+	if c.IsSet("run9-init-empty-epoch") && (!strings.HasPrefix(metaURI, "badger://") || strings.Contains(metaURI, "?") || c.Uint64("run9-init-empty-epoch") == 0) {
+		return fmt.Errorf("empty filesystem initialization requires plain Badger metadata and a positive epoch")
+	}
 	removePassword(metaURI)
 	name := c.Args().Get(1)
 	validName := regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
@@ -433,6 +440,12 @@ func format(c *cli.Context) error {
 	var create, encrypted bool
 	format, err := m.Load(false)
 	if err == nil {
+		if c.IsSet("run9-init-empty-epoch") {
+			if err := m.Shutdown(); err != nil {
+				return errors.Wrap(err, "close existing filesystem")
+			}
+			return fmt.Errorf("empty filesystem initialization refuses existing format")
+		}
 		if c.Bool("no-update") {
 			// Fork divergence: always shutdown meta client on early exit.
 			// This is critical for badger with SkipWAL enabled (memtables must be flushed).
@@ -595,6 +608,9 @@ func format(c *cli.Context) error {
 			logger.Errorf("shutdown: %s", shutdownErr)
 		}
 		logger.Fatalf("format: %s", err)
+	}
+	if c.IsSet("run9-init-empty-epoch") {
+		return finishRun9EmptyFormat(m, format, c.Uint64("run9-init-empty-epoch"))
 	}
 	// Fork divergence: always shutdown meta client after format completes.
 	// This is critical for badger with SkipWAL enabled (memtables must be flushed).

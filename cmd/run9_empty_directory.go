@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"path"
@@ -17,30 +18,40 @@ func cmdRun9CheckEmptyDirectory() *cli.Command {
 		Name:      "check-empty-dir",
 		Hidden:    true,
 		Usage:     "run9 internal: check an absent or empty directory without following symlinks",
-		ArgsUsage: "READONLY-META-URL ABSOLUTE-PATH",
+		ArgsUsage: "READONLY-META-URL ABSOLUTE-PATH [ABSOLUTE-PATH...]",
 		Action: func(c *cli.Context) error {
-			setup(c, 2)
-			return checkRun9EmptyDirectory(c.Context, c.Args().Get(0), c.Args().Get(1))
+			setup0(c, 2, 0)
+			return checkRun9EmptyDirectory(c.Context, c.Args().Get(0), c.Args().Slice()[1:]...)
 		},
 	}
 }
 
-func checkRun9EmptyDirectory(ctx context.Context, metaURL, directory string) error {
+func checkRun9EmptyDirectory(ctx context.Context, metaURL string, directories ...string) (retErr error) {
 	parsed, err := url.Parse(metaURL)
 	if err != nil || parsed.Scheme != "badger" || parsed.Query().Get("readonly") != "1" {
 		return fmt.Errorf("empty directory check requires native read-only Badger metadata")
 	}
-	if directory == "/" || !path.IsAbs(directory) || path.Clean(directory) != directory || strings.ContainsRune(directory, 0) {
-		return fmt.Errorf("directory must be a canonical absolute path other than root")
+	if len(directories) == 0 {
+		return fmt.Errorf("at least one directory is required")
+	}
+	for _, directory := range directories {
+		if directory == "/" || !path.IsAbs(directory) || path.Clean(directory) != directory || strings.ContainsRune(directory, 0) {
+			return fmt.Errorf("directory must be a canonical absolute path other than root")
+		}
 	}
 	conf := meta.DefaultConf()
 	conf.ReadOnly, conf.NoBGJob = true, true
 	client := meta.NewClient(metaURL, conf)
-	defer client.Shutdown()
+	defer func() { retErr = errors.Join(retErr, client.Shutdown()) }()
 	if _, err := client.Load(true); err != nil {
 		return err
 	}
-	return checkRun9EmptyDirectoryMetadata(run9ReadViewContext(ctx), client, directory)
+	for _, directory := range directories {
+		if err := checkRun9EmptyDirectoryMetadata(run9ReadViewContext(ctx), client, directory); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func checkRun9EmptyDirectoryMetadata(ctx meta.Context, client meta.Meta, directory string) error {
