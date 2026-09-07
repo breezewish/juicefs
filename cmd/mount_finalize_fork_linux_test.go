@@ -234,6 +234,30 @@ func (b *blockingFinalizeSessionShutdowner) Shutdown() error {
 	return nil
 }
 
+func TestWriteForkFinalizeAck_PendingIsNotSuccess(t *testing.T) {
+	ackPath := filepath.Join(t.TempDir(), "ack.json")
+	ack := &forkFinalizeAckV1{
+		SchemaVersion:     1,
+		Pid:               99990,
+		PidStarttimeTicks: 1234,
+		Status:            "pending",
+		Phase:             "shutdown",
+	}
+	if err := writeForkFinalizeAck(ackPath, ack); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readFinalizeAckFile(ackPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "pending" || got.Phase != "shutdown" {
+		t.Fatalf("unexpected progress ack: %+v", got)
+	}
+	if err := validateFinalizeAck(got, ack.Pid, ack.PidStarttimeTicks); !errors.Is(err, errForkFinalizeAckPending) {
+		t.Fatalf("pending ack must not prove finalize success: %v", err)
+	}
+}
+
 func TestWriteForkFinalizeAck_WritesFile(t *testing.T) {
 	pid := 99991
 	starttimeTicks := uint64(time.Now().UnixNano())

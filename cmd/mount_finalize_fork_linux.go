@@ -315,9 +315,14 @@ func writeForkFinalizeAck(ackPath string, ack *forkFinalizeAckV1) error {
 		_ = tmp.Close()
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
+	// Pending is only a live progress notification, never a persistence proof.
+	// Atomic publication is sufficient: syncing every phase can make unrelated
+	// host filesystem writes stall finalize. Keep the terminal ACK fence intact.
+	if ack.Status != "pending" {
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			return err
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return err
@@ -325,9 +330,11 @@ func writeForkFinalizeAck(ackPath string, ack *forkFinalizeAckV1) error {
 	if err := os.Rename(tmpPath, ackPath); err != nil {
 		return err
 	}
-	if err := syncDir(ackDir); err != nil {
-		// fsync the directory is optional (file fsync is the minimum requirement).
-		logger.Warnf("finalize: fsync ack dir: %s", err)
+	if ack.Status != "pending" {
+		if err := syncDir(ackDir); err != nil {
+			// fsync the directory is optional (file fsync is the minimum requirement).
+			logger.Warnf("finalize: fsync ack dir: %s", err)
+		}
 	}
 	return nil
 }
