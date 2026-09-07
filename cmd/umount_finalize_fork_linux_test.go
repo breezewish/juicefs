@@ -4,14 +4,97 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
+	"fmt"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/urfave/cli/v2"
 )
+
+func TestUmountFinalizeRejectsInvalidSuccessAck(t *testing.T) {
+	if os.Getenv("JFS_TEST_INVALID_SUCCESS_ACK") == "1" {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGUSR2)
+		defer signal.Stop(signals)
+		fmt.Println("ready")
+		<-signals
+		pid := os.Getpid()
+		start, err := readProcStatStarttimeTicks(pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeForkFinalizeAck(forkFinalizeAckPath(pid, start), &forkFinalizeAckV1{
+			SchemaVersion: 2, Pid: pid, PidStarttimeTicks: start, Status: "ok",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		<-signals // The requester must reject the proof and kill this child.
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestUmountFinalizeRejectsInvalidSuccessAck$")
+	child.Env = append(os.Environ(), "JFS_TEST_INVALID_SUCCESS_ACK=1")
+	child.Stderr = os.Stderr
+	stdout, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var ackPath, requestPath string
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+		if ackPath != "" {
+			_ = os.Remove(ackPath)
+			_ = os.Remove(requestPath)
+		}
+	})
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "ready\n" {
+		t.Fatalf("signal handler readiness: %q, %v", line, err)
+	}
+	pid := child.Process.Pid
+	start, err := readProcStatStarttimeTicks(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackPath, requestPath = forkFinalizeAckPath(pid, start), forkFinalizeRequestPath(pid, start)
+	// Only replace the FUSE config read. The actual process identity, signal,
+	// ACK validation and command result handling remain under test.
+	original := readVFSConfigWithTimeout
+	readVFSConfigWithTimeout = func(context.Context, string, time.Duration) (*vfs.Config, error) {
+		return &vfs.Config{Pid: pid}, nil
+	}
+	t.Cleanup(func() { readVFSConfigWithTimeout = original })
+	flags := flag.NewFlagSet("umount-finalize", flag.ContinueOnError)
+	flags.String("finalize-timeout", "1s", "")
+	flags.String("umount-observe-timeout", "50ms", "")
+	flags.String("exit-observe-timeout", "50ms", "")
+	if err := flags.Parse([]string{"/unused-test-mount"}); err != nil {
+		t.Fatal(err)
+	}
+	cliCtx := cli.NewContext(cli.NewApp(), flags, nil)
+	cliCtx.Context = ctx
+	result, exitCode := umountFinalizeRun(cliCtx)
+	if exitCode == 0 || result.Ok || result.Finalized || !strings.Contains(result.Reason, "unexpected ack schema_version 2") {
+		t.Fatalf("invalid success ACK must fail: exit=%d result=%+v", exitCode, result)
+	}
+}
 
 func TestWaitFinalizeAck_WaitsForFile(t *testing.T) {
 	pid := os.Getpid()

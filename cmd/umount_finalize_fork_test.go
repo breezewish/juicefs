@@ -253,6 +253,43 @@ func TestWaitFinalizeStart_PendingAck(t *testing.T) {
 	}
 }
 
+// Err is observed between reading the ack and checking process identity. This
+// context schedules publication in that exact gap without sleeps or live PIDs.
+type finalizePublicationContext struct {
+	context.Context
+	publish func()
+}
+
+func (c *finalizePublicationContext) Err() error {
+	if c.publish != nil {
+		publish := c.publish
+		c.publish = nil
+		publish()
+	}
+	return c.Context.Err()
+}
+
+func TestWaitFinalizeStart_AckPublishedBeforeObservedExit(t *testing.T) {
+	ackPath := filepath.Join(secureTempDir(t), "ack.json")
+	ctx := &finalizePublicationContext{
+		Context: context.Background(),
+		publish: func() {
+			// PID -1 cannot match a mount daemon; its final ack appears after
+			// the first read, just before the waiter observes that it is gone.
+			if err := os.WriteFile(ackPath, []byte(`{"schema_version":1,"pid":-1,"pid_starttime_ticks":456,"status":"ok"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	got, err := waitFinalizeStart(ctx, ackPath, -1, 456, uint32(os.Geteuid()))
+	if err != nil {
+		t.Fatalf("published success must survive daemon exit: %v", err)
+	}
+	if got == nil || got.Status != "ok" {
+		t.Fatalf("unexpected ack: %+v", got)
+	}
+}
+
 func TestWaitFinalizeAck_PendingEventuallyOk(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("live mount process identity requires Linux /proc")

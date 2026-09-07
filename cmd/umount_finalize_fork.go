@@ -230,24 +230,25 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 	if startAck != nil {
 		result := &forkUmountFinalizeResult{
 			Ok:                   false,
-			Finalized:            startAck.Status == "ok",
+			Finalized:            false,
 			KernelUmountObserved: false,
 			DaemonExitObserved:   false,
 			Ack:                  startAck,
 		}
+		if startErr != nil {
+			result.Reason = startErr.Error()
+			killForkMountProcess(conf, pid, expectedStarttime)
+			return result, 1
+		}
 		if startAck.Status == "ok" {
 			result.Ok = true
+			result.Finalized = true
 			result.DaemonExitObserved = waitProcessExit(ctx.Context, pid, expectedStarttime, exitObserveTimeout)
 			if !result.DaemonExitObserved {
 				logger.Warnf("finalize ack is ok but mount daemon didn't exit within %s, killing it best-effort", exitObserveTimeout)
 				killForkMountProcess(conf, pid, expectedStarttime)
 			}
 			return result, 0
-		}
-		if startErr != nil {
-			result.Reason = startErr.Error()
-			killForkMountProcess(conf, pid, expectedStarttime)
-			return result, 1
 		}
 	}
 	if startErr != nil {
@@ -294,7 +295,7 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 	return result, 0
 }
 
-func readVFSConfigWithTimeout(ctx context.Context, mp string, timeout time.Duration) (*vfs.Config, error) {
+var readVFSConfigWithTimeout = func(ctx context.Context, mp string, timeout time.Duration) (*vfs.Config, error) {
 	var raw []byte
 	err := withTimeout(ctx, timeout, func() error {
 		configPath, err := findInternalMountConfigPath(mp)
@@ -448,8 +449,9 @@ func validateFinalizeAck(ack *forkFinalizeAckV1, expectedPid int, expectedStartt
 }
 
 func waitFinalizeStart(ctx context.Context, ackPath string, expectedPid int, expectedStarttime uint64, expectedUID uint32) (*forkFinalizeAckV1, error) {
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(forkFinalizeObserveInterval)
 	defer ticker.Stop()
+	daemonExited := false
 	for {
 		dirReady, err := finalizeAckDirReady(filepath.Dir(ackPath), expectedUID)
 		if err != nil {
@@ -459,11 +461,7 @@ func waitFinalizeStart(ctx context.Context, ackPath string, expectedPid int, exp
 		if dirReady {
 			ack, err := readFinalizeAckFile(ackPath)
 			if err == nil {
-				validateErr := validateFinalizeAck(ack, expectedPid, expectedStarttime)
-				if validateErr == nil || errors.Is(validateErr, errForkFinalizeAckPending) {
-					return ack, validateErr
-				}
-				return ack, validateErr
+				return ack, validateFinalizeAck(ack, expectedPid, expectedStarttime)
 			}
 			if !os.IsNotExist(err) {
 				return nil, err
@@ -473,13 +471,19 @@ func waitFinalizeStart(ctx context.Context, ackPath string, expectedPid int, exp
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if !processMatches(expectedPid, expectedStarttime) {
+		if daemonExited {
 			return nil, fmt.Errorf("mount daemon exited before finalize start ack")
+		}
+		if !processMatches(expectedPid, expectedStarttime) {
+			// The daemon can publish its ack and exit between our read and
+			// liveness check. Observe that final publication before failing.
+			daemonExited = true
+			continue
 		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			// Re-read through validation before returning the context error.
 		}
 	}
 }
