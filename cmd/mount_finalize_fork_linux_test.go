@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
@@ -61,7 +62,7 @@ func TestFinalizeRequestSurvivesUnmountError(t *testing.T) {
 	// proves the failing unmount returned and the handler completed its decision.
 	forkMountLifecycle.Lock()
 	defer forkMountLifecycle.Unlock()
-	if !forkFinalizeInProgress.Load() {
+	if !forkFinalizeInProgress {
 		t.Fatal("an accepted finalize request must not become ordinary mount shutdown after an unmount error")
 	}
 }
@@ -376,88 +377,92 @@ func TestRunForkFinalizeOnMain_WritesUploadDrainErrorAck(t *testing.T) {
 }
 
 func TestRunForkFinalizeOnMain_TimesOutUploadDrainWritesAck(t *testing.T) {
-	pid := os.Getpid()
-	starttimeTicks, err := readProcStatStarttimeTicks(pid)
-	if err != nil {
-		t.Fatalf("readProcStatStarttimeTicks: %v", err)
-	}
+	origFlushAll := forkFinalizeFlushAll
+	defer func() { forkFinalizeFlushAll = origFlushAll }()
+	// Virtual time reaches the deadline only once the selected phase blocks;
+	// synctest also joins its goroutines before the global hook is restored.
+	synctest.Test(t, func(t *testing.T) {
+		pid := os.Getpid()
+		starttimeTicks, err := readProcStatStarttimeTicks(pid)
+		if err != nil {
+			t.Fatalf("readProcStatStarttimeTicks: %v", err)
+		}
 
-	ackPath := forkFinalizeAckPath(pid, starttimeTicks)
-	reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
-	_ = os.Remove(ackPath)
-	_ = os.Remove(reqPath)
-	t.Cleanup(func() {
+		ackPath := forkFinalizeAckPath(pid, starttimeTicks)
+		reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
 		_ = os.Remove(ackPath)
 		_ = os.Remove(reqPath)
+		t.Cleanup(func() {
+			_ = os.Remove(ackPath)
+			_ = os.Remove(reqPath)
+		})
+		if err := os.MkdirAll(filepath.Dir(ackPath), 0o700); err != nil {
+			t.Fatalf("MkdirAll ack dir: %v", err)
+		}
+		if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
+			SchemaVersion:   1,
+			FinalizeTimeout: "200ms",
+		}); err != nil {
+			t.Fatalf("writeForkFinalizeRequest: %v", err)
+		}
+
+		metaCli := &fakeFinalizeSessionShutdowner{}
+		store := &blockingFinalizeChunkStore{}
+		v := &vfs.VFS{
+			Conf: &vfs.Config{
+				Chunk: &chunk.Config{Writeback: true},
+			},
+			Store: store,
+		}
+
+		forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
+
+		done := make(chan error, 1)
+		go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("runForkFinalizeOnMain should fail on timeout")
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("runForkFinalizeOnMain blocked")
+		}
+
+		if metaCli.closeCalls != 0 {
+			t.Fatalf("CloseSession should not be called on timeout, got %d", metaCli.closeCalls)
+		}
+		if metaCli.shutdownCalls != 0 {
+			t.Fatalf("Shutdown should not be called on timeout, got %d", metaCli.shutdownCalls)
+		}
+		if store.waitCalls != 1 {
+			t.Fatalf("WaitForUploadDrain should be called once, got %d", store.waitCalls)
+		}
+
+		data, err := os.ReadFile(ackPath)
+		if err != nil {
+			t.Fatalf("ReadFile ack: %v", err)
+		}
+		var ack forkFinalizeAckV1
+		if err := json.Unmarshal(data, &ack); err != nil {
+			t.Fatalf("Unmarshal ack: %v", err)
+		}
+		if ack.Status != "error" {
+			t.Fatalf("unexpected ack status: %+v", ack)
+		}
+		if ack.Phase != "upload_drain" {
+			t.Fatalf("unexpected ack phase: %+v", ack)
+		}
+		if !strings.Contains(ack.Error, "timeout after") {
+			t.Fatalf("unexpected ack error: %+v", ack)
+		}
+		if ack.FinishedAt == "" {
+			t.Fatalf("ack should include finished_at: %+v", ack)
+		}
 	})
-	if err := os.MkdirAll(filepath.Dir(ackPath), 0o700); err != nil {
-		t.Fatalf("MkdirAll ack dir: %v", err)
-	}
-	if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
-		SchemaVersion:   1,
-		FinalizeTimeout: "200ms",
-	}); err != nil {
-		t.Fatalf("writeForkFinalizeRequest: %v", err)
-	}
-
-	metaCli := &fakeFinalizeSessionShutdowner{}
-	store := &blockingFinalizeChunkStore{}
-	v := &vfs.VFS{
-		Conf: &vfs.Config{
-			Chunk: &chunk.Config{Writeback: true},
-		},
-		Store: store,
-	}
-
-	origFlushAll := forkFinalizeFlushAll
-	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
-	defer func() { forkFinalizeFlushAll = origFlushAll }()
-
-	done := make(chan error, 1)
-	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatalf("runForkFinalizeOnMain should fail on timeout")
-		}
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("runForkFinalizeOnMain blocked")
-	}
-
-	if metaCli.closeCalls != 0 {
-		t.Fatalf("CloseSession should not be called on timeout, got %d", metaCli.closeCalls)
-	}
-	if metaCli.shutdownCalls != 0 {
-		t.Fatalf("Shutdown should not be called on timeout, got %d", metaCli.shutdownCalls)
-	}
-	if store.waitCalls != 1 {
-		t.Fatalf("WaitForUploadDrain should be called once, got %d", store.waitCalls)
-	}
-
-	data, err := os.ReadFile(ackPath)
-	if err != nil {
-		t.Fatalf("ReadFile ack: %v", err)
-	}
-	var ack forkFinalizeAckV1
-	if err := json.Unmarshal(data, &ack); err != nil {
-		t.Fatalf("Unmarshal ack: %v", err)
-	}
-	if ack.Status != "error" {
-		t.Fatalf("unexpected ack status: %+v", ack)
-	}
-	if ack.Phase != "upload_drain" {
-		t.Fatalf("unexpected ack phase: %+v", ack)
-	}
-	if !strings.Contains(ack.Error, "timeout after") {
-		t.Fatalf("unexpected ack error: %+v", ack)
-	}
-	if ack.FinishedAt == "" {
-		t.Fatalf("ack should include finished_at: %+v", ack)
-	}
 }
 
 func TestRunForkFinalizeOnMain_FlushAllPanicWritesPanicAck(t *testing.T) {
@@ -513,253 +518,250 @@ func TestRunForkFinalizeOnMain_FlushAllPanicWritesPanicAck(t *testing.T) {
 }
 
 func TestRunForkFinalizeOnMain_TimesOutFlushAllWritesAck(t *testing.T) {
-	pid := os.Getpid()
-	starttimeTicks, err := readProcStatStarttimeTicks(pid)
-	if err != nil {
-		t.Fatalf("readProcStatStarttimeTicks: %v", err)
-	}
+	origFlushAll := forkFinalizeFlushAll
+	defer func() { forkFinalizeFlushAll = origFlushAll }()
+	synctest.Test(t, func(t *testing.T) {
+		pid := os.Getpid()
+		starttimeTicks, err := readProcStatStarttimeTicks(pid)
+		if err != nil {
+			t.Fatalf("readProcStatStarttimeTicks: %v", err)
+		}
 
-	ackPath := forkFinalizeAckPath(pid, starttimeTicks)
-	reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
-	_ = os.Remove(ackPath)
-	_ = os.Remove(reqPath)
-	t.Cleanup(func() {
+		ackPath := forkFinalizeAckPath(pid, starttimeTicks)
+		reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
 		_ = os.Remove(ackPath)
 		_ = os.Remove(reqPath)
+		t.Cleanup(func() {
+			_ = os.Remove(ackPath)
+			_ = os.Remove(reqPath)
+		})
+		if err := os.MkdirAll(filepath.Dir(ackPath), 0o700); err != nil {
+			t.Fatalf("MkdirAll ack dir: %v", err)
+		}
+		if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
+			SchemaVersion:   1,
+			FinalizeTimeout: "200ms",
+		}); err != nil {
+			t.Fatalf("writeForkFinalizeRequest: %v", err)
+		}
+
+		metaCli := &fakeFinalizeSessionShutdowner{}
+		v := &vfs.VFS{Conf: &vfs.Config{}}
+
+		flushCh := make(chan struct{})
+		forkFinalizeFlushAll = func(*vfs.VFS) error {
+			<-flushCh
+			return nil
+		}
+		defer close(flushCh)
+
+		done := make(chan error, 1)
+		go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("runForkFinalizeOnMain should fail on flush_all timeout")
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("runForkFinalizeOnMain blocked in flush_all")
+		}
+
+		if metaCli.closeCalls != 0 {
+			t.Fatalf("CloseSession should not be called after flush_all timeout, got %d", metaCli.closeCalls)
+		}
+		if metaCli.shutdownCalls != 0 {
+			t.Fatalf("Shutdown should not be called after flush_all timeout, got %d", metaCli.shutdownCalls)
+		}
+
+		data, err := os.ReadFile(ackPath)
+		if err != nil {
+			t.Fatalf("ReadFile ack: %v", err)
+		}
+		var ack forkFinalizeAckV1
+		if err := json.Unmarshal(data, &ack); err != nil {
+			t.Fatalf("Unmarshal ack: %v", err)
+		}
+		if ack.Status != "error" {
+			t.Fatalf("unexpected ack status: %+v", ack)
+		}
+		if ack.Phase != "flush_all" {
+			t.Fatalf("unexpected ack phase: %+v", ack)
+		}
+		if !strings.Contains(ack.Error, "timeout after") {
+			t.Fatalf("unexpected ack error: %+v", ack)
+		}
+		if ack.FinishedAt == "" {
+			t.Fatalf("ack should include finished_at: %+v", ack)
+		}
 	})
-	if err := os.MkdirAll(filepath.Dir(ackPath), 0o700); err != nil {
-		t.Fatalf("MkdirAll ack dir: %v", err)
-	}
-	if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
-		SchemaVersion:   1,
-		FinalizeTimeout: "200ms",
-	}); err != nil {
-		t.Fatalf("writeForkFinalizeRequest: %v", err)
-	}
-
-	metaCli := &fakeFinalizeSessionShutdowner{}
-	v := &vfs.VFS{Conf: &vfs.Config{}}
-
-	flushCh := make(chan struct{})
-	flushDone := make(chan struct{})
-	origFlushAll := forkFinalizeFlushAll
-	forkFinalizeFlushAll = func(*vfs.VFS) error {
-		defer close(flushDone)
-		<-flushCh
-		return nil
-	}
-	defer func() {
-		close(flushCh)
-		<-flushDone
-		forkFinalizeFlushAll = origFlushAll
-	}()
-
-	done := make(chan error, 1)
-	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatalf("runForkFinalizeOnMain should fail on flush_all timeout")
-		}
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("runForkFinalizeOnMain blocked in flush_all")
-	}
-
-	if metaCli.closeCalls != 0 {
-		t.Fatalf("CloseSession should not be called after flush_all timeout, got %d", metaCli.closeCalls)
-	}
-	if metaCli.shutdownCalls != 0 {
-		t.Fatalf("Shutdown should not be called after flush_all timeout, got %d", metaCli.shutdownCalls)
-	}
-
-	data, err := os.ReadFile(ackPath)
-	if err != nil {
-		t.Fatalf("ReadFile ack: %v", err)
-	}
-	var ack forkFinalizeAckV1
-	if err := json.Unmarshal(data, &ack); err != nil {
-		t.Fatalf("Unmarshal ack: %v", err)
-	}
-	if ack.Status != "error" {
-		t.Fatalf("unexpected ack status: %+v", ack)
-	}
-	if ack.Phase != "flush_all" {
-		t.Fatalf("unexpected ack phase: %+v", ack)
-	}
-	if !strings.Contains(ack.Error, "timeout after") {
-		t.Fatalf("unexpected ack error: %+v", ack)
-	}
-	if ack.FinishedAt == "" {
-		t.Fatalf("ack should include finished_at: %+v", ack)
-	}
 }
 
 func TestRunForkFinalizeOnMain_TimesOutCloseSessionWritesAck(t *testing.T) {
-	pid := os.Getpid()
-	starttimeTicks, err := readProcStatStarttimeTicks(pid)
-	if err != nil {
-		t.Fatalf("readProcStatStarttimeTicks: %v", err)
-	}
+	origFlushAll := forkFinalizeFlushAll
+	defer func() { forkFinalizeFlushAll = origFlushAll }()
+	synctest.Test(t, func(t *testing.T) {
+		pid := os.Getpid()
+		starttimeTicks, err := readProcStatStarttimeTicks(pid)
+		if err != nil {
+			t.Fatalf("readProcStatStarttimeTicks: %v", err)
+		}
 
-	ackPath := forkFinalizeAckPath(pid, starttimeTicks)
-	reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
-	_ = os.Remove(ackPath)
-	_ = os.Remove(reqPath)
-	t.Cleanup(func() {
+		ackPath := forkFinalizeAckPath(pid, starttimeTicks)
+		reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
 		_ = os.Remove(ackPath)
 		_ = os.Remove(reqPath)
+		t.Cleanup(func() {
+			_ = os.Remove(ackPath)
+			_ = os.Remove(reqPath)
+		})
+		if err := os.MkdirAll(filepath.Dir(ackPath), 0o700); err != nil {
+			t.Fatalf("MkdirAll ack dir: %v", err)
+		}
+		if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
+			SchemaVersion:   1,
+			FinalizeTimeout: "200ms",
+		}); err != nil {
+			t.Fatalf("writeForkFinalizeRequest: %v", err)
+		}
+
+		closeCh := make(chan struct{})
+		metaCli := &blockingFinalizeSessionShutdowner{
+			blockCloseSession: true,
+			closeCh:           closeCh,
+		}
+		v := &vfs.VFS{Conf: &vfs.Config{}}
+
+		forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
+		defer close(closeCh)
+
+		done := make(chan error, 1)
+		go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("runForkFinalizeOnMain should fail on close_session timeout")
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("runForkFinalizeOnMain blocked in close_session")
+		}
+
+		if metaCli.closeCalls.Load() != 1 {
+			t.Fatalf("CloseSession should be called once, got %d", metaCli.closeCalls.Load())
+		}
+		if metaCli.shutdownCalls.Load() != 0 {
+			t.Fatalf("Shutdown should not be called after close_session timeout, got %d", metaCli.shutdownCalls.Load())
+		}
+
+		data, err := os.ReadFile(ackPath)
+		if err != nil {
+			t.Fatalf("ReadFile ack: %v", err)
+		}
+		var ack forkFinalizeAckV1
+		if err := json.Unmarshal(data, &ack); err != nil {
+			t.Fatalf("Unmarshal ack: %v", err)
+		}
+		if ack.Status != "error" {
+			t.Fatalf("unexpected ack status: %+v", ack)
+		}
+		if ack.Phase != "close_session" {
+			t.Fatalf("unexpected ack phase: %+v", ack)
+		}
+		if !strings.Contains(ack.Error, "timeout after") {
+			t.Fatalf("unexpected ack error: %+v", ack)
+		}
+		if ack.FinishedAt == "" {
+			t.Fatalf("ack should include finished_at: %+v", ack)
+		}
 	})
-	if err := os.MkdirAll(filepath.Dir(ackPath), 0o700); err != nil {
-		t.Fatalf("MkdirAll ack dir: %v", err)
-	}
-	if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
-		SchemaVersion:   1,
-		FinalizeTimeout: "200ms",
-	}); err != nil {
-		t.Fatalf("writeForkFinalizeRequest: %v", err)
-	}
-
-	closeCh := make(chan struct{})
-	metaCli := &blockingFinalizeSessionShutdowner{
-		blockCloseSession: true,
-		closeCh:           closeCh,
-	}
-	v := &vfs.VFS{Conf: &vfs.Config{}}
-
-	origFlushAll := forkFinalizeFlushAll
-	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
-	defer func() {
-		close(closeCh)
-		forkFinalizeFlushAll = origFlushAll
-	}()
-
-	done := make(chan error, 1)
-	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatalf("runForkFinalizeOnMain should fail on close_session timeout")
-		}
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("runForkFinalizeOnMain blocked in close_session")
-	}
-
-	if metaCli.closeCalls.Load() != 1 {
-		t.Fatalf("CloseSession should be called once, got %d", metaCli.closeCalls.Load())
-	}
-	if metaCli.shutdownCalls.Load() != 0 {
-		t.Fatalf("Shutdown should not be called after close_session timeout, got %d", metaCli.shutdownCalls.Load())
-	}
-
-	data, err := os.ReadFile(ackPath)
-	if err != nil {
-		t.Fatalf("ReadFile ack: %v", err)
-	}
-	var ack forkFinalizeAckV1
-	if err := json.Unmarshal(data, &ack); err != nil {
-		t.Fatalf("Unmarshal ack: %v", err)
-	}
-	if ack.Status != "error" {
-		t.Fatalf("unexpected ack status: %+v", ack)
-	}
-	if ack.Phase != "close_session" {
-		t.Fatalf("unexpected ack phase: %+v", ack)
-	}
-	if !strings.Contains(ack.Error, "timeout after") {
-		t.Fatalf("unexpected ack error: %+v", ack)
-	}
-	if ack.FinishedAt == "" {
-		t.Fatalf("ack should include finished_at: %+v", ack)
-	}
 }
 
 func TestRunForkFinalizeOnMain_TimesOutShutdownWritesAck(t *testing.T) {
-	pid := os.Getpid()
-	starttimeTicks, err := readProcStatStarttimeTicks(pid)
-	if err != nil {
-		t.Fatalf("readProcStatStarttimeTicks: %v", err)
-	}
+	origFlushAll := forkFinalizeFlushAll
+	defer func() { forkFinalizeFlushAll = origFlushAll }()
+	synctest.Test(t, func(t *testing.T) {
+		pid := os.Getpid()
+		starttimeTicks, err := readProcStatStarttimeTicks(pid)
+		if err != nil {
+			t.Fatalf("readProcStatStarttimeTicks: %v", err)
+		}
 
-	ackPath := forkFinalizeAckPath(pid, starttimeTicks)
-	reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
-	_ = os.Remove(ackPath)
-	_ = os.Remove(reqPath)
-	t.Cleanup(func() {
+		ackPath := forkFinalizeAckPath(pid, starttimeTicks)
+		reqPath := forkFinalizeRequestPath(pid, starttimeTicks)
 		_ = os.Remove(ackPath)
 		_ = os.Remove(reqPath)
+		t.Cleanup(func() {
+			_ = os.Remove(ackPath)
+			_ = os.Remove(reqPath)
+		})
+		if err := os.MkdirAll(filepath.Dir(ackPath), 0o700); err != nil {
+			t.Fatalf("MkdirAll ack dir: %v", err)
+		}
+		if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
+			SchemaVersion:   1,
+			FinalizeTimeout: "200ms",
+		}); err != nil {
+			t.Fatalf("writeForkFinalizeRequest: %v", err)
+		}
+
+		shutdownCh := make(chan struct{})
+		metaCli := &blockingFinalizeSessionShutdowner{
+			blockShutdown: true,
+			shutdownCh:    shutdownCh,
+		}
+		v := &vfs.VFS{Conf: &vfs.Config{}}
+
+		forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
+		defer close(shutdownCh)
+
+		done := make(chan error, 1)
+		go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("runForkFinalizeOnMain should fail on shutdown timeout")
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("runForkFinalizeOnMain blocked in shutdown")
+		}
+
+		if metaCli.closeCalls.Load() != 1 {
+			t.Fatalf("CloseSession should be called once, got %d", metaCli.closeCalls.Load())
+		}
+		if metaCli.shutdownCalls.Load() != 1 {
+			t.Fatalf("Shutdown should be called once, got %d", metaCli.shutdownCalls.Load())
+		}
+
+		data, err := os.ReadFile(ackPath)
+		if err != nil {
+			t.Fatalf("ReadFile ack: %v", err)
+		}
+		var ack forkFinalizeAckV1
+		if err := json.Unmarshal(data, &ack); err != nil {
+			t.Fatalf("Unmarshal ack: %v", err)
+		}
+		if ack.Status != "error" {
+			t.Fatalf("unexpected ack status: %+v", ack)
+		}
+		if ack.Phase != "shutdown" {
+			t.Fatalf("unexpected ack phase: %+v", ack)
+		}
+		if !strings.Contains(ack.Error, "timeout after") {
+			t.Fatalf("unexpected ack error: %+v", ack)
+		}
+		if ack.FinishedAt == "" {
+			t.Fatalf("ack should include finished_at: %+v", ack)
+		}
 	})
-	if err := os.MkdirAll(filepath.Dir(ackPath), 0o700); err != nil {
-		t.Fatalf("MkdirAll ack dir: %v", err)
-	}
-	if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
-		SchemaVersion:   1,
-		FinalizeTimeout: "200ms",
-	}); err != nil {
-		t.Fatalf("writeForkFinalizeRequest: %v", err)
-	}
-
-	shutdownCh := make(chan struct{})
-	metaCli := &blockingFinalizeSessionShutdowner{
-		blockShutdown: true,
-		shutdownCh:    shutdownCh,
-	}
-	v := &vfs.VFS{Conf: &vfs.Config{}}
-
-	origFlushAll := forkFinalizeFlushAll
-	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
-	defer func() {
-		close(shutdownCh)
-		forkFinalizeFlushAll = origFlushAll
-	}()
-
-	done := make(chan error, 1)
-	go func() { done <- runForkFinalizeOnMain(metaCli, v, nil, nil) }()
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatalf("runForkFinalizeOnMain should fail on shutdown timeout")
-		}
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("runForkFinalizeOnMain blocked in shutdown")
-	}
-
-	if metaCli.closeCalls.Load() != 1 {
-		t.Fatalf("CloseSession should be called once, got %d", metaCli.closeCalls.Load())
-	}
-	if metaCli.shutdownCalls.Load() != 1 {
-		t.Fatalf("Shutdown should be called once, got %d", metaCli.shutdownCalls.Load())
-	}
-
-	data, err := os.ReadFile(ackPath)
-	if err != nil {
-		t.Fatalf("ReadFile ack: %v", err)
-	}
-	var ack forkFinalizeAckV1
-	if err := json.Unmarshal(data, &ack); err != nil {
-		t.Fatalf("Unmarshal ack: %v", err)
-	}
-	if ack.Status != "error" {
-		t.Fatalf("unexpected ack status: %+v", ack)
-	}
-	if ack.Phase != "shutdown" {
-		t.Fatalf("unexpected ack phase: %+v", ack)
-	}
-	if !strings.Contains(ack.Error, "timeout after") {
-		t.Fatalf("unexpected ack error: %+v", ack)
-	}
-	if ack.FinishedAt == "" {
-		t.Fatalf("ack should include finished_at: %+v", ack)
-	}
 }

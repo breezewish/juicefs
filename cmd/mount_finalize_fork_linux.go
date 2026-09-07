@@ -98,11 +98,12 @@ func installForkFinalizeHandler(_ meta.Meta, v *vfs.VFS, _ object.ObjectStorage)
 	go func() {
 		for range signalChan {
 			forkMountLifecycle.Lock()
-			if !forkFinalizeInProgress.CompareAndSwap(false, true) {
+			if forkFinalizeInProgress {
 				forkMountLifecycle.Unlock()
 				logger.Infof("Received SIGUSR2 but finalize is already in progress")
 				continue
 			}
+			forkFinalizeInProgress = true
 			if err := writeForkFinalizePendingAckForCurrentProcess(); err != nil {
 				logger.Warnf("finalize: write pending ack: %s", err)
 			}

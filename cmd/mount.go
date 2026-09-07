@@ -761,7 +761,7 @@ func mount(c *cli.Context) error {
 	// the handler and leave a late pending ack over the terminal result.
 	forkMountLifecycle.Lock()
 	defer forkMountLifecycle.Unlock()
-	if forkFinalizeInProgress.Load() {
+	if forkFinalizeInProgress {
 		return runForkFinalizeOnMain(metaCli, v, blob, sliceAllocationStart)
 	}
 	if err := v.FlushAll(""); err != nil {

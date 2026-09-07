@@ -8,9 +8,9 @@ import (
 // forkFinalizeInProgress records an accepted terminal finalize request.
 // It must be defined on all platforms because other code paths may reference it.
 //
-// On Linux, SIGUSR2 sets it under forkMountLifecycle's write lock. It remains
+// Every access is protected by forkMountLifecycle. Once accepted, it remains
 // true until the mount daemon exits after finalizing on the main mount goroutine.
-var forkFinalizeInProgress atomic.Bool
+var forkFinalizeInProgress bool
 
 // forkFlushDrainInProgress indicates whether the fork-only flush-drain handler is running.
 // It is intentionally separate from finalize: flush-drain keeps the mount daemon alive.

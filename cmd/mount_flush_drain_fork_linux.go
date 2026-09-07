@@ -30,7 +30,7 @@ func installForkFlushDrainHandler(v *vfs.VFS) {
 	go func() {
 		for range signalChan {
 			forkMountLifecycle.RLock()
-			if forkFinalizeInProgress.Load() {
+			if forkFinalizeInProgress {
 				forkMountLifecycle.RUnlock()
 				logger.Infof("Received SIGUSR1 but finalize is already in progress")
 				continue
