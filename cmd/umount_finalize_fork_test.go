@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -253,11 +254,18 @@ func TestWaitFinalizeStart_PendingAck(t *testing.T) {
 }
 
 func TestWaitFinalizeAck_PendingEventuallyOk(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("live mount process identity requires Linux /proc")
+	}
+	starttime, err := readProcStatStarttimeTicks(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
 	ackPath := filepath.Join(secureTempDir(t), "ack.json")
 	pending := &forkFinalizeAckV1{
 		SchemaVersion:     1,
-		Pid:               123,
-		PidStarttimeTicks: 456,
+		Pid:               os.Getpid(),
+		PidStarttimeTicks: starttime,
 		Status:            "pending",
 		Phase:             "signal_received",
 	}
@@ -269,20 +277,33 @@ func TestWaitFinalizeAck_PendingEventuallyOk(t *testing.T) {
 		t.Fatalf("WriteFile pending ack: %v", err)
 	}
 
+	published := make(chan error, 1)
+	t.Cleanup(func() {
+		if err := <-published; err != nil {
+			t.Errorf("publish finalize ack: %v", err)
+		}
+	})
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		finalAck := &forkFinalizeAckV1{
 			SchemaVersion:     1,
-			Pid:               123,
-			PidStarttimeTicks: 456,
+			Pid:               pending.Pid,
+			PidStarttimeTicks: pending.PidStarttimeTicks,
 			Status:            "ok",
 			FinishedAt:        time.Now().UTC().Format(time.RFC3339Nano),
 		}
 		finalData, marshalErr := json.Marshal(finalAck)
 		if marshalErr != nil {
+			published <- marshalErr
 			return
 		}
-		_ = os.WriteFile(ackPath, finalData, 0o600)
+		// Match the daemon's atomic publication; truncating the visible ack
+		// would expose partial JSON that the reader correctly rejects.
+		if err := os.WriteFile(ackPath+".next", finalData, 0o600); err != nil {
+			published <- err
+			return
+		}
+		published <- os.Rename(ackPath+".next", ackPath)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -297,11 +318,18 @@ func TestWaitFinalizeAck_PendingEventuallyOk(t *testing.T) {
 }
 
 func TestWaitFinalizeAck_TimeoutReturnsPendingAck(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("live mount process identity requires Linux /proc")
+	}
+	starttime, err := readProcStatStarttimeTicks(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
 	ackPath := filepath.Join(secureTempDir(t), "ack.json")
 	pending := &forkFinalizeAckV1{
 		SchemaVersion:     1,
-		Pid:               123,
-		PidStarttimeTicks: 456,
+		Pid:               os.Getpid(),
+		PidStarttimeTicks: starttime,
 		Status:            "pending",
 		Phase:             "upload_drain",
 	}
@@ -648,6 +676,19 @@ func TestWaitFinalizeAck_DaemonExitedWithoutAck(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exited without finalize ack") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestWaitFinalizeAck_DaemonExitedWithPendingAck(t *testing.T) {
+	ackPath := filepath.Join(secureTempDir(t), "ack.json")
+	if err := os.WriteFile(ackPath, []byte(`{"schema_version":1,"pid":0,"pid_starttime_ticks":1,"status":"pending","phase":"signal_received"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := waitFinalizeAck(ctx, ackPath, 0, 1, uint32(os.Geteuid()))
+	if err == nil || !strings.Contains(err.Error(), "exited without finalize ack") {
+		t.Fatalf("a pending ack cannot keep a dead daemon alive: %v", err)
 	}
 }
 

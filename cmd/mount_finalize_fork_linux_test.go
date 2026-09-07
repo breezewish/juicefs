@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -16,8 +17,54 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
+	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
+
+func TestFinalizeRequestSurvivesUnmountError(t *testing.T) {
+	if os.Getenv("JFS_TEST_FINALIZE_UNMOUNT_ERROR") != "1" {
+		// The handler owns process-wide signals and lifecycle state. Keep it in
+		// a child so this regression test cannot affect any other mount test.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestFinalizeRequestSurvivesUnmountError$")
+		child.Env = append(os.Environ(), "JFS_TEST_FINALIZE_UNMOUNT_ERROR=1")
+		output, err := child.CombinedOutput()
+		if err != nil {
+			t.Fatalf("finalize signal subprocess: %v\n%s", err, output)
+		}
+		return
+	}
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "fusermount"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	pid := os.Getpid()
+	start, err := readProcStatStarttimeTicks(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackPath := forkFinalizeAckPath(pid, start)
+	t.Cleanup(func() { _ = os.Remove(ackPath) })
+	installForkFinalizeHandler(nil, &vfs.VFS{Conf: &vfs.Config{Meta: &meta.Config{MountPoint: "/not-mounted"}}}, nil)
+	if err := syscall.Kill(pid, syscall.SIGUSR2); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = waitFinalizeStart(ctx, ackPath, pid, start, uint32(os.Geteuid()))
+	if !errors.Is(err, errForkFinalizeAckPending) {
+		t.Fatalf("expected accepted finalize request, got %v", err)
+	}
+	// Pending is published while the handler holds this lock. Acquiring it
+	// proves the failing unmount returned and the handler completed its decision.
+	forkMountLifecycle.Lock()
+	defer forkMountLifecycle.Unlock()
+	if !forkFinalizeInProgress.Load() {
+		t.Fatal("an accepted finalize request must not become ordinary mount shutdown after an unmount error")
+	}
+}
 
 type fakeFinalizeChunkStore struct {
 	waitErr   error

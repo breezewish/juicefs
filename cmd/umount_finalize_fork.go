@@ -487,53 +487,46 @@ func waitFinalizeStart(ctx context.Context, ackPath string, expectedPid int, exp
 func waitFinalizeAck(ctx context.Context, ackPath string, expectedPid int, expectedStarttime uint64, expectedUID uint32) (*forkFinalizeAckV1, error) {
 	ticker := time.NewTicker(forkFinalizeObserveInterval)
 	defer ticker.Stop()
+	daemonExited := false
 	for {
+		var ack *forkFinalizeAckV1
 		dirReady, err := finalizeAckDirReady(filepath.Dir(ackPath), expectedUID)
 		if err != nil {
 			return nil, err
 		}
 
 		if dirReady {
-			ack, err := readFinalizeAckFile(ackPath)
+			ack, err = readFinalizeAckFile(ackPath)
 			if err == nil {
 				validateErr := validateFinalizeAck(ack, expectedPid, expectedStarttime)
-				if errors.Is(validateErr, errForkFinalizeAckPending) {
-					goto waitNext
+				if !errors.Is(validateErr, errForkFinalizeAckPending) {
+					return ack, validateErr
 				}
-				return ack, validateErr
 			}
-			if !os.IsNotExist(err) {
+			if err != nil && !os.IsNotExist(err) {
 				return nil, err
 			}
 		}
 
 		if ctx.Err() != nil {
-			// Best-effort read/validate above; timeout/cancellation wins only when ack is still missing.
-			return nil, ctx.Err()
+			// Preserve pending phase evidence, but never treat it as completion.
+			return ack, ctx.Err()
 		}
 
-		// If the daemon is already gone and ack is still missing, fail early (cannot prove finalize).
-		if !processMatches(expectedPid, expectedStarttime) {
-			return nil, fmt.Errorf("mount daemon exited without finalize ack")
+		// A pending ack is not proof of completion, even if the daemon is gone.
+		if daemonExited {
+			return ack, fmt.Errorf("mount daemon exited without finalize ack")
 		}
-	waitNext:
+		if !processMatches(expectedPid, expectedStarttime) {
+			// Death may follow the terminal rename just after our read. Read
+			// once more after observing death before declaring proof missing.
+			daemonExited = true
+			continue
+		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			// Best-effort: return the latest ack even when timing out, so callers can
-			// see which phase got stuck (the mount daemon updates ack.phase as it
-			// progresses).
-			if dirReady, err := finalizeAckDirReady(filepath.Dir(ackPath), expectedUID); err == nil && dirReady {
-				ack, err := readFinalizeAckFile(ackPath)
-				if err == nil {
-					validateErr := validateFinalizeAck(ack, expectedPid, expectedStarttime)
-					if errors.Is(validateErr, errForkFinalizeAckPending) {
-						return ack, ctx.Err()
-					}
-					return ack, validateErr
-				}
-			}
-			return nil, ctx.Err()
+			// One final read through the same validation path before returning.
 		}
 	}
 }

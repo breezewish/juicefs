@@ -27,6 +27,12 @@ func TestWaitFinalizeAck_WaitsForFile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	published := make(chan error, 1)
+	t.Cleanup(func() {
+		if err := <-published; err != nil {
+			t.Errorf("publish finalize ack: %v", err)
+		}
+	})
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		ack := &forkFinalizeAckV1{
@@ -36,8 +42,7 @@ func TestWaitFinalizeAck_WaitsForFile(t *testing.T) {
 			Status:            "ok",
 			FinishedAt:        time.Now().UTC().Format(time.RFC3339Nano),
 		}
-		data, _ := json.Marshal(ack)
-		_ = os.WriteFile(ackPath, data, 0o600)
+		published <- writeForkFinalizeAck(ackPath, ack)
 	}()
 
 	_, err = waitFinalizeAck(ctx, ackPath, pid, starttimeTicks, uint32(os.Geteuid()))

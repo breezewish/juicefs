@@ -5,11 +5,11 @@ import (
 	"sync/atomic"
 )
 
-// forkFinalizeInProgress indicates whether the fork-only finalize handler is running.
+// forkFinalizeInProgress records an accepted terminal finalize request.
 // It must be defined on all platforms because other code paths may reference it.
 //
-// On Linux, it is set to true when receiving SIGUSR2 and remains true until the
-// mount daemon exits (os.Exit in the finalize handler).
+// On Linux, SIGUSR2 sets it under forkMountLifecycle's write lock. It remains
+// true until the mount daemon exits after finalizing on the main mount goroutine.
 var forkFinalizeInProgress atomic.Bool
 
 // forkFlushDrainInProgress indicates whether the fork-only flush-drain handler is running.

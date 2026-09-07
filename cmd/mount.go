@@ -756,6 +756,11 @@ func mount(c *cli.Context) error {
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
 	emitRun9StageTrace("mount_stage3_vfs_ready_end", vfsReadyStart, nil)
 	mountMain(v, c)
+	// Wait for the signal handler's pending ack and any in-flight flush-drain
+	// before closing the filesystem. Otherwise a requester-led unmount can race
+	// the handler and leave a late pending ack over the terminal result.
+	forkMountLifecycle.Lock()
+	defer forkMountLifecycle.Unlock()
 	if forkFinalizeInProgress.Load() {
 		return runForkFinalizeOnMain(metaCli, v, blob, sliceAllocationStart)
 	}
