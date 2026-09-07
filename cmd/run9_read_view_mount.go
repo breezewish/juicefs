@@ -62,13 +62,19 @@ func newRun9MountedReadFilesystem(ctx meta.Context, root *fs.FileSystem, volumes
 	return &run9MountedReadFilesystem{root: root, volumes: volumes}, nil
 }
 
-func (m *run9MountedReadFilesystem) Lstat(ctx meta.Context, name string) (*fs.FileStat, syscall.Errno) {
+// backing selects storage only after the caller resolves guest symlinks.
+func (m *run9MountedReadFilesystem) backing(name string) (*fs.FileSystem, string) {
 	for _, volume := range m.volumes {
 		if name == volume.mount || strings.HasPrefix(name, volume.mount+"/") {
-			return volume.data.Lstat(ctx, run9ReadViewRoot+strings.TrimPrefix(name, volume.mount))
+			return volume.data, run9ReadViewRoot + strings.TrimPrefix(name, volume.mount)
 		}
 	}
-	stat, errno := m.root.Lstat(ctx, name)
+	return m.root, name
+}
+
+func (m *run9MountedReadFilesystem) Lstat(ctx meta.Context, name string) (*fs.FileStat, syscall.Errno) {
+	backing, physical := m.backing(name)
+	stat, errno := backing.Lstat(ctx, physical)
 	for _, volume := range m.volumes {
 		if errno == syscall.ENOENT && strings.HasPrefix(volume.mount, name+"/") {
 			return volume.dataRoot.WithName(path.Base(name)), 0
@@ -78,30 +84,18 @@ func (m *run9MountedReadFilesystem) Lstat(ctx meta.Context, name string) (*fs.Fi
 }
 
 func (m *run9MountedReadFilesystem) Readlink(ctx meta.Context, name string) ([]byte, syscall.Errno) {
-	for _, volume := range m.volumes {
-		if name == volume.mount || strings.HasPrefix(name, volume.mount+"/") {
-			return volume.data.Readlink(ctx, run9ReadViewRoot+strings.TrimPrefix(name, volume.mount))
-		}
-	}
-	return m.root.Readlink(ctx, name)
+	backing, physical := m.backing(name)
+	return backing.Readlink(ctx, physical)
 }
 
 func (m *run9MountedReadFilesystem) Open(ctx meta.Context, name string, flags uint32) (*fs.File, syscall.Errno) {
-	for _, volume := range m.volumes {
-		if name == volume.mount || strings.HasPrefix(name, volume.mount+"/") {
-			return volume.data.Open(ctx, run9ReadViewRoot+strings.TrimPrefix(name, volume.mount), flags)
-		}
-	}
-	return m.root.Open(ctx, name, flags)
+	backing, physical := m.backing(name)
+	return backing.Open(ctx, physical, flags)
 }
 
 func (m *run9MountedReadFilesystem) ReadDirPage(ctx meta.Context, name string, limit int, cursor string) ([]*fs.FileStat, string, syscall.Errno) {
-	for _, volume := range m.volumes {
-		if name == volume.mount || strings.HasPrefix(name, volume.mount+"/") {
-			return volume.data.ReadDirPage(ctx, run9ReadViewRoot+strings.TrimPrefix(name, volume.mount), limit, cursor)
-		}
-	}
-	entries, next, errno := m.root.ReadDirPage(ctx, name, limit, cursor)
+	backing, physical := m.backing(name)
+	entries, next, errno := backing.ReadDirPage(ctx, physical, limit, cursor)
 	children := make(map[string]bool)
 	for _, volume := range m.volumes {
 		if strings.HasPrefix(volume.mount, name+"/") {

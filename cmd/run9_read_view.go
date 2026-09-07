@@ -420,8 +420,10 @@ func serveRun9ReadView(c *cli.Context) error {
 		for _, volume := range mounted.volumes {
 			handler.dataMounts = append(handler.dataMounts, volume.mount)
 		}
-		handler.generation = binary.BigEndian.Uint64(identity.Sum(nil)[:8])
 	}
+	// Generations are local to each Snap. Standalone Volume views must also
+	// bind cursors and validators to their metadata identity, not just its epoch.
+	handler.generation = binary.BigEndian.Uint64(identity.Sum(nil)[:8])
 
 	if err := removeRun9ReadViewSocket(listenPath); err != nil {
 		return err
