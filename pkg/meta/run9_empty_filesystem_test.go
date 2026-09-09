@@ -15,8 +15,8 @@ func TestRun9EmptyFilesystemPersistsDirectoryStatsAndEpoch(t *testing.T) {
 	m, err := newKVMeta("badger", dir, testConfig())
 	require.NoError(t, err)
 	require.NoError(t, m.Init(testFormat(), false))
-	require.NoError(t, InitRun9EmptyFilesystem(m, 7, 1001, 1002))
-	require.ErrorContains(t, InitRun9EmptyFilesystem(m, 8, 1001, 1002), "fresh metadata")
+	require.NoError(t, InitRun9EmptyFilesystem(m, 7, 1001, 1002, nil))
+	require.ErrorContains(t, InitRun9EmptyFilesystem(m, 8, 1001, 1002, nil), "fresh metadata")
 	require.NoError(t, m.Shutdown())
 
 	// Reopen after the SkipWAL close fence: checking only the original client's
@@ -66,17 +66,43 @@ func TestRun9EmptyFilesystemPersistsDirectoryStatsAndEpoch(t *testing.T) {
 	m.FlushSession()
 }
 
+func TestRun9EmptyFilesystemPersistsGuestPermissionsWithoutChangingHostAccess(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newKVMeta("badger", dir, testConfig())
+	require.NoError(t, err)
+	require.NoError(t, m.Init(testFormat(), false))
+	require.NoError(t, InitRun9EmptyFilesystem(m, 7, 1001, 1002, &Run9RootPermissions{UID: 1000, GID: 2000, Mode: 0}))
+	require.NoError(t, m.Shutdown())
+	m, err = newKVMeta("badger", dir, testConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
+	_, err = m.Load(true)
+	require.NoError(t, err)
+	var inode Ino
+	var attr Attr
+	require.Zero(t, m.Lookup(Background(), RootInode, "rootfs", &inode, &attr, false))
+	require.Equal(t, uint32(1001), attr.Uid)
+	require.Equal(t, uint32(1002), attr.Gid)
+	require.Equal(t, uint16(0755), attr.Mode)
+	var value []byte
+	require.Zero(t, m.GetXattr(Background(), inode, "user.containers.override_stat", &value))
+	require.Equal(t, "1000:2000:00", string(value))
+	require.ErrorContains(t, InitRun9EmptyFilesystem(m, 7, 1001, 1002, &Run9RootPermissions{Mode: 0755}), "fresh metadata")
+	require.Zero(t, m.GetXattr(Background(), inode, "user.containers.override_stat", &value))
+	require.Equal(t, "1000:2000:00", string(value))
+}
+
 func TestRun9EmptyFilesystemRejectsUsedMetadataAndInvalidEpoch(t *testing.T) {
 	m, err := newKVMeta("badger", t.TempDir(), testConfig())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
 	require.NoError(t, m.Init(testFormat(), false))
-	require.Error(t, InitRun9EmptyFilesystem(m, 0, 0, 0))
-	require.Error(t, InitRun9EmptyFilesystem(m, uint64(math.MaxInt64>>32)+1, 0, 0))
+	require.Error(t, InitRun9EmptyFilesystem(m, 0, 0, 0, nil))
+	require.Error(t, InitRun9EmptyFilesystem(m, uint64(math.MaxInt64>>32)+1, 0, 0, nil))
 	var inode Ino
 	var attr Attr
 	require.Zero(t, m.Mkdir(Background(), RootInode, "existing", 0755, 0, 0, &inode, &attr))
-	require.ErrorContains(t, InitRun9EmptyFilesystem(m, 7, 0, 0), "fresh metadata")
+	require.ErrorContains(t, InitRun9EmptyFilesystem(m, 7, 0, 0, nil), "fresh metadata")
 	require.Equal(t, syscall.ENOENT, m.Lookup(Background(), RootInode, "rootfs", &inode, &attr, false))
 	m.FlushSession()
 }
@@ -95,7 +121,7 @@ func TestRun9EmptyFilesystemMatchesNativeMkdirAccounting(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, fast.Shutdown()) })
 	require.NoError(t, fast.Init(testFormat(), false))
-	require.NoError(t, InitRun9EmptyFilesystem(fast, 7, 0, 0))
+	require.NoError(t, InitRun9EmptyFilesystem(fast, 7, 0, 0, nil))
 	var fastAttr Attr
 	require.Zero(t, fast.Lookup(Background(), RootInode, "rootfs", &inode, &fastAttr, false))
 	require.Equal(t, nativeAttr.Typ, fastAttr.Typ)

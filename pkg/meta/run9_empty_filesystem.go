@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// Run9RootPermissions is guest metadata for the empty rootfs directory. Host
+// inode ownership stays with the runtime, including when guest mode is 0000.
+type Run9RootPermissions struct {
+	UID, GID uint32
+	Mode     uint32
+}
+
 // InitRun9EmptyFilesystem initializes run9's rootfs directory and allocation
 // fence in a freshly formatted, exclusively owned Badger filesystem. It is not
 // a general mkdir or an existing-volume repair operation. Native encoders keep
@@ -13,7 +20,10 @@ import (
 // directory, counters and directory statistics without a mounted session's
 // deferred accounting. The caller must successfully Shutdown before publishing
 // this filesystem; Badger SkipWAL does not make transaction commit a disk fence.
-func InitRun9EmptyFilesystem(client Meta, epoch uint64, uid, gid uint32) error {
+func InitRun9EmptyFilesystem(client Meta, epoch uint64, uid, gid uint32, guest *Run9RootPermissions) error {
+	if guest != nil && (guest.UID == math.MaxUint32 || guest.GID == math.MaxUint32 || guest.Mode > 07777) {
+		return fmt.Errorf("invalid initial guest rootfs permissions")
+	}
 	m, ok := client.(*kvMeta)
 	if !ok || m.client.name() != "badger" || m.conf.ReadOnly {
 		return fmt.Errorf("empty filesystem initialization requires writable Badger metadata")
@@ -58,6 +68,11 @@ func InitRun9EmptyFilesystem(client Meta, epoch uint64, uid, gid uint32) error {
 		const inode = Ino(2)
 		tx.set(m.inodeKey(RootInode), m.marshal(&parent))
 		tx.set(m.inodeKey(inode), m.marshal(&attr))
+		if guest != nil {
+			// Same encoding as image import and guest chmod/chown. Do not write
+			// guest IDs into host attributes: rootless virtiofs must retain access.
+			tx.set(m.xattrKey(inode, "user.containers.override_stat"), []byte(fmt.Sprintf("%d:%d:0%o", guest.UID, guest.GID, guest.Mode)))
+		}
 		tx.set(m.entryKey(RootInode, "rootfs"), m.packEntry(TypeDirectory, inode))
 		tx.set(m.dirStatKey(inode), m.packDirStat(&dirStat{}))
 		// Directory length is not included in the parent's logical file bytes,

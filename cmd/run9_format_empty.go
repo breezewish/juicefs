@@ -18,14 +18,14 @@ type run9FormatEmptyOutput struct {
 // finishRun9EmptyFormat is the no-mount initialization path. It consumes the
 // existing format client and reports success only after checked metadata close.
 // No VFS, session, writeback worker or data slice has existed in this lifecycle.
-func finishRun9EmptyFormat(m meta.Meta, format *meta.Format, epoch uint64) (err error) {
+func finishRun9EmptyFormat(m meta.Meta, format *meta.Format, epoch uint64, guest *meta.Run9RootPermissions) (err error) {
 	closed := false
 	defer func() {
 		if !closed {
 			err = errors.Join(err, m.Shutdown())
 		}
 	}()
-	if err := meta.InitRun9EmptyFilesystem(m, epoch, uint32(os.Geteuid()), uint32(os.Getegid())); err != nil {
+	if err := meta.InitRun9EmptyFilesystem(m, epoch, uint32(os.Geteuid()), uint32(os.Getegid()), guest); err != nil {
 		return err
 	}
 	var total, available, usedInodes, availableInodes uint64

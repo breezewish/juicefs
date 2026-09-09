@@ -89,6 +89,9 @@ Details: https://juicefs.com/docs/community/quick_start_guide`,
 					Name: "run9-init-empty-epoch", Hidden: true,
 					Usage: "initialize a fresh run9 filesystem without mounting",
 				},
+				&cli.UintFlag{Name: "run9-rootfs-uid", Hidden: true},
+				&cli.UintFlag{Name: "run9-rootfs-gid", Hidden: true},
+				&cli.UintFlag{Name: "run9-rootfs-mode", Hidden: true, Value: 0755},
 				&cli.BoolFlag{
 					Name:  "force",
 					Usage: "overwrite existing format",
@@ -408,6 +411,13 @@ func readKerbConf(file string) string {
 func format(c *cli.Context) error {
 	setup(c, 2)
 	metaURI := c.Args().Get(0)
+	var guest *meta.Run9RootPermissions
+	if c.IsSet("run9-rootfs-uid") || c.IsSet("run9-rootfs-gid") || c.IsSet("run9-rootfs-mode") {
+		if !c.IsSet("run9-init-empty-epoch") || c.Uint("run9-rootfs-uid") >= 0xffffffff || c.Uint("run9-rootfs-gid") >= 0xffffffff || c.Uint("run9-rootfs-mode") > 07777 {
+			return fmt.Errorf("rootfs permissions require empty initialization, valid UID/GID and mode 0000..7777")
+		}
+		guest = &meta.Run9RootPermissions{UID: uint32(c.Uint("run9-rootfs-uid")), GID: uint32(c.Uint("run9-rootfs-gid")), Mode: uint32(c.Uint("run9-rootfs-mode"))}
+	}
 	if c.IsSet("run9-init-empty-epoch") && (!strings.HasPrefix(metaURI, "badger://") || strings.Contains(metaURI, "?") || c.Uint64("run9-init-empty-epoch") == 0) {
 		return fmt.Errorf("empty filesystem initialization requires plain Badger metadata and a positive epoch")
 	}
@@ -610,7 +620,7 @@ func format(c *cli.Context) error {
 		logger.Fatalf("format: %s", err)
 	}
 	if c.IsSet("run9-init-empty-epoch") {
-		return finishRun9EmptyFormat(m, format, c.Uint64("run9-init-empty-epoch"))
+		return finishRun9EmptyFormat(m, format, c.Uint64("run9-init-empty-epoch"), guest)
 	}
 	// Fork divergence: always shutdown meta client after format completes.
 	// This is critical for badger with SkipWAL enabled (memtables must be flushed).

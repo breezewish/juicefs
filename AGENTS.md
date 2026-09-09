@@ -131,6 +131,12 @@ Related files:
 
 ### Badger Close Safely
 
+- Empty run9 format can initialize the new rootfs directory's guest UID/GID and
+  Unix mode in the same metadata transaction as its inode and allocation fence.
+  Guest metadata uses `user.containers.override_stat`; host inode access stays
+  runtime-owned. This is creation-only, never a mount-time chmod/chown policy.
+  Implementation: `cmd/run9_format_empty.go`, `pkg/meta/run9_empty_filesystem.go`.
+
 - Metadata client is explicitly shut down after format via `m.Shutdown()`. It prevents a bug where badger is not properly closed when format exits. As badger is customized without WAL, not closing it properly can cause data corruption as data is still in memtable and not flushed to disk.
 
   TODO: Find a way to ensure memtables are flushed even on fatal/abnormal exits (e.g. `logger.Fatalf` / `os.Exit` bypass defers), so we don't rely on always calling `Shutdown()`.
