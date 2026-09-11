@@ -138,6 +138,11 @@ func (tx *badgerTxn) delete(key []byte) {
 }
 
 type badgerClient struct {
+	// The research physical checkpoint closes and reopens only the database,
+	// keeping the metadata session and FUSE handles alive. Every database user,
+	// including value-log GC, must participate in this lifecycle gate.
+	dbMu      sync.RWMutex
+	dbError   error
 	client    *badger.DB
 	readOnly  bool
 	ticker    *time.Ticker
@@ -164,6 +169,11 @@ func (c *badgerClient) simpleTxn(ctx context.Context, f func(*kvTxn) error, retr
 }
 
 func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) (err error) {
+	c.dbMu.RLock()
+	defer c.dbMu.RUnlock()
+	if c.dbError != nil {
+		return c.dbError
+	}
 	tx := &badgerTxn{c.client.NewTransaction(!c.readOnly), c.client}
 	defer func() { tx.t.Discard() }()
 	defer func() {
@@ -188,6 +198,11 @@ func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int)
 }
 
 func (c *badgerClient) scan(prefix []byte, handler func(key []byte, value []byte) bool) error {
+	c.dbMu.RLock()
+	defer c.dbMu.RUnlock()
+	if c.dbError != nil {
+		return c.dbError
+	}
 	tx := c.client.NewTransaction(false)
 	defer tx.Discard()
 	it := tx.NewIterator(badger.IteratorOptions{
@@ -210,6 +225,11 @@ func (c *badgerClient) scan(prefix []byte, handler func(key []byte, value []byte
 }
 
 func (c *badgerClient) reset(prefix []byte) error {
+	c.dbMu.RLock()
+	defer c.dbMu.RUnlock()
+	if c.dbError != nil {
+		return c.dbError
+	}
 	if prefix == nil {
 		return c.client.DropAll()
 	}
@@ -221,6 +241,12 @@ func (c *badgerClient) close() error {
 		close(c.done)
 		c.ticker.Stop()
 		<-c.gcDone
+		c.dbMu.Lock()
+		defer c.dbMu.Unlock()
+		if c.dbError != nil {
+			c.closeErr = c.dbError
+			return
+		}
 		c.closeErr = c.client.Close()
 	})
 	return c.closeErr
@@ -383,6 +409,9 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	ticker := time.NewTicker(time.Hour)
 	done := make(chan struct{})
 	gcDone := make(chan struct{})
+	wrapped := &badgerClient{
+		client: client, readOnly: opts.readOnly, ticker: ticker, done: done, gcDone: gcDone,
+	}
 	go func() {
 		defer close(gcDone)
 		if opts.readOnly {
@@ -398,7 +427,13 @@ func newBadgerClient(addr string) (tkvClient, error) {
 						return
 					default:
 					}
-					if client.RunValueLogGC(0.7) != nil {
+					wrapped.dbMu.RLock()
+					err := wrapped.dbError
+					if err == nil {
+						err = wrapped.client.RunValueLogGC(0.7)
+					}
+					wrapped.dbMu.RUnlock()
+					if err != nil {
 						break
 					}
 				}
@@ -408,13 +443,7 @@ func newBadgerClient(addr string) (tkvClient, error) {
 		}
 	}()
 
-	return &badgerClient{
-		client:   client,
-		readOnly: opts.readOnly,
-		ticker:   ticker,
-		done:     done,
-		gcDone:   gcDone,
-	}, nil
+	return wrapped, nil
 }
 
 func init() {

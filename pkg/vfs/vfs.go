@@ -803,6 +803,8 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 }
 
 func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err syscall.Errno) {
+	v.checkpointWrites.RLock()
+	defer v.checkpointWrites.RUnlock()
 	size := uint64(len(buf))
 	if ino == controlInode && runtime.GOOS == "darwin" {
 		fh = v.getControlHandle(ctx.Pid())
@@ -1229,14 +1231,19 @@ func (v *VFS) RemoveXattr(ctx Context, ino Ino, name string) (err syscall.Errno)
 var logger = utils.GetLogger("juicefs")
 
 type VFS struct {
-	Conf            *Config
-	Meta            meta.Meta
-	Store           chunk.ChunkStore
-	InvalidateEntry func(parent meta.Ino, name string) syscall.Errno
-	UpdateFormat    func(*meta.Format)
-	reader          DataReader
-	writer          DataWriter
-	cacheFiller     *CacheFiller
+	// Prevent new buffered data between a research checkpoint's upload drain
+	// and fixed metadata view, including host FUSE requests already queued
+	// when the guest VM stops. Metadata-only mutations remain transactional;
+	// native compaction uploads synchronously before publishing references.
+	checkpointWrites sync.RWMutex
+	Conf             *Config
+	Meta             meta.Meta
+	Store            chunk.ChunkStore
+	InvalidateEntry  func(parent meta.Ino, name string) syscall.Errno
+	UpdateFormat     func(*meta.Format)
+	reader           DataReader
+	writer           DataWriter
+	cacheFiller      *CacheFiller
 
 	handles   map[Ino][]*handle
 	handleIno map[uint64]Ino
