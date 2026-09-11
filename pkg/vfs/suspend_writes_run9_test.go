@@ -1,5 +1,3 @@
-//go:build run9_checkpoint_research
-
 package vfs
 
 import (
@@ -11,14 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestResearchCheckpointBarrierSeparatesBufferedWrites(t *testing.T) {
+func TestSuspendWritesSeparatesBufferedWrites(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	defer v.Meta.Shutdown()
 	ctx := NewLogContext(meta.NewContext(10, 0, []uint32{0}))
 	file, fh, status := v.Create(ctx, 1, "checkpoint", 0644, 0, syscall.O_RDWR)
 	require.Zero(t, status)
 	require.Zero(t, v.Write(ctx, file.Inode, []byte("before"), 0, fh))
-	unlock := v.Run9CheckpointWriteBarrier()
+	unlock := v.SuspendWrites()
 	released := false
 	defer func() {
 		if !released {

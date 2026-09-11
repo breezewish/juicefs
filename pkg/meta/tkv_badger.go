@@ -138,7 +138,7 @@ func (tx *badgerTxn) delete(key []byte) {
 }
 
 type badgerClient struct {
-	// The research physical checkpoint closes and reopens only the database,
+	// Metadata capture closes and reopens only the database,
 	// keeping the metadata session and FUSE handles alive. Every database user,
 	// including value-log GC, must participate in this lifecycle gate.
 	dbMu      sync.RWMutex
@@ -197,31 +197,62 @@ func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int)
 	return tx.t.Commit()
 }
 
+// scan releases the database before invoking callbacks. Maintenance callbacks
+// may write through the same client or wait for workers that do: holding an
+// RWMutex read lock there deadlocks as soon as capture queues its write lock.
+// A bounded key page owns copied bytes only. Each page reopens at the last key;
+// callers that require an immutable scan already use a private metadata clone.
 func (c *badgerClient) scan(prefix []byte, handler func(key []byte, value []byte) bool) error {
-	c.dbMu.RLock()
-	defer c.dbMu.RUnlock()
-	if c.dbError != nil {
-		return c.dbError
-	}
-	tx := c.client.NewTransaction(false)
-	defer tx.Discard()
-	it := tx.NewIterator(badger.IteratorOptions{
-		Prefix:         prefix,
-		PrefetchValues: true,
-		PrefetchSize:   10240,
-	})
-	defer it.Close()
-	for it.Rewind(); it.Valid(); it.Next() {
-		item := it.Item()
-		value, err := item.ValueCopy(nil)
+	var cursor []byte
+	for {
+		var keys, values [][]byte
+		err := func() error {
+			c.dbMu.RLock()
+			defer c.dbMu.RUnlock()
+			if c.dbError != nil {
+				return c.dbError
+			}
+			tx := c.client.NewTransaction(false)
+			defer tx.Discard()
+			options := badger.DefaultIteratorOptions
+			options.Prefix = prefix
+			options.PrefetchSize = 64
+			it := tx.NewIterator(options)
+			defer it.Close()
+			if cursor == nil {
+				it.Seek(prefix)
+			} else {
+				it.Seek(cursor)
+				if it.Valid() && bytes.Equal(it.Item().Key(), cursor) {
+					it.Next()
+				}
+			}
+			size := 0
+			for ; it.ValidForPrefix(prefix) && len(keys) < 1024 && size < 4<<20; it.Next() {
+				item := it.Item()
+				value, err := item.ValueCopy(nil)
+				if err != nil {
+					return err
+				}
+				key := item.KeyCopy(nil)
+				keys, values = append(keys, key), append(values, value)
+				size += len(key) + len(value)
+			}
+			return nil
+		}()
 		if err != nil {
 			return err
 		}
-		if !handler(item.KeyCopy(nil), value) {
-			break
+		if len(keys) == 0 {
+			return nil
+		}
+		cursor = keys[len(keys)-1]
+		for i, key := range keys {
+			if !handler(key, values[i]) {
+				return nil
+			}
 		}
 	}
-	return nil
 }
 
 func (c *badgerClient) reset(prefix []byte) error {
@@ -248,6 +279,7 @@ func (c *badgerClient) close() error {
 			return
 		}
 		c.closeErr = c.client.Close()
+		c.dbError = badger.ErrDBClosed
 	})
 	return c.closeErr
 }

@@ -1,5 +1,3 @@
-//go:build run9_checkpoint_research
-
 package chunk
 
 import (
@@ -14,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCheckpointUploadFenceWaitsForPUTResearch(t *testing.T) {
+func TestPendingUploadsRequireSuccessfulPUT(t *testing.T) {
 	backend, err := object.CreateStorage("mem", "", "", "", "")
 	require.NoError(t, err)
 	storage := &cleanCacheUploadStorage{ObjectStorage: backend, entered: make(chan struct{}, 1), release: make(chan struct{})}
@@ -30,7 +28,7 @@ func TestCheckpointUploadFenceWaitsForPUTResearch(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, writer.Finish(len(payload)))
 	<-storage.entered
-	fence := store.Run9CaptureUploads()
+	fence := store.CaptureUploads()
 	require.Equal(t, 1, fence.Blocks)
 	deadline, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
@@ -50,21 +48,21 @@ func TestCheckpointUploadFenceWaitsForPUTResearch(t *testing.T) {
 	require.Equal(t, payload, body)
 }
 
-func TestCheckpointUploadFenceResearch(t *testing.T) {
+func TestPendingUploadsExcludeLaterWrites(t *testing.T) {
 	store := &cachedStore{}
-	store.researchUploads.start("captured", 1024)
-	fence := store.Run9CaptureUploads()
+	store.uploads.start("captured", 1024)
+	fence := store.CaptureUploads()
 	require.Equal(t, 1, fence.Blocks)
 	require.Equal(t, int64(1024), fence.Bytes)
-	store.researchUploads.start("parent-later", 2048)
+	store.uploads.start("parent-later", 2048)
 	deadline, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	require.ErrorIs(t, fence.Wait(deadline), context.DeadlineExceeded)
-	store.researchUploads.complete("captured")
+	store.uploads.complete("captured")
 	require.NoError(t, fence.Wait(context.Background()))
-	later := store.Run9CaptureUploads()
+	later := store.CaptureUploads()
 	require.Equal(t, int64(2048), later.Bytes, "a completed snapshot must not wait for later parent writes")
-	store.researchUploads.abandon("parent-later")
+	store.uploads.abandon("parent-later")
 	require.ErrorContains(t, later.Wait(context.Background()), "abandoned")
-	require.Zero(t, store.Run9CaptureUploads().Blocks)
+	require.Zero(t, store.CaptureUploads().Blocks)
 }

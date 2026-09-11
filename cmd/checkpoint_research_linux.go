@@ -91,7 +91,7 @@ func installResearchCheckpoint(v *vfs.VFS, allocationStart *uint64) (func(), err
 				}
 				defer forkFlushDrainInProgress.Store(false)
 				start := time.Now()
-				unlockWrites := v.Run9CheckpointWriteBarrier()
+				unlockWrites := v.SuspendWrites()
 				writesLocked := true
 				defer func() {
 					if writesLocked {
@@ -107,9 +107,9 @@ func installResearchCheckpoint(v *vfs.VFS, allocationStart *uint64) (func(), err
 					reportError(fmt.Errorf("missing upload drain"))
 					return
 				}
-				var uploads *chunk.Run9UploadFence
+				var uploads *chunk.PendingUploads
 				if request.Strategy == "checkpoint-async" || request.Strategy == "logical-async" || request.Strategy == "physical-async" {
-					uploads = v.Store.(interface{ Run9CaptureUploads() *chunk.Run9UploadFence }).Run9CaptureUploads()
+					uploads = v.Store.(interface{ CaptureUploads() *chunk.PendingUploads }).CaptureUploads()
 				} else {
 					if err := drainer.WaitForUploadDrain(ctx); err != nil {
 						reportError(err)
@@ -143,7 +143,7 @@ func installResearchCheckpoint(v *vfs.VFS, allocationStart *uint64) (func(), err
 						return
 					}
 				}
-				remaining := v.Store.(interface{ Run9CaptureUploads() *chunk.Run9UploadFence }).Run9CaptureUploads()
+				remaining := v.Store.(interface{ CaptureUploads() *chunk.PendingUploads }).CaptureUploads()
 				_ = encoder.Encode(map[string]any{"phase": "complete", "result": out, "uploads": uploads, "remaining_uploads": remaining, "flush_ms": flushMS, "total_ms": float64(time.Since(start).Microseconds()) / 1000})
 			}()
 		}
