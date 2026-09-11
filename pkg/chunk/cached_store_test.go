@@ -204,6 +204,8 @@ func TestUploadStagingFile_FallsBackToCacheCopyWhenStageMissing(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf
 	conf.Writeback = true
+	// Exercise explicit recovery before any background upload can consume staging.
+	conf.UploadDelay = time.Hour
 	conf.CacheDir = t.TempDir()
 	store := NewCachedStore(mem, conf, nil).(*cachedStore)
 
@@ -212,7 +214,7 @@ func TestUploadStagingFile_FallsBackToCacheCopyWhenStageMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stage block: %v", err)
 	}
-	store.pendingKeys[key] = &pendingItem{key: key, fpath: stagingPath}
+	store.addDelayedStaging(key, stagingPath, time.Now(), false)
 	if err := os.Remove(stagingPath); err != nil {
 		t.Fatalf("remove staging path: %v", err)
 	}
@@ -240,6 +242,8 @@ func TestUploadStagingFile_FallsBackToChecksummedCacheCopyWhenStageMissing(t *te
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf
 	conf.Writeback = true
+	// Exercise explicit recovery before any background upload can consume staging.
+	conf.UploadDelay = time.Hour
 	conf.CacheDir = t.TempDir()
 	conf.CacheChecksum = CsFull
 	store := NewCachedStore(mem, conf, nil).(*cachedStore)
@@ -249,7 +253,7 @@ func TestUploadStagingFile_FallsBackToChecksummedCacheCopyWhenStageMissing(t *te
 	if err != nil {
 		t.Fatalf("stage block: %v", err)
 	}
-	store.pendingKeys[key] = &pendingItem{key: key, fpath: stagingPath}
+	store.addDelayedStaging(key, stagingPath, time.Now(), false)
 	if err := os.Remove(stagingPath); err != nil {
 		t.Fatalf("remove staging path: %v", err)
 	}

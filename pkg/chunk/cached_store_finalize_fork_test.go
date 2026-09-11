@@ -213,11 +213,7 @@ func TestWaitForUploadDrain_QueuesRecoverablePendingUpload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stage block: %v", err)
 	}
-	store.pendingKeys[key] = &pendingItem{
-		key:   key,
-		fpath: stagingPath,
-		ts:    time.Now(),
-	}
+	store.addDelayedStaging(key, stagingPath, time.Now(), false)
 	if err := os.Remove(stagingPath); err != nil {
 		t.Fatalf("remove staging path: %v", err)
 	}
@@ -267,11 +263,7 @@ func TestWaitForUploadDrain_RecoversPendingUploadWhenCacheIndexMissesHardlink(t 
 	cacheStore.scanned = true
 	cacheStore.Unlock()
 
-	store.pendingKeys[key] = &pendingItem{
-		key:   key,
-		fpath: stagingPath,
-		ts:    time.Now(),
-	}
+	store.addDelayedStaging(key, stagingPath, time.Now(), false)
 	if err := os.Remove(stagingPath); err != nil {
 		t.Fatalf("remove staging path: %v", err)
 	}
@@ -309,18 +301,14 @@ func TestWaitForUploadDrain_RemovesStalePendingWhenObjectAlreadyStored(t *testin
 	if err := mem.Put(ctx, key, bytes.NewReader([]byte("good"))); err != nil {
 		t.Fatalf("put remote object: %v", err)
 	}
-	store.pendingKeys[key] = &pendingItem{
-		key:   key,
-		fpath: filepath.Join(t.TempDir(), "missing"),
-		ts:    time.Now(),
-	}
+	store.addDelayedStaging(key, filepath.Join(t.TempDir(), "missing"), time.Now(), false)
 
 	waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	if err := store.WaitForUploadDrain(waitCtx); err != nil {
 		t.Fatalf("WaitForUploadDrain should remove stale pending when remote object is already stored, got %v", err)
 	}
-	if _, ok := store.pendingKeys[key]; ok {
+	if store.isPendingValid(key) {
 		t.Fatalf("pending key %s should be removed after remote object proof", key)
 	}
 }
