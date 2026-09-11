@@ -12,7 +12,7 @@ import (
 )
 
 func TestResearchCheckpointKeepsOneViewWhileSourceChanges(t *testing.T) {
-	for _, strategy := range []string{"physical", "logical", "logical-blocking"} {
+	for _, strategy := range []string{"physical", "physical-async", "logical", "logical-blocking"} {
 		t.Run(strategy, func(t *testing.T) {
 			conf := testConfig()
 			conf.NoBGJob = true

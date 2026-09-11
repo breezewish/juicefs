@@ -33,6 +33,8 @@ type Run9CheckpointResult struct {
 	Counter   uint64  `json:"counter"`
 	CaptureMS float64 `json:"capture_ms"`
 	ExportMS  float64 `json:"export_ms"`
+	CloseMS   float64 `json:"close_ms,omitempty"`
+	ReopenMS  float64 `json:"reopen_ms,omitempty"`
 	Entries   int64   `json:"entries"`
 	Bytes     int64   `json:"bytes"`
 	Files     int     `json:"files"`
@@ -56,11 +58,11 @@ func (m *kvMeta) Run9Checkpoint(ctx context.Context, opts Run9CheckpointOptions,
 	if _, err := os.Lstat(opts.Directory); !os.IsNotExist(err) {
 		return out, fmt.Errorf("checkpoint destination must not exist: %v", err)
 	}
-	if opts.Strategy != "physical" && opts.Strategy != "logical" && opts.Strategy != "logical-async" && opts.Strategy != "logical-blocking" && opts.Strategy != "checkpoint" && opts.Strategy != "checkpoint-async" {
+	if opts.Strategy != "physical" && opts.Strategy != "physical-async" && opts.Strategy != "logical" && opts.Strategy != "logical-async" && opts.Strategy != "logical-blocking" && opts.Strategy != "checkpoint" && opts.Strategy != "checkpoint-async" {
 		return out, fmt.Errorf("unknown checkpoint strategy %q", opts.Strategy)
 	}
 	start := time.Now()
-	if opts.Strategy == "physical" || opts.Strategy == "checkpoint" || opts.Strategy == "checkpoint-async" {
+	if opts.Strategy == "physical" || opts.Strategy == "physical-async" || opts.Strategy == "checkpoint" || opts.Strategy == "checkpoint-async" {
 		out, resultErr = c.checkpointPhysical(ctx, opts)
 		if resultErr != nil {
 			return out, resultErr
@@ -185,7 +187,7 @@ func (c *badgerClient) checkpointPhysical(ctx context.Context, opts Run9Checkpoi
 	}
 	out.Counter = counter
 	dbOptions := c.client.Opts()
-	if opts.Strategy != "physical" {
+	if opts.Strategy == "checkpoint" || opts.Strategy == "checkpoint-async" {
 		err := c.client.WithFileCheckpoint(ctx, func() error {
 			if opts.FailPhase == "after_flush" {
 				return fmt.Errorf("injected failure after flush")
@@ -194,14 +196,30 @@ func (c *badgerClient) checkpointPhysical(ctx context.Context, opts Run9Checkpoi
 		})
 		return out, err
 	}
-	if err := c.client.Close(); err != nil {
+	closeStart := time.Now()
+	err = c.client.Close()
+	out.CloseMS = float64(time.Since(closeStart).Microseconds()) / 1000
+	if err != nil {
 		c.dbError = fmt.Errorf("physical checkpoint close failed: %w", err)
 		return out, c.dbError
 	}
 	// Reopen even when cloning or cancellation fails. This restores the same
 	// metadata session's database; it does not reset allocation counters.
 	defer func() {
+		if opts.FailPhase == "during_reopen" {
+			// A regular file cannot be a database directory. Exercise a real
+			// Open error without damaging the original metadata files.
+			dbOptions.Dir = filepath.Join(dbOptions.Dir, "MANIFEST")
+		}
+		if opts.FailPhase == "reopen_value_directory" {
+			// Badger's discard-stats initialization exits the process on some
+			// I/O errors instead of returning them from Open. Subprocess tests
+			// must cover this separate source-loss boundary.
+			dbOptions.ValueDir = filepath.Join(dbOptions.Dir, "MANIFEST")
+		}
+		reopenStart := time.Now()
 		db, err := badger.Open(dbOptions)
+		out.ReopenMS = float64(time.Since(reopenStart).Microseconds()) / 1000
 		if err != nil {
 			c.dbError = fmt.Errorf("physical checkpoint reopen failed: %w", err)
 			resultErr = errors.Join(resultErr, c.dbError)
@@ -222,6 +240,15 @@ func cloneCheckpointMetadata(ctx context.Context, source string, opts Run9Checkp
 	}
 	if err := os.Mkdir(opts.Directory, 0700); err != nil {
 		return err
+	}
+	if opts.ExportDelayMS > 0 {
+		timer := time.NewTimer(time.Duration(opts.ExportDelayMS) * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 	entries, err := os.ReadDir(source)
 	if err != nil {

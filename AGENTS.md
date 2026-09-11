@@ -27,6 +27,12 @@ Related files:
 
 ### Badger
 
+- Research builds support closing only Badger, cloning its stable files, and
+  reopening it inside the existing metadata session. The `physical-async`
+  experiment combines this with a fixed upload fence; FUSE and the uploader
+  remain alive. All DB users share the access gate, and reopen errors poison
+  that client instead of acknowledging a usable snapshot.
+
 - Accept `badger://path?nextchunk=<n>` as the metadata address. Only the query param `nextchunk` is supported. When `nextchunk` is set, it overrides the value of `CnextChunk`. Overriding `CnextChunk` is the core of ensuring forked metadata will not conflict with the original metadata when both are mounted. `nextchunk` is allowed to be set to any value. The caller is responsible for ensuring the value is properly set to avoid conflicts. If `nextchunk` is not set, it means nextchunk will not be overridden (upstream original behavior is preserved).
 
 - When `nextchunk` is set, run9 also writes `Crun9NextChunkLimit` and rejects `NewSlice` after that writable epoch range is exhausted. This keeps one prepared metadata lineage inside one owned slice-id epoch range.

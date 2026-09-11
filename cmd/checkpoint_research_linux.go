@@ -108,7 +108,7 @@ func installResearchCheckpoint(v *vfs.VFS, allocationStart *uint64) (func(), err
 					return
 				}
 				var uploads *chunk.Run9UploadFence
-				if request.Strategy == "checkpoint-async" || request.Strategy == "logical-async" {
+				if request.Strategy == "checkpoint-async" || request.Strategy == "logical-async" || request.Strategy == "physical-async" {
 					uploads = v.Store.(interface{ Run9CaptureUploads() *chunk.Run9UploadFence }).Run9CaptureUploads()
 				} else {
 					if err := drainer.WaitForUploadDrain(ctx); err != nil {
