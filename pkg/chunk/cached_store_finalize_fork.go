@@ -156,6 +156,7 @@ func (store *cachedStore) pendingBlockRecoveryError(ctx context.Context, key, st
 	block, err := store.loadPendingBlockForUpload(key, stagingPath, blen)
 	if err != nil {
 		if err == errNotCached && store.pendingObjectAlreadyStored(ctx, key, blen) == nil {
+			store.uploads.complete(key)
 			store.removePending(key)
 			return nil
 		}

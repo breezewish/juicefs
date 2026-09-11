@@ -1173,6 +1173,7 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	if err != nil {
 		if store.isPendingValid(key) {
 			if err == errNotCached && store.pendingObjectAlreadyStored(context.TODO(), key, blen) == nil {
+				store.uploads.complete(key)
 				store.removePending(key)
 				return
 			}

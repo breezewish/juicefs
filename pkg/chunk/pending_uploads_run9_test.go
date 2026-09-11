@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -64,5 +65,40 @@ func TestPendingUploadsExcludeLaterWrites(t *testing.T) {
 	require.Equal(t, int64(2048), later.Bytes, "a completed snapshot must not wait for later parent writes")
 	store.uploads.abandon("parent-later")
 	require.ErrorContains(t, later.Wait(context.Background()), "abandoned")
+	require.Zero(t, store.CaptureUploads().Blocks)
+}
+
+func TestPendingUploadsCompleteAfterRemoteRecovery(t *testing.T) {
+	backend, err := object.CreateStorage("mem", "", "", "", "")
+	require.NoError(t, err)
+	conf := defaultConf
+	conf.CacheDir, conf.Writeback, conf.UploadDelay = t.TempDir(), true, time.Hour
+	store := NewCachedStore(backend, conf, nil).(*cachedStore)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	missing := filepath.Join(t.TempDir(), "missing")
+
+	// Finalize can prove that a missing staged object was already uploaded.
+	first := "chunks/0/0/123_0_4"
+	require.NoError(t, backend.Put(ctx, first, bytes.NewReader([]byte("good"))))
+	store.pendingMutex.Lock()
+	store.pendingKeys[first] = &pendingItem{key: first, fpath: missing, ts: time.Now()}
+	store.pendingMutex.Unlock()
+	store.uploads.start(first, 4)
+	captured := store.CaptureUploads()
+	require.NoError(t, store.pendingBlockRecoveryError(ctx, first, missing))
+	require.NoError(t, captured.Wait(ctx))
+	require.Zero(t, store.CaptureUploads().Blocks)
+
+	// The ordinary background uploader has the same recovery path.
+	second := "chunks/0/0/124_0_4"
+	require.NoError(t, backend.Put(ctx, second, bytes.NewReader([]byte("good"))))
+	store.pendingMutex.Lock()
+	store.pendingKeys[second] = &pendingItem{key: second, fpath: missing, ts: time.Now()}
+	store.pendingMutex.Unlock()
+	store.uploads.start(second, 4)
+	captured = store.CaptureUploads()
+	store.uploadStagingFile(second, missing)
+	require.NoError(t, captured.Wait(ctx))
 	require.Zero(t, store.CaptureUploads().Blocks)
 }
