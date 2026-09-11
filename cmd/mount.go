@@ -756,11 +756,6 @@ func mount(c *cli.Context) error {
 		return fmt.Errorf("install metadata capture: %w", err)
 	}
 	defer stopCapture()
-	stopCheckpoint, err := installResearchCheckpoint(v, sliceAllocationStart)
-	if err != nil {
-		return fmt.Errorf("install research checkpoint: %w", err)
-	}
-	defer stopCheckpoint()
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)

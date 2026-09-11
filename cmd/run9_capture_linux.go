@@ -73,14 +73,10 @@ func installRun9Capture(v *vfs.VFS, allocationStart *uint64) (func(), error) {
 				defer handlers.Done()
 				defer conn.Close()
 				encoder := json.NewEncoder(conn)
-				if err := serveRun9Capture(ctx, conn, encoder, v, allocationStart); err != nil {
-					if errors.Is(err, meta.ErrRun9MetadataUnavailable) {
-						_ = encoder.Encode(run9CaptureResponse{Phase: "error", Code: "source_unavailable", Error: err.Error()})
-						// Source recovery failed. Exit without finalize or GC
-						// authorization and let the existing mount-loss path converge.
-						logger.Fatalf("online capture lost source metadata: %s", err)
-					}
-					_ = encoder.Encode(run9CaptureResponse{Phase: "error", Error: err.Error()})
+				if err := serveRun9Capture(ctx, conn, encoder, v, allocationStart); errors.Is(err, meta.ErrRun9MetadataUnavailable) {
+					// Source recovery failed. Exit without finalize or GC
+					// authorization and let the existing mount-loss path converge.
+					logger.Fatalf("online capture lost source metadata: %s", err)
 				}
 			}()
 		}
@@ -93,7 +89,27 @@ func installRun9Capture(v *vfs.VFS, allocationStart *uint64) (func(), error) {
 	}, nil
 }
 
-func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encoder, v *vfs.VFS, allocationStart *uint64) error {
+func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encoder, v *vfs.VFS, allocationStart *uint64) (resultErr error) {
+	var cancel context.CancelFunc
+	var readerDone chan struct{}
+	defer func() {
+		// Send the outcome before cancellation closes the socket. This also
+		// covers malformed requests before the cancellation reader is started.
+		if resultErr != nil {
+			response := run9CaptureResponse{Phase: "error", Error: resultErr.Error()}
+			if errors.Is(resultErr, meta.ErrRun9MetadataUnavailable) {
+				response.Code = "source_unavailable"
+			}
+			_ = encoder.Encode(response)
+		}
+		if cancel != nil {
+			cancel()
+		}
+		_ = conn.Close()
+		if readerDone != nil {
+			<-readerDone
+		}
+	}()
 	// Bound idle clients, including one that connects but never sends a request.
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	var request run9CaptureRequest
@@ -105,17 +121,16 @@ func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encod
 		return fmt.Errorf("capture deadline must be within 30 minutes")
 	}
 	_ = conn.SetDeadline(deadline)
-	ctx, cancel := context.WithDeadline(parent, deadline)
-	defer cancel()
+	ctx, cancelRequest := context.WithDeadline(parent, deadline)
+	cancel = cancelRequest
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
-	readerDone := make(chan struct{})
+	readerDone = make(chan struct{})
 	go func() {
 		defer close(readerDone)
 		_, _ = io.Copy(io.Discard, conn)
 		cancel()
 	}()
-	defer func() { _ = conn.Close(); <-readerDone }()
 	// Finalize holds the write side. TryRLock avoids admitting a new handler
 	// behind shutdown, whose final cleanup also joins these handlers.
 	if !forkMountLifecycle.TryRLock() {
