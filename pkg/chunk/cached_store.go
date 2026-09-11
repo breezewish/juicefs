@@ -237,6 +237,7 @@ func (s *rSlice) Remove() error {
 		// there could be multiple clients try to remove the same chunk in the same time,
 		// any of them should succeed if any blocks is removed
 		key := s.key(i)
+		s.store.researchUploads.abandon(key)
 		s.store.removePending(key)
 		s.store.bcache.remove(key, true)
 	}
@@ -443,6 +444,9 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	if err == nil && cacheUploaded {
 		store.cacheBlock(key, block, false, false)
 	}
+	if err == nil {
+		store.researchUploads.complete(key)
+	}
 	return err
 }
 
@@ -488,6 +492,7 @@ func (s *wSlice) upload(indx int) {
 					logger.Warnf("write %s to disk: %s, upload it directly", key, err)
 				}
 			} else {
+				s.store.researchUploads.start(key, blen)
 				s.errors <- nil
 				if s.store.conf.UploadDelay == 0 && s.store.canUpload() {
 					select {
@@ -736,6 +741,7 @@ type cachedStore struct {
 	pendingCh       chan *pendingItem
 	pendingKeys     map[string]*pendingItem
 	pendingMutex    sync.Mutex
+	researchUploads researchUploadTracker
 	startHour       int
 	endHour         int
 	compressor      compress.Compressor

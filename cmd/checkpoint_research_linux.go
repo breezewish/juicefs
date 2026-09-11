@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
@@ -26,6 +27,9 @@ func installResearchCheckpoint(v *vfs.VFS, allocationStart *uint64) (func(), err
 	})
 	if !ok || allocationStart == nil {
 		return func() {}, nil
+	}
+	if os.Getenv("RUN9_RESEARCH_STAGE_ALL") == "1" {
+		v.Store.(interface{ Run9StageAllWrites() }).Run9StageAllWrites()
 	}
 	if raw := os.Getenv("RUN9_RESEARCH_UPLOAD_LIMIT_MBPS"); raw != "" {
 		limit, err := strconv.ParseInt(raw, 10, 64)
@@ -103,9 +107,14 @@ func installResearchCheckpoint(v *vfs.VFS, allocationStart *uint64) (func(), err
 					reportError(fmt.Errorf("missing upload drain"))
 					return
 				}
-				if err := drainer.WaitForUploadDrain(ctx); err != nil {
-					reportError(err)
-					return
+				var uploads *chunk.Run9UploadFence
+				if request.Strategy == "checkpoint-async" || request.Strategy == "logical-async" {
+					uploads = v.Store.(interface{ Run9CaptureUploads() *chunk.Run9UploadFence }).Run9CaptureUploads()
+				} else {
+					if err := drainer.WaitForUploadDrain(ctx); err != nil {
+						reportError(err)
+						return
+					}
 				}
 				v.Meta.FlushSession()
 				flushMS := float64(time.Since(start).Microseconds()) / 1000
@@ -122,13 +131,20 @@ func installResearchCheckpoint(v *vfs.VFS, allocationStart *uint64) (func(), err
 					}
 					unlockWrites()
 					writesLocked = false
-					return encoder.Encode(map[string]any{"phase": "captured", "counter": counter, "flush_ms": flushMS})
+					return encoder.Encode(map[string]any{"phase": "captured", "counter": counter, "flush_ms": flushMS, "uploads": uploads})
 				})
 				if err != nil {
 					reportError(err)
 					return
 				}
-				_ = encoder.Encode(map[string]any{"phase": "complete", "result": out, "flush_ms": flushMS, "total_ms": float64(time.Since(start).Microseconds()) / 1000})
+				if uploads != nil {
+					if err := uploads.Wait(ctx); err != nil {
+						reportError(err)
+						return
+					}
+				}
+				remaining := v.Store.(interface{ Run9CaptureUploads() *chunk.Run9UploadFence }).Run9CaptureUploads()
+				_ = encoder.Encode(map[string]any{"phase": "complete", "result": out, "uploads": uploads, "remaining_uploads": remaining, "flush_ms": flushMS, "total_ms": float64(time.Since(start).Microseconds()) / 1000})
 			}()
 		}
 	}()

@@ -18,8 +18,9 @@ import (
 
 // Run9CheckpointOptions selects an experimental owner-local snapshot mechanism.
 // This API is compiled only for research binaries; callers must block new
-// buffered data writes and drain uploads before entering it. The captured
-// callback releases that barrier after protecting shared slices from GC.
+// buffered writes and finish their immutable data slices before entering it.
+// Either drain their uploads first or retain an upload fence until publication.
+// The captured callback releases the barrier after protecting slices from GC.
 type Run9CheckpointOptions struct {
 	Directory     string `json:"directory"`
 	Strategy      string `json:"strategy"`
@@ -55,11 +56,11 @@ func (m *kvMeta) Run9Checkpoint(ctx context.Context, opts Run9CheckpointOptions,
 	if _, err := os.Lstat(opts.Directory); !os.IsNotExist(err) {
 		return out, fmt.Errorf("checkpoint destination must not exist: %v", err)
 	}
-	if opts.Strategy != "physical" && opts.Strategy != "logical" && opts.Strategy != "logical-blocking" {
+	if opts.Strategy != "physical" && opts.Strategy != "logical" && opts.Strategy != "logical-async" && opts.Strategy != "logical-blocking" && opts.Strategy != "checkpoint" && opts.Strategy != "checkpoint-async" {
 		return out, fmt.Errorf("unknown checkpoint strategy %q", opts.Strategy)
 	}
 	start := time.Now()
-	if opts.Strategy == "physical" {
+	if opts.Strategy == "physical" || opts.Strategy == "checkpoint" || opts.Strategy == "checkpoint-async" {
 		out, resultErr = c.checkpointPhysical(ctx, opts)
 		if resultErr != nil {
 			return out, resultErr
@@ -110,7 +111,7 @@ func (c *badgerClient) checkpointLogical(ctx context.Context, opts Run9Checkpoin
 	}
 	out.Counter = counter
 	out.CaptureMS = float64(time.Since(start).Microseconds()) / 1000
-	if opts.Strategy == "logical" {
+	if opts.Strategy == "logical" || opts.Strategy == "logical-async" {
 		if err := captured(counter); err != nil {
 			return out, err
 		}
@@ -184,6 +185,15 @@ func (c *badgerClient) checkpointPhysical(ctx context.Context, opts Run9Checkpoi
 	}
 	out.Counter = counter
 	dbOptions := c.client.Opts()
+	if opts.Strategy != "physical" {
+		err := c.client.WithFileCheckpoint(ctx, func() error {
+			if opts.FailPhase == "after_flush" {
+				return fmt.Errorf("injected failure after flush")
+			}
+			return cloneCheckpointMetadata(ctx, dbOptions.Dir, opts, &out)
+		})
+		return out, err
+	}
 	if err := c.client.Close(); err != nil {
 		c.dbError = fmt.Errorf("physical checkpoint close failed: %w", err)
 		return out, c.dbError
@@ -202,20 +212,25 @@ func (c *badgerClient) checkpointPhysical(ctx context.Context, opts Run9Checkpoi
 	if opts.FailPhase == "after_close" {
 		return out, fmt.Errorf("injected failure after close")
 	}
+	err = cloneCheckpointMetadata(ctx, dbOptions.Dir, opts, &out)
+	return out, err
+}
+
+func cloneCheckpointMetadata(ctx context.Context, source string, opts Run9CheckpointOptions, out *Run9CheckpointResult) error {
 	if err := ctx.Err(); err != nil {
-		return out, err
+		return err
 	}
 	if err := os.Mkdir(opts.Directory, 0700); err != nil {
-		return out, err
+		return err
 	}
-	entries, err := os.ReadDir(dbOptions.Dir)
+	entries, err := os.ReadDir(source)
 	if err != nil {
-		return out, err
+		return err
 	}
 	start := time.Now()
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() {
-			return out, fmt.Errorf("non-file metadata entry %s", entry.Name())
+			return fmt.Errorf("non-file metadata entry %s", entry.Name())
 		}
 	}
 	// Match run9rt's existing offline clone concurrency for a fair comparison.
@@ -227,20 +242,20 @@ func (c *badgerClient) checkpointPhysical(ctx context.Context, opts Run9Checkpoi
 			if opts.FailPhase == "during_copy" && index == 1 {
 				return fmt.Errorf("injected failure during copy")
 			}
-			size, err := checkpointCloneFile(copyCtx, filepath.Join(dbOptions.Dir, entry.Name()), filepath.Join(opts.Directory, entry.Name()))
+			size, err := checkpointCloneFile(copyCtx, filepath.Join(source, entry.Name()), filepath.Join(opts.Directory, entry.Name()))
 			sizes[index] = size
 			return err
 		})
 	}
 	if err := group.Wait(); err != nil {
-		return out, err
+		return err
 	}
 	out.Files = len(entries)
 	for _, size := range sizes {
 		out.Bytes += size
 	}
 	out.ExportMS = float64(time.Since(start).Microseconds()) / 1000
-	return out, nil
+	return nil
 }
 
 func checkpointCounter(txn *badger.Txn) (uint64, error) {
