@@ -143,12 +143,12 @@ func GetLogger(name string) *logHandle {
 	return logger
 }
 
-// SetLogLevel sets Level to all the loggers in the map
+// SetLogLevel updates all registered loggers safely alongside background logging.
 func SetLogLevel(lvl logrus.Level) {
 	mu.Lock()
 	defer mu.Unlock()
 	for _, logger := range loggers {
-		logger.Level = lvl
+		logger.SetLevel(lvl)
 	}
 }
 

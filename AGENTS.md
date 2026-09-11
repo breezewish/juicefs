@@ -83,6 +83,10 @@ Related files:
 - `pkg/meta/tkv_test.go`
 - `pkg/meta/load_dump_test.go`
 
+### Concurrent log level changes
+
+- `SetLogLevel` uses Logrus's atomic setter so command initialization does not race with background logging. Covered by `pkg/utils/logger_test.go` under the race detector.
+
 ### Usage reporting disabled by default
 
 - Usage reporting is always disabled by default.

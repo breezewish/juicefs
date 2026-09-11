@@ -59,6 +59,24 @@ func TestLogger(t *testing.T) {
 	}
 }
 
+func TestSetLogLevelDuringLogging(t *testing.T) {
+	logger := GetLogger(t.Name())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			logger.Debug("filtered message")
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		SetLogLevel(logrus.WarnLevel)
+	}
+	<-done
+	if logger.GetLevel() != logrus.WarnLevel {
+		t.Fatal("logger did not receive the updated level")
+	}
+}
+
 func TestMethodName(t *testing.T) {
 	type args struct {
 		fullFuncName string
