@@ -138,6 +138,11 @@ func (tx *badgerTxn) delete(key []byte) {
 }
 
 type badgerClient struct {
+	// Metadata capture closes and reopens only the database,
+	// keeping the metadata session and FUSE handles alive. Every database user,
+	// including value-log GC, must participate in this lifecycle gate.
+	dbMu      sync.RWMutex
+	dbError   error
 	client    *badger.DB
 	readOnly  bool
 	ticker    *time.Ticker
@@ -164,6 +169,11 @@ func (c *badgerClient) simpleTxn(ctx context.Context, f func(*kvTxn) error, retr
 }
 
 func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) (err error) {
+	c.dbMu.RLock()
+	defer c.dbMu.RUnlock()
+	if c.dbError != nil {
+		return c.dbError
+	}
 	tx := &badgerTxn{c.client.NewTransaction(!c.readOnly), c.client}
 	defer func() { tx.t.Discard() }()
 	defer func() {
@@ -187,29 +197,70 @@ func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int)
 	return tx.t.Commit()
 }
 
+// scan releases the database before invoking callbacks. Maintenance callbacks
+// may write through the same client or wait for workers that do: holding an
+// RWMutex read lock there deadlocks as soon as capture queues its write lock.
+// A bounded key page owns copied bytes only. Each page reopens at the last key;
+// callers that require an immutable scan already use a private metadata clone.
 func (c *badgerClient) scan(prefix []byte, handler func(key []byte, value []byte) bool) error {
-	tx := c.client.NewTransaction(false)
-	defer tx.Discard()
-	it := tx.NewIterator(badger.IteratorOptions{
-		Prefix:         prefix,
-		PrefetchValues: true,
-		PrefetchSize:   10240,
-	})
-	defer it.Close()
-	for it.Rewind(); it.Valid(); it.Next() {
-		item := it.Item()
-		value, err := item.ValueCopy(nil)
+	var cursor []byte
+	for {
+		var keys, values [][]byte
+		err := func() error {
+			c.dbMu.RLock()
+			defer c.dbMu.RUnlock()
+			if c.dbError != nil {
+				return c.dbError
+			}
+			tx := c.client.NewTransaction(false)
+			defer tx.Discard()
+			options := badger.DefaultIteratorOptions
+			options.Prefix = prefix
+			options.PrefetchSize = 64
+			it := tx.NewIterator(options)
+			defer it.Close()
+			if cursor == nil {
+				it.Seek(prefix)
+			} else {
+				it.Seek(cursor)
+				if it.Valid() && bytes.Equal(it.Item().Key(), cursor) {
+					it.Next()
+				}
+			}
+			size := 0
+			for ; it.ValidForPrefix(prefix) && len(keys) < 1024 && size < 4<<20; it.Next() {
+				item := it.Item()
+				value, err := item.ValueCopy(nil)
+				if err != nil {
+					return err
+				}
+				key := item.KeyCopy(nil)
+				keys, values = append(keys, key), append(values, value)
+				size += len(key) + len(value)
+			}
+			return nil
+		}()
 		if err != nil {
 			return err
 		}
-		if !handler(item.KeyCopy(nil), value) {
-			break
+		if len(keys) == 0 {
+			return nil
+		}
+		cursor = keys[len(keys)-1]
+		for i, key := range keys {
+			if !handler(key, values[i]) {
+				return nil
+			}
 		}
 	}
-	return nil
 }
 
 func (c *badgerClient) reset(prefix []byte) error {
+	c.dbMu.RLock()
+	defer c.dbMu.RUnlock()
+	if c.dbError != nil {
+		return c.dbError
+	}
 	if prefix == nil {
 		return c.client.DropAll()
 	}
@@ -221,7 +272,14 @@ func (c *badgerClient) close() error {
 		close(c.done)
 		c.ticker.Stop()
 		<-c.gcDone
+		c.dbMu.Lock()
+		defer c.dbMu.Unlock()
+		if c.dbError != nil {
+			c.closeErr = c.dbError
+			return
+		}
 		c.closeErr = c.client.Close()
+		c.dbError = badger.ErrDBClosed
 	})
 	return c.closeErr
 }
@@ -383,6 +441,9 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	ticker := time.NewTicker(time.Hour)
 	done := make(chan struct{})
 	gcDone := make(chan struct{})
+	wrapped := &badgerClient{
+		client: client, readOnly: opts.readOnly, ticker: ticker, done: done, gcDone: gcDone,
+	}
 	go func() {
 		defer close(gcDone)
 		if opts.readOnly {
@@ -398,7 +459,13 @@ func newBadgerClient(addr string) (tkvClient, error) {
 						return
 					default:
 					}
-					if client.RunValueLogGC(0.7) != nil {
+					wrapped.dbMu.RLock()
+					err := wrapped.dbError
+					if err == nil {
+						err = wrapped.client.RunValueLogGC(0.7)
+					}
+					wrapped.dbMu.RUnlock()
+					if err != nil {
 						break
 					}
 				}
@@ -408,13 +475,7 @@ func newBadgerClient(addr string) (tkvClient, error) {
 		}
 	}()
 
-	return &badgerClient{
-		client:   client,
-		readOnly: opts.readOnly,
-		ticker:   ticker,
-		done:     done,
-		gcDone:   gcDone,
-	}, nil
+	return wrapped, nil
 }
 
 func init() {

@@ -237,6 +237,7 @@ func (s *rSlice) Remove() error {
 		// there could be multiple clients try to remove the same chunk in the same time,
 		// any of them should succeed if any blocks is removed
 		key := s.key(i)
+		s.store.uploads.abandon(key)
 		s.store.removePending(key)
 		s.store.bcache.remove(key, true)
 	}
@@ -443,6 +444,9 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	if err == nil && cacheUploaded {
 		store.cacheBlock(key, block, false, false)
 	}
+	if err == nil {
+		store.uploads.complete(key)
+	}
 	return err
 }
 
@@ -470,6 +474,9 @@ func (s *wSlice) upload(indx int) {
 			panic(fmt.Sprintf("block length does not match: %v != %v", off, blen))
 		}
 		if s.writeback && blen < s.store.conf.WritebackThresholdSize {
+			// Register before exposing the staging file: the background scanner
+			// can PUT it immediately, even before stage() returns.
+			s.store.uploads.start(key, blen)
 			stagingPath := "unknown"
 			stageFailed := false
 			block.Acquire()
@@ -736,6 +743,7 @@ type cachedStore struct {
 	pendingCh       chan *pendingItem
 	pendingKeys     map[string]*pendingItem
 	pendingMutex    sync.Mutex
+	uploads         uploadTracker
 	startHour       int
 	endHour         int
 	compressor      compress.Compressor
@@ -1165,6 +1173,7 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	if err != nil {
 		if store.isPendingValid(key) {
 			if err == errNotCached && store.pendingObjectAlreadyStored(context.TODO(), key, blen) == nil {
+				store.uploads.complete(key)
 				store.removePending(key)
 				return
 			}

@@ -751,6 +751,11 @@ func mount(c *cli.Context) error {
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
 	})
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
+	stopCapture, err := installRun9Capture(v, sliceAllocationStart)
+	if err != nil {
+		return fmt.Errorf("install metadata capture: %w", err)
+	}
+	defer stopCapture()
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
