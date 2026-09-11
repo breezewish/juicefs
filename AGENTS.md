@@ -87,6 +87,10 @@ Related files:
 
 - `SetLogLevel` uses Logrus's atomic setter so command initialization does not race with background logging. Covered by `pkg/utils/logger_test.go` under the race detector.
 
+### Shared read cancellation
+
+- A live block reader retries a shared download cancelled by another reader, without consuming its VFS storage-error retry budget. Its own cancellation and actual download errors still propagate; shared page references are released before retrying. This prevents cancelled readahead from turning unrelated reads into EIO under concurrent file access. Covered by `pkg/chunk/cached_store_cancel_test.go`.
+
 ### Usage reporting disabled by default
 
 - Usage reporting is always disabled by default.
