@@ -1795,7 +1795,11 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	switch flags {
 	case 0, RenameNoReplace, RenameExchange, RenameNoReplace | RenameRestore:
 	case RenameWhiteout, RenameNoReplace | RenameWhiteout:
-		return syscall.ENOTSUP
+		// Run9's Badger-backed Snap stores the rename and whiteout in one
+		// metadata transaction. Other backends retain their upstream contract.
+		if kv, ok := m.en.(*kvMeta); !ok || kv.Name() != "badger" {
+			return syscall.ENOTSUP
+		}
 	default:
 		return syscall.EINVAL
 	}

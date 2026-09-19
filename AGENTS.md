@@ -298,3 +298,13 @@ For non-divergent code, we should keep as it is in upstream as much as possible,
 - The captured `CnextChunk` advances the current mount's retired-slice GC floor. It includes cached allocation reservations and never rolls back; finalize serializes with captures and pending upload waits.
 - The hidden `prepare-fork` command removes inherited session-owned state only from a private candidate. It runs outside the source mount process, isolating candidate Badger failures from the running parent.
 - Sources: `cmd/run9_capture_linux.go`, `cmd/run9_prepare_fork.go`, `pkg/meta/run9_metadata_capture_linux.go`, `pkg/meta/run9_metadata_prepare.go`, `pkg/chunk/pending_uploads_run9.go`; coverage includes metadata reopen/copy failures, fixed upload sets and real VM online Fork tests in run9.
+
+## OverlayFS whiteouts
+
+- Badger metadata supports `RENAME_WHITEOUT`: the source character device
+  (0:0, mode 000) and destination rename commit in one KV transaction, so online
+  Snap capture cannot observe an intermediate state.
+- Whiteouts consume normal inode/directory/user/group quota and inherit the
+  source parent's setgid group. Other metadata backends return `ENOTSUP`.
+- `pkg/meta/run9_rename_whiteout_test.go` covers replacement, no-replace failure,
+  cross-directory hardlinks, setgid inheritance, quota failure and Badger reopen.
