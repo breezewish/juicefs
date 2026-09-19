@@ -2197,6 +2197,23 @@ func (m *baseMeta) Readdir(ctx Context, inode Ino, plus uint8, entries *[]*Entry
 	return st
 }
 
+// Linux delegates system.* authorization to the filesystem, unlike user.*.
+// Container metadata is writable only by the native inode owner or root,
+// including when default_permissions disables ordinary Meta.Access checks.
+func (m *baseMeta) checkContainerXattrOwner(ctx Context, inode Ino, name string) syscall.Errno {
+	if !strings.HasPrefix(name, "system.containers.") || ctx.Uid() == 0 {
+		return 0
+	}
+	var attr Attr
+	if st := m.GetAttr(ctx, inode, &attr); st != 0 {
+		return st
+	}
+	if ctx.Uid() != attr.Uid {
+		return syscall.EPERM
+	}
+	return 0
+}
+
 func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
@@ -2211,7 +2228,11 @@ func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, f
 	}
 
 	defer m.timeit("SetXattr", time.Now())
-	return m.en.doSetXattr(ctx, m.checkRoot(inode), name, value, flags)
+	inode = m.checkRoot(inode)
+	if st := m.checkContainerXattrOwner(ctx, inode, name); st != 0 {
+		return st
+	}
+	return m.en.doSetXattr(ctx, inode, name, value, flags)
 }
 
 func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
@@ -2223,7 +2244,11 @@ func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 	}
 
 	defer m.timeit("RemoveXattr", time.Now())
-	return m.en.doRemoveXattr(ctx, m.checkRoot(inode), name)
+	inode = m.checkRoot(inode)
+	if st := m.checkContainerXattrOwner(ctx, inode, name); st != 0 {
+		return st
+	}
+	return m.en.doRemoveXattr(ctx, inode, name)
 }
 
 func (m *baseMeta) GetParents(ctx Context, inode Ino) map[Ino]int {

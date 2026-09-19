@@ -76,6 +76,8 @@ func TestRun9RenameWhiteoutQuotaFailureDoesNotMoveSource(t *testing.T) {
 	var attr Attr
 	require.Zero(t, m.Mknod(ctx, RootInode, "source", TypeFile, 0644, 0, 0, "", &source, &attr))
 	m.getBase().doFlushStats()
+	// A no-op must not allocate quota even when the filesystem is full.
+	require.Zero(t, m.Rename(ctx, RootInode, "source", RootInode, "source", RenameWhiteout, nil, nil))
 	require.Equal(t, syscall.ENOSPC, m.Rename(ctx, RootInode, "source", RootInode, "destination", RenameWhiteout, nil, nil))
 	require.Zero(t, m.Lookup(ctx, RootInode, "source", &got, &attr, false))
 	require.Equal(t, source, got)
@@ -153,4 +155,54 @@ func TestRun9RenameWhiteoutMovesDirectoryAndUpdatesParentLinks(t *testing.T) {
 	require.Zero(t, m.GetSummary(ctx, RootInode, &sum, true, true))
 	require.Equal(t, uint64(2), sum.Files)
 	require.Equal(t, uint64(3), sum.Dirs)
+}
+
+func TestRun9RenameWhiteoutUsesInheritedGroupAndNetDirectoryQuota(t *testing.T) {
+	m, err := newKVMeta("badger", t.TempDir(), testConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
+	format := testFormat()
+	format.DirStats = true
+	format.UserGroupQuota = true
+	require.NoError(t, m.Init(format, false))
+	ctx := Background()
+	var dir, source, got Ino
+	var attr Attr
+	require.Zero(t, m.Mkdir(ctx, RootInode, "group", 02777, 0, 0, &dir, &attr))
+	require.Zero(t, m.SetAttr(ctx, dir, SetAttrGID|SetAttrMode, 0, &Attr{Gid: 2000, Mode: 02777}))
+	require.Zero(t, m.Mknod(ctx, dir, "source", TypeFile, 0644, 0, 0, "", &source, &attr))
+	// The caller group and source directory are full. The whiteout belongs to
+	// group 2000, and moving source out leaves the directory at one entry.
+	m.getBase().groupQuotas[0] = &Quota{MaxInodes: 1, UsedInodes: 1}
+	m.getBase().groupQuotas[2000] = &Quota{MaxInodes: 2, UsedInodes: 1}
+	m.getBase().dirQuotas[uint64(dir)] = &Quota{MaxInodes: 1, UsedInodes: 1}
+	require.Zero(t, m.Rename(ctx, dir, "source", RootInode, "moved", RenameWhiteout, nil, nil))
+	require.Zero(t, m.Lookup(ctx, dir, "source", &got, &attr, false))
+	require.Equal(t, uint32(2000), attr.Gid)
+	require.Equal(t, uint8(TypeCharDev), attr.Typ)
+	require.Zero(t, m.Lookup(ctx, RootInode, "moved", &got, &attr, false))
+	require.Equal(t, source, got)
+	require.Equal(t, int64(0), m.getBase().dirQuotas[uint64(dir)].newInodes)
+}
+
+func TestRun9ContainerXattrRequiresNativeOwner(t *testing.T) {
+	m, err := newKVMeta("badger", t.TempDir(), testConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
+	require.NoError(t, m.Init(testFormat(), false))
+	var inode Ino
+	var attr Attr
+	require.Zero(t, m.Mknod(Background(), RootInode, "fifo", TypeFIFO, 0666, 0, 0, "", &inode, &attr))
+	require.Zero(t, m.SetAttr(Background(), inode, SetAttrUID, 0, &Attr{Uid: 1000}))
+	owner := NewContext(1, 1000, []uint32{1000})
+	foreign := NewContext(2, 2000, []uint32{2000})
+	const key = "system.containers.override_stat"
+	require.Zero(t, m.SetXattr(owner, inode, key, []byte("1000:2000:0600"), 0))
+	require.Equal(t, syscall.EPERM, m.SetXattr(foreign, inode, key, []byte("0:0:0777"), 0))
+	require.Equal(t, syscall.EPERM, m.RemoveXattr(foreign, inode, key))
+	var value []byte
+	require.Zero(t, m.GetXattr(owner, inode, key, &value))
+	require.Equal(t, "1000:2000:0600", string(value))
+	require.Zero(t, m.RemoveXattr(owner, inode, key))
+	require.Zero(t, m.SetXattr(Background(), inode, key, []byte("0:0:0600"), 0))
 }

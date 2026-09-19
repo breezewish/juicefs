@@ -1825,9 +1825,6 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	var whiteoutCreated bool
 	var whiteoutAttr Attr
 	if flags&RenameWhiteout != 0 {
-		if st := m.checkQuota(ctx, align4K(0), 1, ctx.Uid(), ctx.Gid(), parentSrc); st != 0 {
-			return st
-		}
 		var err error
 		whiteout, err = m.nextInode()
 		if err != nil {
@@ -2103,8 +2100,32 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 			whiteoutAttr.Flags = sattr.Flags & FlagSkipTrash
 			if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" || sattr.Mode&02000 != 0 {
 				whiteoutAttr.Gid = sattr.Gid
-				if m.checkGroupQuota(ctx, uint64(whiteoutAttr.Gid), align4K(0), 1) {
-					return syscall.EDQUOT
+			}
+			if st := m.checkQuota(ctx, align4K(0), 1, whiteoutAttr.Uid, whiteoutAttr.Gid); st != 0 {
+				return st
+			}
+			// Source-only quota trees lose the moved inode and gain a whiteout:
+			// they cannot grow. Shared ancestors gain one entry unless replacing.
+			if dino == 0 {
+				ancestors := map[Ino]bool{RootInode: true}
+				for p := parentDst; p > RootInode; {
+					ancestors[p] = true
+					var st syscall.Errno
+					if p, st = m.getDirParent(ctx, p); st != 0 {
+						return st
+					}
+				}
+				for p := parentSrc; ; {
+					if ancestors[p] {
+						if m.checkDirQuota(ctx, p, align4K(0), 1) {
+							return syscall.EDQUOT
+						}
+						break
+					}
+					var st syscall.Errno
+					if p, st = m.getDirParent(ctx, p); st != 0 {
+						return st
+					}
 				}
 			}
 			tx.set(m.inodeKey(whiteout), m.marshal(&whiteoutAttr))
