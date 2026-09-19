@@ -1821,6 +1821,19 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 }
 
 func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode, tInode *Ino, attr, tAttr *Attr) syscall.Errno {
+	var whiteout Ino
+	var whiteoutCreated bool
+	var whiteoutAttr Attr
+	if flags&RenameWhiteout != 0 {
+		if st := m.checkQuota(ctx, align4K(0), 1, ctx.Uid(), ctx.Gid(), parentSrc); st != 0 {
+			return st
+		}
+		var err error
+		whiteout, err = m.nextInode()
+		if err != nil {
+			return errno(err)
+		}
+	}
 	var trash Ino
 	if st := m.checkTrash(parentDst, &trash); st != 0 {
 		return st
@@ -1837,6 +1850,7 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	}
 	err := m.txn(ctx, func(tx *kvTxn) error {
 		opened = false
+		whiteoutCreated = false
 		dino, dtyp = 0, 0
 		tattr = Attr{}
 		newSpace, newInode = 0, 0
@@ -2078,6 +2092,25 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 		}
 		tx.set(m.inodeKey(ino), m.marshal(&iattr))
 		tx.set(m.entryKey(parentDst, nameDst), buf)
+		if whiteout != 0 {
+			// Publish both directory entries and the whiteout inode atomically;
+			// an online Snap capture must never see only half of this operation.
+			whiteoutAttr = Attr{Typ: TypeCharDev, Uid: ctx.Uid(), Gid: ctx.Gid(), Nlink: 1,
+				Parent: parentSrc, Full: true, Atime: now.Unix(), Mtime: now.Unix(), Ctime: now.Unix(),
+				Atimensec: uint32(now.Nanosecond()), Mtimensec: uint32(now.Nanosecond()), Ctimensec: uint32(now.Nanosecond())}
+			// Match mknod's ownership and skip-trash inheritance. Mode and rdev
+			// remain zero: this is a whiteout, not a copy of the moved inode.
+			whiteoutAttr.Flags = sattr.Flags & FlagSkipTrash
+			if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" || sattr.Mode&02000 != 0 {
+				whiteoutAttr.Gid = sattr.Gid
+				if m.checkGroupQuota(ctx, uint64(whiteoutAttr.Gid), align4K(0), 1) {
+					return syscall.EDQUOT
+				}
+			}
+			tx.set(m.inodeKey(whiteout), m.marshal(&whiteoutAttr))
+			tx.set(m.entryKey(parentSrc, nameSrc), m.packEntry(TypeCharDev, whiteout))
+			whiteoutCreated = true
+		}
 		if dupdate {
 			tx.set(m.inodeKey(parentDst), m.marshal(&dattr))
 		}
@@ -2088,6 +2121,12 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 			m.fileDeleted(opened, false, dino, tattr.Length)
 		}
 		m.updateStats(newSpace, newInode)
+	}
+	if err == nil && whiteoutCreated {
+		m.updateStats(align4K(0), 1)
+		m.updateDirStat(ctx, parentSrc, 0, align4K(0), 1)
+		m.updateDirQuota(ctx, parentSrc, align4K(0), 1)
+		m.updateUserGroupQuota(ctx, whiteoutAttr.Uid, whiteoutAttr.Gid, align4K(0), 1)
 	}
 	return errno(err)
 }

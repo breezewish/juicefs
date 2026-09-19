@@ -679,8 +679,10 @@ func testMetaClient(t *testing.T, m Meta) {
 	} else if string(entries[0].Name) != "." || string(entries[1].Name) != ".." || string(entries[2].Name) != "f" {
 		t.Fatalf("entries: %+v", entries)
 	}
-	if st := m.Rename(ctx, parent, "f", 1, "f2", RenameWhiteout, &inode, attr); st != syscall.ENOTSUP {
-		t.Fatalf("rename d/f -> f2: %s", st)
+	if m.Name() != "badger" {
+		if st := m.Rename(ctx, parent, "f", 1, "f2", RenameWhiteout, &inode, attr); st != syscall.ENOTSUP {
+			t.Fatalf("rename d/f -> f2: %s", st)
+		}
 	}
 	if st := m.Rename(ctx, parent, "f", 1, "f2", 0, &inode, attr); st != 0 {
 		t.Fatalf("rename d/f -> f2: %s", st)
