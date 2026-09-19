@@ -125,3 +125,32 @@ func TestRun9RenameWhiteoutNoReplaceLeavesBothEntriesUnchanged(t *testing.T) {
 	require.Zero(t, m.Lookup(ctx, RootInode, "destination", &got, &attr, false))
 	require.Equal(t, destination, got)
 }
+
+func TestRun9RenameWhiteoutMovesDirectoryAndUpdatesParentLinks(t *testing.T) {
+	m, err := newKVMeta("badger", t.TempDir(), testConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
+	require.NoError(t, m.Init(testFormat(), false))
+	ctx := Background()
+	var source, destination, file, got Ino
+	var attr Attr
+	require.Zero(t, m.Mkdir(ctx, RootInode, "source", 0755, 0, 0, &source, &attr))
+	require.Zero(t, m.Mkdir(ctx, RootInode, "destination", 0755, 0, 0, &destination, &attr))
+	require.Zero(t, m.Mknod(ctx, source, "file", TypeFile, 0644, 0, 0, "", &file, &attr))
+	require.Zero(t, m.Rename(ctx, RootInode, "source", destination, "moved", RenameWhiteout, nil, nil))
+	require.Zero(t, m.Lookup(ctx, RootInode, "source", &got, &attr, false))
+	require.Equal(t, uint8(TypeCharDev), attr.Typ)
+	require.Zero(t, m.Lookup(ctx, destination, "moved", &got, &attr, false))
+	require.Equal(t, source, got)
+	require.Equal(t, destination, attr.Parent)
+	require.Zero(t, m.Lookup(ctx, source, "file", &got, &attr, false))
+	require.Equal(t, file, got)
+	require.Zero(t, m.GetAttr(ctx, RootInode, &attr))
+	require.Equal(t, uint32(3), attr.Nlink)
+	require.Zero(t, m.GetAttr(ctx, destination, &attr))
+	require.Equal(t, uint32(3), attr.Nlink)
+	var sum Summary
+	require.Zero(t, m.GetSummary(ctx, RootInode, &sum, true, true))
+	require.Equal(t, uint64(2), sum.Files)
+	require.Equal(t, uint64(3), sum.Dirs)
+}
