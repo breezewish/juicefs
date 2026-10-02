@@ -106,7 +106,7 @@ func TestRun9RetiredSlicesResumesBeyondOldTotalLimits(t *testing.T) {
 	require.NoError(t, os.WriteFile(first, []byte{1}, 0600))
 	require.NoError(t, os.WriteFile(last, []byte{2}, 0600))
 	var firstTurn run9RetiredSliceGCResult
-	done, err := consumeRun9RetiredSnapshot(context.Background(), dir, 8192, &firstTurn)
+	done, err := consumeRun9RetiredSnapshot(context.Background(), dir, 8192, time.Now().Add(2*time.Minute), &firstTurn)
 	require.NoError(t, err)
 	require.False(t, done)
 	require.EqualValues(t, 8192, firstTurn.DeletedObjects)
@@ -115,7 +115,7 @@ func TestRun9RetiredSlicesResumesBeyondOldTotalLimits(t *testing.T) {
 	require.FileExists(t, last)
 	// A new consumer reopens the read-only snapshot and continues after the
 	// checkpoint, including records beyond the former 65,536-record scan cap.
-	secondTurn, err := run9GCRetiredSlices(context.Background(), queue)
+	secondTurn, err := run9GCRetiredSlices(context.Background(), queue, time.Now().Add(2*time.Minute))
 	require.NoError(t, err)
 	require.True(t, secondTurn.OK, secondTurn.Error)
 	require.EqualValues(t, 66000-8192, secondTurn.DeletedObjects)
@@ -137,7 +137,7 @@ func TestRun9RetiredSlicesKeepsLiveHistoricalAndOtherEpochObjects(t *testing.T) 
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
 		require.NoError(t, os.WriteFile(path, []byte{1}, 0600))
 	}
-	out, err := run9GCRetiredSlices(context.Background(), queue)
+	out, err := run9GCRetiredSlices(context.Background(), queue, time.Now().Add(2*time.Minute))
 	require.NoError(t, err)
 	require.True(t, out.OK, out.Error)
 	require.EqualValues(t, 2, out.DeletedObjects)
@@ -156,7 +156,7 @@ func TestRun9RetiredSlicesRejectsCorruptProofAndRetriesFailedDelete(t *testing.T
 	raw, err := os.ReadFile(proofPath)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(proofPath, append(raw, ' '), 0600))
-	out, err := run9GCRetiredSlices(context.Background(), queue)
+	out, err := run9GCRetiredSlices(context.Background(), queue, time.Now().Add(2*time.Minute))
 	require.NoError(t, err)
 	require.False(t, out.OK)
 	require.Contains(t, out.Error, "checksum")
@@ -167,18 +167,18 @@ func TestRun9RetiredSlicesRejectsCorruptProofAndRetriesFailedDelete(t *testing.T
 	require.NoError(t, os.WriteFile(filepath.Join(key, "obstacle"), nil, 0600))
 	now := time.Now()
 	require.NoError(t, os.Chtimes(dir, now, now))
-	out, err = run9GCRetiredSlices(context.Background(), queue)
+	out, err = run9GCRetiredSlices(context.Background(), queue, time.Now().Add(2*time.Minute))
 	require.NoError(t, err)
 	require.False(t, out.OK)
 	require.Equal(t, 1, out.FailedSnapshots)
 	require.NoFileExists(t, filepath.Join(dir, "cursor"))
-	out, err = run9GCRetiredSlices(context.Background(), queue)
+	out, err = run9GCRetiredSlices(context.Background(), queue, time.Now().Add(2*time.Minute))
 	require.NoError(t, err)
 	require.Equal(t, 1, out.DeferredSnapshots)
 	require.NoError(t, os.Remove(filepath.Join(key, "obstacle")))
 	require.NoError(t, os.Remove(key))
 	require.NoError(t, os.Chtimes(dir, now, now))
-	out, err = run9GCRetiredSlices(context.Background(), queue)
+	out, err = run9GCRetiredSlices(context.Background(), queue, time.Now().Add(2*time.Minute))
 	require.NoError(t, err)
 	require.True(t, out.OK, out.Error)
 	require.Equal(t, 1, out.CompletedSnapshots)
@@ -199,7 +199,7 @@ func TestRun9RetiredSlicesCorruptMetadataDoesNotBlockOtherSnapshots(t *testing.T
 	require.NoError(t, os.WriteFile(filepath.Join(finished, "partial"), nil, 0600))
 	unpublished := filepath.Join(queue, ".tmp-unpublished")
 	require.NoError(t, os.Mkdir(unpublished, 0700))
-	out, err := run9GCRetiredSlices(context.Background(), queue)
+	out, err := run9GCRetiredSlices(context.Background(), queue, time.Now().Add(2*time.Minute))
 	require.NoError(t, err)
 	require.False(t, out.OK)
 	require.Equal(t, 1, out.FailedSnapshots)
@@ -222,13 +222,13 @@ func TestRun9RetiredSlicesRejectsInvalidCursorBeforeDeleting(t *testing.T) {
 	require.NoError(t, os.WriteFile(key, []byte{1}, 0600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "cursor"), []byte("4b000000020000000000000001"), 0600)) // outside lifecycle
 	var out run9RetiredSliceGCResult
-	done, err := consumeRun9RetiredSnapshot(context.Background(), dir, 1, &out)
+	done, err := consumeRun9RetiredSnapshot(context.Background(), dir, 1, time.Now().Add(2*time.Minute), &out)
 	require.ErrorContains(t, err, "invalid retired slice cursor")
 	require.False(t, done)
 	require.Zero(t, out.DeletedObjects)
 	require.FileExists(t, key)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "cursor"), []byte("partial"), 0600))
-	_, err = consumeRun9RetiredSnapshot(context.Background(), dir, 1, &out)
+	_, err = consumeRun9RetiredSnapshot(context.Background(), dir, 1, time.Now().Add(2*time.Minute), &out)
 	require.ErrorContains(t, err, "invalid snapshot cursor file")
 	require.FileExists(t, key)
 }
@@ -243,7 +243,7 @@ func TestRun9RetiredSlicesInvalidEntriesDoNotBlockHealthySnapshot(t *testing.T) 
 	require.NoError(t, os.Symlink(target, filepath.Join(queue, "gc-link")))
 	format := &meta.Format{Name: "healthy", UUID: "volume", Storage: "file", Bucket: t.TempDir() + "/", BlockSize: 4096}
 	makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
-	out, err := run9GCRetiredSlices(context.Background(), queue)
+	out, err := run9GCRetiredSlices(context.Background(), queue, time.Now().Add(2*time.Minute))
 	require.NoError(t, err)
 	require.False(t, out.OK)
 	require.Equal(t, 2, out.FailedSnapshots)
@@ -266,7 +266,7 @@ func TestRun9RetiredSlicesCorruptCounterDoesNotBlockHealthySnapshot(t *testing.T
 	require.NoError(t, db.Close())
 	format.Name = "healthy-counter"
 	makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
-	out, err := run9GCRetiredSlices(context.Background(), queue)
+	out, err := run9GCRetiredSlices(context.Background(), queue, time.Now().Add(2*time.Minute))
 	require.NoError(t, err)
 	require.False(t, out.OK)
 	require.Contains(t, out.Error, "invalid nextChunk counter encoding")
@@ -300,7 +300,7 @@ func TestRun9RetiredSlicesCancellationDoesNotOpenNextSnapshot(t *testing.T) {
 	makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
 	format.Name = "second"
 	makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{{1 << 32, 1, -1}})
-	out, err := run9GCRetiredSlices(ctx, queue)
+	out, err := run9GCRetiredSlices(ctx, queue, time.Now().Add(2*time.Minute))
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, 1, opened, "cancellation must stop before opening another snapshot")
 	require.EqualValues(t, 1, out.DeletedObjects)
@@ -326,4 +326,52 @@ func TestRun9RetiredSlicesCommandKeepsCountsOnCancellation(t *testing.T) {
 	require.False(t, result.OK)
 	require.Contains(t, result.Error, "context canceled")
 	require.EqualValues(t, 1, result.DeletedObjects)
+}
+
+func TestRun9RetiredSlicesWorkBudgetCheckpointsPage(t *testing.T) {
+	queue := t.TempDir()
+	format := &meta.Format{Name: "budget", UUID: "volume", Storage: "retired-budget-test", Bucket: "test", BlockSize: 64}
+	dir := makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{
+		{1 << 32, 1, -1},
+		{1<<32 + 1, 1, -1},
+	})
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	deadline := time.Now().Add(2 * time.Second)
+	object.Register("retired-budget-test", func(string, string, string, string) (object.ObjectStorage, error) {
+		return &retiredSliceDeleteStore{base, func(context.Context, string) error {
+			// Hold the first DELETE until the work budget expires, while the
+			// hard IO deadline still permits the page checkpoint.
+			time.Sleep(time.Until(deadline))
+			return nil
+		}}, nil
+	})
+	ctx, cancel := context.WithDeadline(context.Background(), deadline.Add(15*time.Second))
+	defer cancel()
+	var out run9RetiredSliceGCResult
+	done, err := consumeRun9RetiredSnapshot(ctx, dir, 65536, deadline, &out)
+	require.NoError(t, err)
+	require.False(t, done)
+	require.EqualValues(t, 1, out.DeletedObjects)
+	require.Zero(t, out.FailedSnapshots)
+	require.FileExists(t, filepath.Join(dir, "cursor"))
+	out = run9RetiredSliceGCResult{}
+	done, err = consumeRun9RetiredSnapshot(ctx, dir, 65536, time.Now().Add(time.Minute), &out)
+	require.NoError(t, err)
+	require.True(t, done)
+	require.EqualValues(t, 1, out.DeletedObjects, "resume after the checkpoint without repeating the first DELETE")
+}
+
+func TestRun9RetiredSlicesExpiredWorkBudgetDoesNotOpenSnapshot(t *testing.T) {
+	queue := t.TempDir()
+	// If consumed, this incomplete snapshot would fail validation and back off.
+	dir := filepath.Join(queue, "gc-unopened")
+	require.NoError(t, os.Mkdir(dir, 0700))
+	out, err := run9GCRetiredSlices(context.Background(), queue, time.Now())
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Zero(t, out.FailedSnapshots)
+	info, err := os.Stat(dir)
+	require.NoError(t, err)
+	require.False(t, info.ModTime().After(time.Now()))
 }

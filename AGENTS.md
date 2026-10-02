@@ -235,7 +235,10 @@ Related files:
   `gc-retired-slices` opens only those immutable clones in native read-only mode,
   pages through negative K references in the lifecycle's allocation interval,
   deletes exact object keys, and checkpoints each completely deleted page.
-  Per-turn budgets pause rather than truncate lifetime coverage. Failed tasks
+  Per-turn budgets pause rather than truncate lifetime coverage. The two-minute
+  work budget stops new pages; a separate 15-second IO grace lets the current
+  page checkpoint without turning normal budget exhaustion into a failed task.
+  Caller cancellation and the hard IO deadline still report errors. Failed tasks
   use future directory mtime for retry backoff; partial deletes remain counted.
   No writable metadata, staging, lineage epoch, or online DeleteSlice changes.
   Snapshot open/scan failures return errors rather than terminating maintenance.

@@ -48,9 +48,12 @@ func cmdRun9GCRetiredSlices() *cli.Command {
 			if c.NArg() != 0 {
 				return fmt.Errorf("gc-retired-slices takes no positional arguments")
 			}
-			ctx, cancel := context.WithTimeout(c.Context, 2*time.Minute)
+			// Stop starting pages after the work budget. Give the last page time
+			// to checkpoint before the hard IO deadline and systemd termination.
+			deadline := time.Now().Add(2 * time.Minute)
+			ctx, cancel := context.WithDeadline(c.Context, deadline.Add(15*time.Second))
 			defer cancel()
-			out, err := run9GCRetiredSlices(ctx, c.String("queue-dir"))
+			out, err := run9GCRetiredSlices(ctx, c.String("queue-dir"), deadline)
 			if err != nil {
 				out.OK = false
 				if out.Error == "" {
@@ -62,7 +65,7 @@ func cmdRun9GCRetiredSlices() *cli.Command {
 	}
 }
 
-func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCResult, error) {
+func run9GCRetiredSlices(ctx context.Context, dir string, deadline time.Time) (run9RetiredSliceGCResult, error) {
 	out := run9RetiredSliceGCResult{OK: true}
 	info, err := os.Lstat(dir)
 	if os.IsNotExist(err) {
@@ -93,6 +96,9 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
+		if !time.Now().Before(deadline) {
+			break
+		}
 		entries, err := f.ReadDir(32)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return out, err
@@ -103,6 +109,9 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 		for _, entry := range entries {
 			if err := ctx.Err(); err != nil {
 				return out, err
+			}
+			if !time.Now().Before(deadline) {
+				return out, nil
 			}
 			path := filepath.Join(dir, entry.Name())
 			if strings.HasPrefix(entry.Name(), ".done-") {
@@ -124,7 +133,7 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 			}
 			var done bool
 			if info.IsDir() {
-				done, err = consumeRun9RetiredSnapshot(ctx, path, 65536-out.DeletedObjects, &out)
+				done, err = consumeRun9RetiredSnapshot(ctx, path, 65536-out.DeletedObjects, deadline, &out)
 			} else {
 				err = fmt.Errorf("GC snapshot is not a directory")
 			}
@@ -165,7 +174,7 @@ func run9GCRetiredSlices(ctx context.Context, dir string) (run9RetiredSliceGCRes
 	return out, nil
 }
 
-func consumeRun9RetiredSnapshot(ctx context.Context, path string, objectBudget uint64, out *run9RetiredSliceGCResult) (done bool, err error) {
+func consumeRun9RetiredSnapshot(ctx context.Context, path string, objectBudget uint64, deadline time.Time, out *run9RetiredSliceGCResult) (done bool, err error) {
 	proofPath := filepath.Join(path, "proof.json")
 	info, err := os.Lstat(proofPath)
 	if err != nil {
@@ -240,7 +249,9 @@ func consumeRun9RetiredSnapshot(ctx context.Context, path string, objectBudget u
 	pageSize := int(max(uint64(1), 1024/blocksPerSlice))
 	// Yield between completed pages, not halfway through every slow page. The
 	// invocation context still bounds IO; page checkpoints make retries safe.
-	deadline := time.Now().Add(15 * time.Second)
+	if taskDeadline := time.Now().Add(15 * time.Second); taskDeadline.Before(deadline) {
+		deadline = taskDeadline
+	}
 	var deleted uint64
 	for deleted < objectBudget && time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
