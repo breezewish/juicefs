@@ -240,6 +240,8 @@ Related files:
   page checkpoint without turning normal budget exhaustion into a failed task.
   Caller cancellation and the hard IO deadline still report errors. Failed tasks
   use future directory mtime for retry backoff; partial deletes remain counted.
+  Tasks run oldest-mtime first; unfinished tasks persist their last turn in the
+  same mtime so large tasks cannot starve waiting tasks across invocations.
   No writable metadata, staging, lineage epoch, or online DeleteSlice changes.
   Snapshot open/scan failures return errors rather than terminating maintenance.
   Implementation: `pkg/meta/run9_retired_slices.go`, `cmd/run9_retired_slices.go`,

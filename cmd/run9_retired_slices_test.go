@@ -375,3 +375,40 @@ func TestRun9RetiredSlicesExpiredWorkBudgetDoesNotOpenSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, info.ModTime().After(time.Now()))
 }
+
+func TestRun9RetiredSlicesBudgetYieldsToWaitingSnapshot(t *testing.T) {
+	queue := t.TempDir()
+	format := &meta.Format{Name: "older", UUID: "volume", Storage: "mem", Bucket: "fairness", BlockSize: 1}
+	// Each snapshot needs two turns: one 64 MiB slice fills the entire object
+	// budget at this block size, regardless of directory enumeration order.
+	older := makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{
+		{1 << 32, 64 << 20, -1},
+		{1<<32 + 1, 64 << 20, -1},
+	})
+	format.Name = "waiting"
+	waiting := makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{
+		{1 << 32, 64 << 20, -1},
+		{1<<32 + 1, 64 << 20, -1},
+	})
+	firstPublished, nextPublished := time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(older, firstPublished, firstPublished))
+	require.NoError(t, os.Chtimes(waiting, nextPublished, nextPublished))
+
+	first, err := run9GCRetiredSlices(context.Background(), queue, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	require.True(t, first.OK, first.Error)
+	require.EqualValues(t, 65536, first.DeletedObjects)
+	require.Equal(t, 1, first.PendingSnapshots)
+	require.Zero(t, first.CompletedSnapshots)
+
+	// A new process must serve the waiting task before giving the same task
+	// another full budget. No in-memory round-robin state is available.
+	second, err := run9GCRetiredSlices(context.Background(), queue, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	require.True(t, second.OK, second.Error)
+	require.EqualValues(t, 65536, second.DeletedObjects)
+	require.Equal(t, 1, second.PendingSnapshots)
+	require.Zero(t, second.CompletedSnapshots)
+	require.FileExists(t, filepath.Join(older, "cursor"))
+	require.FileExists(t, filepath.Join(waiting, "cursor"))
+}
