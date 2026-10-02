@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -318,7 +319,7 @@ func TestRun9CountSliceRangesCountsOnlyMatchingObjects(t *testing.T) {
 func TestRun9CountSliceRangesUsesHashPrefixLayout(t *testing.T) {
 	bucket := t.TempDir()
 	matchingKey := chunk.FormatObjectBlockKey(61, 0, 3, true)
-	otherKey := chunk.FormatObjectBlockKey(62, 0, 5, true)
+	otherKey := chunk.FormatObjectBlockKey(250, 0, 5, true)
 	matchingPath := filepath.Join(bucket, "fmtroot", matchingKey)
 	otherPath := filepath.Join(bucket, "fmtroot", otherKey)
 	require.NoError(t, os.MkdirAll(filepath.Dir(matchingPath), 0o755))
@@ -333,26 +334,27 @@ func TestRun9CountSliceRangesUsesHashPrefixLayout(t *testing.T) {
 			Storage: "file",
 			Bucket:  bucket + string(os.PathSeparator),
 		},
-		Ranges: []run9GCSliceRange{{Start: 61, EndInclusive: 61}},
+		Ranges: []run9GCSliceRange{{Start: 61, EndInclusive: 250}},
 	})
 
 	require.NoError(t, err)
 	require.True(t, out.OK)
-	require.Equal(t, uint64(1), out.Objects)
-	require.Equal(t, uint64(3), out.Bytes)
+	require.Equal(t, uint64(2), out.Objects)
+	require.Equal(t, uint64(8), out.Bytes)
 	require.Equal(t, []run9CountSliceRangeAccount{{
 		Start:        61,
-		EndInclusive: 61,
-		Objects:      1,
-		Bytes:        3,
+		EndInclusive: 250,
+		Objects:      2,
+		Bytes:        8,
 	}}, out.Ranges)
 }
 
 func TestRun9CountSliceRangesReturnsPerRangeAccountsInRequestOrder(t *testing.T) {
 	bucket := t.TempDir()
-	firstPath := filepath.Join(bucket, "fmtroot", "chunks/0/0/71_0_3")
-	secondPath := filepath.Join(bucket, "fmtroot", "chunks/0/0/72_0_5")
+	firstPath := filepath.Join(bucket, "fmtroot", "chunks/9/9000/9000000_0_3")
+	secondPath := filepath.Join(bucket, "fmtroot", "chunks/10/10000/10000000_0_5")
 	require.NoError(t, os.MkdirAll(filepath.Dir(firstPath), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(secondPath), 0o755))
 	require.NoError(t, os.WriteFile(firstPath, []byte("abc"), 0o644))
 	require.NoError(t, os.WriteFile(secondPath, []byte("abcde"), 0o644))
 
@@ -364,8 +366,8 @@ func TestRun9CountSliceRangesReturnsPerRangeAccountsInRequestOrder(t *testing.T)
 			Bucket:  bucket + string(os.PathSeparator),
 		},
 		Ranges: []run9GCSliceRange{
-			{SnapID: "snap-b", Start: 72, EndInclusive: 72},
-			{SnapID: "snap-a", Start: 71, EndInclusive: 71},
+			{SnapID: "snap-b", Start: 10000000, EndInclusive: 10000000},
+			{SnapID: "snap-a", Start: 9000000, EndInclusive: 9000000},
 		},
 	})
 
@@ -374,8 +376,8 @@ func TestRun9CountSliceRangesReturnsPerRangeAccountsInRequestOrder(t *testing.T)
 	require.Equal(t, uint64(2), out.Objects)
 	require.Equal(t, uint64(8), out.Bytes)
 	require.Equal(t, []run9CountSliceRangeAccount{
-		{SnapID: "snap-b", Start: 72, EndInclusive: 72, Objects: 1, Bytes: 5},
-		{SnapID: "snap-a", Start: 71, EndInclusive: 71, Objects: 1, Bytes: 3},
+		{SnapID: "snap-b", Start: 10000000, EndInclusive: 10000000, Objects: 1, Bytes: 5},
+		{SnapID: "snap-a", Start: 9000000, EndInclusive: 9000000, Objects: 1, Bytes: 3},
 	}, out.Ranges)
 }
 
@@ -464,9 +466,15 @@ type fakeRun9GCSliceRangeListStore struct {
 	object.ObjectStorage
 	pages [][]object.Object
 	call  int
+	errAt int
+	err   error
 }
 
 func (f *fakeRun9GCSliceRangeListStore) List(ctx context.Context, prefix, marker, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
+	if f.err != nil && f.call == f.errAt {
+		f.call++
+		return nil, false, "", f.err
+	}
 	if f.call >= len(f.pages) {
 		return nil, false, "", nil
 	}
@@ -504,6 +512,47 @@ func TestListRun9GCSliceRangeObjectsCountsListRequests(t *testing.T) {
 	listRequests, listedObjects := scanStats.snapshot()
 	require.Equal(t, uint64(2), listRequests)
 	require.Equal(t, uint64(3), listedObjects)
+}
+
+func TestListRun9GCSliceRangeObjectsPropagatesFirstPageFailure(t *testing.T) {
+	failure := errors.New("access denied")
+	store := &fakeRun9GCSliceRangeListStore{err: failure}
+	_, _, err := listRun9GCSliceRangeObjects(t.Context(), store, "chunks/", "", true)
+	require.ErrorIs(t, err, failure)
+	require.Equal(t, 1, store.call, "a provider failure must not enter an alternative listing retry loop")
+}
+
+func TestListRun9GCSliceRangeObjectsPropagatesLaterPageFailure(t *testing.T) {
+	failure := errors.New("invalid continuation token")
+	store := &fakeRun9GCSliceRangeListStore{
+		pages: [][]object.Object{{testRun9GCObject("chunks/first")}, {}},
+		errAt: 1, err: failure,
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	objs, stats, err := listRun9GCSliceRangeObjects(ctx, store, "chunks/", "", true)
+	require.NoError(t, err)
+	var listed []object.Object
+	for obj := range objs {
+		listed = append(listed, obj)
+	}
+	<-stats.done
+	require.NoError(t, ctx.Err(), "a failed page must finish without waiting for the worker deadline")
+	require.ErrorIs(t, stats.err, failure, "partial output must not be treated as a complete scan")
+	require.Len(t, listed, 1)
+	require.Equal(t, 2, store.call)
+}
+
+func TestCountRun9SliceRangePrefixRejectsPartialAccounting(t *testing.T) {
+	failure := errors.New("provider listing failed")
+	store := &fakeRun9GCSliceRangeListStore{
+		pages: [][]object.Object{{testRun9GCObject(chunk.FormatObjectBlockKey(51, 0, 1, false))}, {}},
+		errAt: 1, err: failure,
+	}
+	out, err := countRun9SliceRangePrefix(t.Context(), store, "chunks/0/", false, []run9GCSliceRange{{Start: 51, EndInclusive: 51}})
+	require.ErrorIs(t, err, failure)
+	require.False(t, out.OK)
+	require.Empty(t, out.Ranges)
 }
 
 func testRun9GCObject(key string) object.Object {

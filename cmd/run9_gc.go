@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -16,7 +17,9 @@ import (
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/sync/errgroup"
 )
 
 type run9ObjectLayout struct {
@@ -144,6 +147,8 @@ type run9GCSliceRangeScanStats struct {
 	listRequests  atomic.Uint64
 	listedObjects atomic.Uint64
 	done          chan struct{}
+	// err is published by closing done; a partial listing is never success.
+	err error
 }
 
 func newRun9GCSliceRangeScanStats() *run9GCSliceRangeScanStats {
@@ -585,6 +590,9 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 
 	deletedObjects, deletedBytes, hasMore, err := deleteRun9SliceRangeMatches(ctx, cancel, blob, objs, req.ObjectLayout.HashPrefix, req.Ranges, req.MaxDeleteObjects, threads)
 	<-scanStats.done
+	if scanStats.err != nil {
+		return run9GCSliceRangesOutput{}, fmt.Errorf("list range objects: %w", scanStats.err)
+	}
 	if err != nil {
 		return run9GCSliceRangesOutput{}, fmt.Errorf("delete range objects: %w", err)
 	}
@@ -618,16 +626,67 @@ func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) 
 	}
 	defer object.Shutdown(blob)
 
+	// Partition valid chunk keys without overlap. Decimal directories below 10
+	// need an exact slash prefix; all larger directories have two leading digits.
+	// Hashed directories use two uppercase hex digits (FormatObjectBlockKey).
+	var prefixes []string
+	if req.ObjectLayout.HashPrefix {
+		for _, digit := range "0123456789ABCDEF" {
+			prefixes = append(prefixes, "chunks/"+string(digit))
+		}
+	} else {
+		for i := range 10 {
+			prefixes = append(prefixes, fmt.Sprintf("chunks/%d/", i))
+		}
+		for i := 10; i < 100; i++ {
+			prefixes = append(prefixes, fmt.Sprintf("chunks/%d", i))
+		}
+	}
+	parts := make([]run9CountSliceRangesOutput, len(prefixes))
+	group, scanCtx := errgroup.WithContext(ctx)
+	group.SetLimit(4)
+	for i, prefix := range prefixes {
+		group.Go(func() error {
+			var err error
+			parts[i], err = countRun9SliceRangePrefix(scanCtx, blob, prefix, req.ObjectLayout.HashPrefix, req.Ranges)
+			return err
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return run9CountSliceRangesOutput{}, err
+	}
+	out := run9CountSliceRangesOutput{OK: true, Ranges: parts[0].Ranges}
+	// Each prefix returns accounts in the original request order, including zeros.
+	for i, part := range parts {
+		out.Objects += part.Objects
+		out.Bytes += part.Bytes
+		out.ScanListRequests += part.ScanListRequests
+		out.ScanListedObjects += part.ScanListedObjects
+		if i == 0 {
+			continue
+		}
+		for j, account := range part.Ranges {
+			out.Ranges[j].Objects += account.Objects
+			out.Ranges[j].Bytes += account.Bytes
+		}
+	}
+	return out, nil
+}
+
+func countRun9SliceRangePrefix(ctx context.Context, blob object.ObjectStorage, prefix string, hashPrefix bool, requested []run9GCSliceRange) (run9CountSliceRangesOutput, error) {
 	listCtx, cancel := context.WithCancel(ctx)
-	objs, scanStats, err := listRun9GCSliceRangeObjects(listCtx, blob, "chunks/", "", true)
+	defer cancel()
+	objs, scanStats, err := listRun9GCSliceRangeObjects(listCtx, blob, prefix, "", true)
 	if err != nil {
-		cancel()
 		return run9CountSliceRangesOutput{}, fmt.Errorf("list range objects: %w", err)
 	}
 
-	objects, bytes, ranges, err := countRun9SliceRangeMatches(ctx, objs, req.ObjectLayout.HashPrefix, req.Ranges)
+	objects, bytes, ranges, err := countRun9SliceRangeMatches(ctx, objs, hashPrefix, requested)
 	cancel()
 	<-scanStats.done
+	if scanStats.err != nil {
+		return run9CountSliceRangesOutput{}, fmt.Errorf("list range objects: %w", scanStats.err)
+	}
 	if err != nil {
 		return run9CountSliceRangesOutput{}, fmt.Errorf("count range objects: %w", err)
 	}
@@ -743,8 +802,11 @@ func run9CountSliceRangeAccumulatorIndex(ranges []run9CountSliceRangeAccumulator
 func listRun9GCSliceRangeObjects(ctx context.Context, store object.ObjectStorage, prefix, marker string, followLink bool) (<-chan object.Object, *run9GCSliceRangeScanStats, error) {
 	scanStats := newRun9GCSliceRangeScanStats()
 	objs, hasMore, nextToken, err := store.List(ctx, prefix, marker, "", "", run9GCSliceRangesListPageSize, followLink)
-	if err != nil {
+	if errors.Is(err, utils.ENOTSUP) {
 		return listRun9GCSliceRangeObjectsFallback(ctx, scanStats, store, prefix, marker, followLink)
+	}
+	if err != nil {
+		return nil, nil, err
 	}
 	scanStats.record(len(objs))
 
@@ -768,24 +830,16 @@ func listRun9GCSliceRangeObjects(ctx context.Context, store object.ObjectStorage
 			}
 
 			marker = lastKey
-			for {
-				var nextToken2 string
-				objs, hasMore, nextToken2, err = store.List(ctx, prefix, marker, nextToken, "", run9GCSliceRangesListPageSize, followLink)
-				scanStats.record(len(objs))
-				if err == nil {
-					nextToken = nextToken2
-					break
+			// Provider SDKs own bounded transport retries. Repeating every error
+			// here hides permanent failures until the worker is killed by its deadline.
+			objs, hasMore, nextToken, err = store.List(ctx, prefix, marker, nextToken, "", run9GCSliceRangesListPageSize, followLink)
+			scanStats.record(len(objs))
+			if err != nil {
+				// GC intentionally cancels listing once its deletion budget is met.
+				if ctx.Err() == nil {
+					scanStats.err = err
 				}
-				if ctx.Err() != nil {
-					return
-				}
-				timer := time.NewTimer(100 * time.Millisecond)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
-				}
+				return
 			}
 		}
 	}()
