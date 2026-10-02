@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -87,91 +87,101 @@ func run9GCRetiredSlices(ctx context.Context, dir string, deadline time.Time) (r
 		out.Busy = true
 		return out, nil
 	}
-	f, err := os.Open(dir)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return out, err
 	}
-	defer f.Close()
-	for out.DeletedObjects < 65536 {
+	// Directory mtime is scheduling state: publication time for new tasks,
+	// last turn for unfinished tasks, or retry time for failures. Oldest first
+	// prevents large snapshots at the directory head from taking every budget.
+	var snapshots []os.FileInfo
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		if !time.Now().Before(deadline) {
+			return out, nil
+		}
+		path := filepath.Join(dir, entry.Name())
+		if strings.HasPrefix(entry.Name(), ".done-") {
+			if err := os.RemoveAll(path); err != nil {
+				return out, err
+			}
+			continue
+		}
+		if !strings.HasPrefix(entry.Name(), "gc-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return out, err
+		}
+		if info.ModTime().After(time.Now()) {
+			out.DeferredSnapshots++
+			continue
+		}
+		snapshots = append(snapshots, info)
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		if snapshots[i].ModTime().Equal(snapshots[j].ModTime()) {
+			return snapshots[i].Name() < snapshots[j].Name()
+		}
+		return snapshots[i].ModTime().Before(snapshots[j].ModTime())
+	})
+	for _, info := range snapshots {
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
 		if !time.Now().Before(deadline) {
 			break
 		}
-		entries, err := f.ReadDir(32)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return out, err
+		path := filepath.Join(dir, info.Name())
+		var done bool
+		if info.IsDir() {
+			done, err = consumeRun9RetiredSnapshot(ctx, path, 65536-out.DeletedObjects, deadline, &out)
+		} else {
+			err = fmt.Errorf("GC snapshot is not a directory")
 		}
-		if len(entries) == 0 {
+		if err != nil {
+			out.OK = false
+			out.FailedSnapshots++
+			// Only task directories carry retry state. In particular, never
+			// follow an invalid symlink to change another path's timestamps.
+			if info.IsDir() {
+				retryAt := time.Now().Add(5 * time.Minute)
+				if retryErr := os.Chtimes(path, retryAt, retryAt); retryErr != nil {
+					err = fmt.Errorf("%w; defer retry: %v", err, retryErr)
+				}
+			}
+			if out.Error == "" {
+				out.Error = fmt.Sprintf("snapshot %s: %v", info.Name(), err)
+			}
+			logger.Errorf("retired slice GC %s: %s", info.Name(), err)
+		} else if done {
+			// A crash during recursive cleanup must not leave a half-removed
+			// Badger in the runnable namespace.
+			finished := filepath.Join(dir, ".done-"+info.Name())
+			if err := os.Rename(path, finished); err != nil {
+				return out, err
+			}
+			out.CompletedSnapshots++
+			if err := os.RemoveAll(finished); err != nil {
+				return out, err
+			}
+		} else {
+			out.PendingSnapshots++
+			// Persist the turn even if opening the snapshot used the remaining
+			// time. It must yield to tasks not reached by this process.
+			now := time.Now()
+			if err := os.Chtimes(path, now, now); err != nil {
+				return out, err
+			}
+		}
+		if out.DeletedObjects >= 65536 {
 			break
 		}
-		for _, entry := range entries {
-			if err := ctx.Err(); err != nil {
-				return out, err
-			}
-			if !time.Now().Before(deadline) {
-				return out, nil
-			}
-			path := filepath.Join(dir, entry.Name())
-			if strings.HasPrefix(entry.Name(), ".done-") {
-				if err := os.RemoveAll(path); err != nil {
-					return out, err
-				}
-				continue
-			}
-			if !strings.HasPrefix(entry.Name(), "gc-") {
-				continue
-			}
-			info, err := entry.Info()
-			if err != nil {
-				return out, err
-			}
-			if info.ModTime().After(time.Now()) {
-				out.DeferredSnapshots++
-				continue
-			}
-			var done bool
-			if info.IsDir() {
-				done, err = consumeRun9RetiredSnapshot(ctx, path, 65536-out.DeletedObjects, deadline, &out)
-			} else {
-				err = fmt.Errorf("GC snapshot is not a directory")
-			}
-			if err != nil {
-				out.OK = false
-				out.FailedSnapshots++
-				// Only task directories carry retry state. In particular, never
-				// follow an invalid symlink to change another path's timestamps.
-				if info.IsDir() {
-					retryAt := time.Now().Add(5 * time.Minute)
-					if retryErr := os.Chtimes(path, retryAt, retryAt); retryErr != nil {
-						err = fmt.Errorf("%w; defer retry: %v", err, retryErr)
-					}
-				}
-				if out.Error == "" {
-					out.Error = fmt.Sprintf("snapshot %s: %v", entry.Name(), err)
-				}
-				logger.Errorf("retired slice GC %s: %s", entry.Name(), err)
-			} else if done {
-				// A crash during recursive cleanup must not leave a half-removed
-				// Badger in the runnable namespace.
-				finished := filepath.Join(dir, ".done-"+entry.Name())
-				if err := os.Rename(path, finished); err != nil {
-					return out, err
-				}
-				out.CompletedSnapshots++
-				if err := os.RemoveAll(finished); err != nil {
-					return out, err
-				}
-			} else {
-				out.PendingSnapshots++
-			}
-			if out.DeletedObjects >= 65536 {
-				break
-			}
-		}
 	}
-	return out, nil
+	return out, ctx.Err()
 }
 
 func consumeRun9RetiredSnapshot(ctx context.Context, path string, objectBudget uint64, deadline time.Time, out *run9RetiredSliceGCResult) (done bool, err error) {
