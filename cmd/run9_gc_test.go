@@ -745,3 +745,61 @@ func TestBulkDeleteBatchSizeUsesConfiguredThreadsForSmallBatches(t *testing.T) {
 	require.Equal(t, 1000, run9GCExactObjectsBulkDeleteBatchSize(100_000, 16))
 	require.Equal(t, 1000, run9GCExactObjectsBulkDeleteBatchSize(1000, 1))
 }
+
+func TestRun9CountSliceRangesSeparatesDirectoriesWithSameLeadingDigits(t *testing.T) {
+	bucket := t.TempDir()
+	firstKey := chunk.FormatObjectBlockKey(10000000000000000, 0, 3, false)
+	secondKey := chunk.FormatObjectBlockKey(10000000001000000, 0, 5, false)
+	firstPath := filepath.Join(bucket, "fmtroot", firstKey)
+	secondPath := filepath.Join(bucket, "fmtroot", secondKey)
+	require.NoError(t, os.MkdirAll(filepath.Dir(firstPath), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(secondPath), 0o755))
+	require.NoError(t, os.WriteFile(firstPath, []byte("abc"), 0o644))
+	require.NoError(t, os.WriteFile(secondPath, []byte("abcde"), 0o644))
+	blob, err := object.CreateStorage("file", filepath.Join(bucket, "fmtroot")+"/", "", "", "")
+	require.NoError(t, err)
+	partitions, requests, err := listRun9AccountingPartitions(t.Context(), blob)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), requests)
+	require.Equal(t, []string{"chunks/10000000000/", "chunks/10000000001/"}, partitions)
+
+	out, err := run9CountSliceRanges(t.Context(), run9CountSliceRangesRequest{
+		JuiceFSFormatName: "fmtroot",
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: 4096},
+		ObjectStorage:     run9ObjectStorageDescriptor{Storage: "file", Bucket: bucket + "/"},
+		Ranges:            []run9GCSliceRange{{SnapID: "owner", Start: 10000000000000000, EndInclusive: 10000000001000000}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), out.Objects)
+	require.Equal(t, uint64(8), out.Bytes)
+	require.Equal(t, uint64(3), out.ScanListRequests)
+}
+
+func TestRun9CountSliceRangesEmptyStoragePreservesZeroAccounts(t *testing.T) {
+	out, err := run9CountSliceRanges(t.Context(), run9CountSliceRangesRequest{
+		JuiceFSFormatName: "fmtroot",
+		ObjectLayout:      run9ObjectLayout{BlockSizeBytes: 4096},
+		ObjectStorage:     run9ObjectStorageDescriptor{Storage: "file", Bucket: t.TempDir() + "/"},
+		Ranges:            []run9GCSliceRange{{SnapID: "owner", Start: 10, EndInclusive: 20}},
+	})
+	require.NoError(t, err)
+	require.True(t, out.OK)
+	require.Equal(t, []run9CountSliceRangeAccount{{SnapID: "owner", Start: 10, EndInclusive: 20}}, out.Ranges)
+	require.Equal(t, uint64(0), out.Objects)
+	require.Equal(t, uint64(1), out.ScanListRequests)
+}
+
+func TestListRun9AccountingPartitionsRejectsIncompleteDiscovery(t *testing.T) {
+	failure := errors.New("listing interrupted")
+	store := &fakeRun9GCSliceRangeListStore{
+		pages: [][]object.Object{{object.UnmarshalObject(map[string]interface{}{
+			"key": "chunks/10/", "size": float64(0), "mtime": "0", "isdir": true,
+		})}, {}},
+		errAt: 1,
+		err:   failure,
+	}
+	partitions, requests, err := listRun9AccountingPartitions(t.Context(), store)
+	require.ErrorIs(t, err, failure)
+	require.Equal(t, uint64(2), requests)
+	require.Nil(t, partitions)
+}

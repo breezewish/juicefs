@@ -626,22 +626,21 @@ func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) 
 	}
 	defer object.Shutdown(blob)
 
-	// Partition valid chunk keys without overlap. Decimal directories below 10
-	// need an exact slash prefix; all larger directories have two leading digits.
-	// Hashed directories use two uppercase hex digits (FormatObjectBlockKey).
-	var prefixes []string
-	if req.ObjectLayout.HashPrefix {
-		for _, digit := range "0123456789ABCDEF" {
-			prefixes = append(prefixes, "chunks/"+string(digit))
-		}
-	} else {
-		for i := range 10 {
-			prefixes = append(prefixes, fmt.Sprintf("chunks/%d/", i))
-		}
-		for i := 10; i < 100; i++ {
-			prefixes = append(prefixes, fmt.Sprintf("chunks/%d", i))
-		}
+	// Validate ownership before I/O and preserve zero accounts for an empty store.
+	empty := make(chan object.Object)
+	close(empty)
+	_, _, accounts, err := countRun9SliceRangeMatches(ctx, empty, req.ObjectLayout.HashPrefix, req.Ranges)
+	if err != nil {
+		return run9CountSliceRangesOutput{}, err
 	}
+	out := run9CountSliceRangesOutput{OK: true, Ranges: accounts}
+	// Real chunk directories keep epochs with the same leading digits in
+	// separate jobs. Fixed decimal prefixes leave large lineages mostly serial.
+	prefixes, listRequests, err := listRun9AccountingPartitions(ctx, blob)
+	if err != nil {
+		return run9CountSliceRangesOutput{}, err
+	}
+	out.ScanListRequests = listRequests
 	parts := make([]run9CountSliceRangesOutput, len(prefixes))
 	group, scanCtx := errgroup.WithContext(ctx)
 	group.SetLimit(4)
@@ -655,22 +654,44 @@ func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) 
 	if err := group.Wait(); err != nil {
 		return run9CountSliceRangesOutput{}, err
 	}
-	out := run9CountSliceRangesOutput{OK: true, Ranges: parts[0].Ranges}
-	// Each prefix returns accounts in the original request order, including zeros.
-	for i, part := range parts {
+	// Each partition returns accounts in the original request order, including zeros.
+	for _, part := range parts {
 		out.Objects += part.Objects
 		out.Bytes += part.Bytes
 		out.ScanListRequests += part.ScanListRequests
 		out.ScanListedObjects += part.ScanListedObjects
-		if i == 0 {
-			continue
-		}
 		for j, account := range part.Ranges {
 			out.Ranges[j].Objects += account.Objects
 			out.Ranges[j].Bytes += account.Bytes
 		}
 	}
 	return out, nil
+}
+
+// listRun9AccountingPartitions lists actual first-level chunk directories. Both
+// decimal and hash layouts partition every valid block key exactly once.
+func listRun9AccountingPartitions(ctx context.Context, blob object.ObjectStorage) ([]string, uint64, error) {
+	var prefixes []string
+	var requests uint64
+	marker, token := "", ""
+	for {
+		objects, more, nextToken, err := blob.List(ctx, "chunks/", marker, token, "/", run9GCSliceRangesListPageSize, true)
+		requests++
+		if err != nil {
+			return nil, requests, fmt.Errorf("list accounting partitions: %w", err)
+		}
+		for _, obj := range objects {
+			marker = obj.Key()
+			// File storage includes the directory itself in its first page.
+			if obj.IsDir() && obj.Key() != "chunks/" {
+				prefixes = append(prefixes, obj.Key())
+			}
+		}
+		if !more {
+			return prefixes, requests, nil
+		}
+		token = nextToken
+	}
 }
 
 func countRun9SliceRangePrefix(ctx context.Context, blob object.ObjectStorage, prefix string, hashPrefix bool, requested []run9GCSliceRange) (run9CountSliceRangesOutput, error) {

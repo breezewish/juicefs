@@ -252,7 +252,7 @@ Related files:
 - `describe-format` reports the persisted object storage descriptor and object layout so runtime can operate after candidate metadata has been removed, and also seeds a prepared writable epoch through the `?nextchunk=` badger path.
 - `gc-slice-ranges` lists only the loaded format prefix, parses `slice_id` from object keys, and deletes only keys whose `slice_id` falls within the requested ranges. It may stop early at `max_delete_objects` and return `has_more=true`.
 - Range GC and accounting propagate object listing failures after provider SDK retries, rather than retrying forever until the worker deadline. Partial scans never produce successful accounting or GC completion. Alternative listing is used only when paged listing is unsupported.
-- Accounting scans disjoint numeric/hex chunk-key prefixes with at most four concurrent listings. This bounds worker load while avoiding one serial full-lineage scan; it publishes totals only after every partition succeeds.
+- Accounting discovers actual first-level chunk directories through delimited listing and scans those disjoint partitions with at most four concurrent listings. Fixed leading-digit partitions can serialize large epoch lineages; directory partitions bound worker load while sharing that work. It publishes totals only after discovery and every partition succeed, including zero accounts for empty storage.
 - When the loaded storage is sharded, range deletion reuses bulk delete and fans out independent shard groups in parallel so GC does not serialize shard-local deletes.
 - Delimited listing workers observe a cancellable context instead of racing on
   the recursive walker's error variable; coarse-GC race tests cover this path.
