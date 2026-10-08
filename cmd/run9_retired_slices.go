@@ -252,9 +252,10 @@ func consumeRun9RetiredSnapshot(ctx context.Context, path string, objectBudget u
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
-	// Aim for at most 1,024 DELETEs per page at the maximum slice size. A single
-	// slice with a tiny block layout may exceed that target (at most 65,536).
-	// These limits bound each turn's work, not total lifecycle garbage coverage.
+	// Bound each metadata read by its worst-case expansion. Accumulate small
+	// slices across reads before issuing DELETEs and checkpointing on shared
+	// metadata; otherwise 4 MiB layouts checkpoint every 64 records even when
+	// each retired slice owns only one small object.
 	blocksPerSlice := (uint64(meta.ChunkSize) + uint64(layout.BlockSizeBytes) - 1) / uint64(layout.BlockSizeBytes)
 	pageSize := int(max(uint64(1), 1024/blocksPerSlice))
 	// Yield between completed pages, not halfway through every slow page. The
@@ -267,17 +268,31 @@ func consumeRun9RetiredSnapshot(ctx context.Context, path string, objectBudget u
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		slices, next, err := m.Run9RetiredSlices(ctx, proof.Start, end, string(cursor), pageSize)
-		if err != nil {
-			return false, err
-		}
-		out.ScannedPages++
 		var objects []run9GCExactObject
-		for _, s := range slices {
-			for offset, index := uint64(0), uint64(0); offset < uint64(s.Size); index++ {
-				size := min(uint64(layout.BlockSizeBytes), uint64(s.Size)-offset)
-				objects = append(objects, run9GCExactObject{Key: chunk.FormatObjectBlockKey(s.Id, index, size, layout.HashPrefix), Size: size})
-				offset += size
+		next := string(cursor)
+		// Keep sparse/live-only scans bounded too. A batch may exceed the
+		// 1,024-object target by one metadata page (or one large slice), never
+		// more than 65,536 objects. Persist its cursor only after all DELETEs
+		// succeed, including when the work budget expires during collection.
+		for scanned := 0; scanned < 4096 && len(objects) < 1024; scanned += pageSize {
+			if scanned > 0 && (!time.Now().Before(deadline) || uint64(len(objects))+blocksPerSlice > 65536) {
+				break
+			}
+			var slices []meta.Slice
+			slices, next, err = m.Run9RetiredSlices(ctx, proof.Start, end, next, pageSize)
+			if err != nil {
+				return false, err
+			}
+			out.ScannedPages++
+			for _, s := range slices {
+				for offset, index := uint64(0), uint64(0); offset < uint64(s.Size); index++ {
+					size := min(uint64(layout.BlockSizeBytes), uint64(s.Size)-offset)
+					objects = append(objects, run9GCExactObject{Key: chunk.FormatObjectBlockKey(s.Id, index, size, layout.HashPrefix), Size: size})
+					offset += size
+				}
+			}
+			if next == "" {
+				break
 			}
 		}
 		n, bytes, err := deleteRun9ExactObjects(ctx, blob, objects, 4)

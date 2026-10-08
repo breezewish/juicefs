@@ -332,8 +332,8 @@ func TestRun9RetiredSlicesWorkBudgetCheckpointsPage(t *testing.T) {
 	queue := t.TempDir()
 	format := &meta.Format{Name: "budget", UUID: "volume", Storage: "retired-budget-test", Bucket: "test", BlockSize: 64}
 	dir := makeRetiredTestSnapshot(t, queue, format, []retiredTestRecord{
-		{1 << 32, 1, -1},
-		{1<<32 + 1, 1, -1},
+		{1 << 32, 64 << 20, -1},
+		{1<<32 + 1, 64 << 20, -1},
 	})
 	base, err := object.CreateStorage("mem", "test", "", "", "")
 	require.NoError(t, err)
@@ -352,14 +352,78 @@ func TestRun9RetiredSlicesWorkBudgetCheckpointsPage(t *testing.T) {
 	done, err := consumeRun9RetiredSnapshot(ctx, dir, 65536, deadline, &out)
 	require.NoError(t, err)
 	require.False(t, done)
-	require.EqualValues(t, 1, out.DeletedObjects)
+	require.EqualValues(t, 1024, out.DeletedObjects)
 	require.Zero(t, out.FailedSnapshots)
 	require.FileExists(t, filepath.Join(dir, "cursor"))
 	out = run9RetiredSliceGCResult{}
 	done, err = consumeRun9RetiredSnapshot(ctx, dir, 65536, time.Now().Add(time.Minute), &out)
 	require.NoError(t, err)
 	require.True(t, done)
-	require.EqualValues(t, 1, out.DeletedObjects, "resume after the checkpoint without repeating the first DELETE")
+	require.EqualValues(t, 1024, out.DeletedObjects, "resume after the checkpoint without repeating the first batch")
+}
+
+func TestRun9RetiredSlicesBatchesSmallObjectsAcrossScanPages(t *testing.T) {
+	queue := t.TempDir()
+	format := &meta.Format{Name: "small-blocks", UUID: "volume", Storage: "retired-batch-test", Bucket: "test", BlockSize: 4096}
+	records := make([]retiredTestRecord, 1024)
+	for i := range records {
+		records[i] = retiredTestRecord{1<<32 + uint64(i), 1, -1}
+	}
+	dir := makeRetiredTestSnapshot(t, queue, format, records)
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	store := &fakeRun9GCExactObjectsBulkDeleteStore{ObjectStorage: base}
+	object.Register("retired-batch-test", func(string, string, string, string) (object.ObjectStorage, error) {
+		return store, nil
+	})
+	var out run9RetiredSliceGCResult
+	done, err := consumeRun9RetiredSnapshot(context.Background(), dir, 65536, time.Now().Add(time.Minute), &out)
+	require.NoError(t, err)
+	require.True(t, done)
+	require.EqualValues(t, 1024, out.DeletedObjects)
+	require.Empty(t, store.deleteCalls)
+	// Four concurrent bulk requests, rather than four requests for each of
+	// sixteen 64-record metadata pages. This also avoids fifteen checkpoints.
+	require.Len(t, store.bulkCalls, 4)
+	require.Len(t, store.bulkCalls[0], 256)
+	require.Len(t, store.bulkCalls[1], 256)
+	require.Len(t, store.bulkCalls[2], 256)
+	require.Len(t, store.bulkCalls[3], 256)
+	require.NoFileExists(t, filepath.Join(dir, "cursor"))
+}
+
+func TestRun9RetiredSlicesRejectsCorruptionBeforeDeletingAccumulatedBatch(t *testing.T) {
+	queue := t.TempDir()
+	format := &meta.Format{Name: "corrupt-batch", UUID: "volume", Storage: "retired-corrupt-batch-test", Bucket: "test", BlockSize: 4096}
+	records := make([]retiredTestRecord, 65)
+	for i := range records {
+		records[i] = retiredTestRecord{1<<32 + uint64(i), 1, -1}
+	}
+	dir := makeRetiredTestSnapshot(t, queue, format, records)
+	db, err := badger.Open(badger.DefaultOptions(filepath.Join(dir, "meta")).WithLogger(nil))
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *badger.Txn) error {
+		key := make([]byte, 13)
+		key[0] = 'K'
+		binary.BigEndian.PutUint64(key[1:9], 1<<32+64)
+		binary.BigEndian.PutUint32(key[9:], 1)
+		return tx.Set(key, []byte{1})
+	}))
+	require.NoError(t, db.Close())
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	store := &fakeRun9GCExactObjectsBulkDeleteStore{ObjectStorage: base}
+	object.Register("retired-corrupt-batch-test", func(string, string, string, string) (object.ObjectStorage, error) {
+		return store, nil
+	})
+	var out run9RetiredSliceGCResult
+	done, err := consumeRun9RetiredSnapshot(context.Background(), dir, 65536, time.Now().Add(time.Minute), &out)
+	require.ErrorContains(t, err, "malformed slice reference record")
+	require.False(t, done)
+	require.Zero(t, out.DeletedObjects)
+	require.Empty(t, store.bulkCalls)
+	require.Empty(t, store.deleteCalls)
+	require.NoFileExists(t, filepath.Join(dir, "cursor"))
 }
 
 func TestRun9RetiredSlicesExpiredWorkBudgetDoesNotOpenSnapshot(t *testing.T) {

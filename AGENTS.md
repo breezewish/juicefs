@@ -235,6 +235,10 @@ Related files:
   `gc-retired-slices` opens only those immutable clones in native read-only mode,
   pages through negative K references in the lifecycle's allocation interval,
   deletes exact object keys, and checkpoints each completely deleted page.
+  Small slices accumulate across metadata reads to target 1,024 actual object
+  keys per delete/checkpoint batch, with a 4,096-record scan bound and the same
+  65,536-key memory ceiling. Worst-case slice sizes still bound individual reads;
+  they no longer force tiny remote DELETE batches for ordinary small slices.
   Per-turn budgets pause rather than truncate lifetime coverage. The two-minute
   work budget stops new pages; a separate 15-second IO grace lets the current
   page checkpoint without turning normal budget exhaustion into a failed task.
