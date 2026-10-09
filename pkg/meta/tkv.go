@@ -3432,10 +3432,15 @@ func (m *kvMeta) dumpEntry(inode Ino, e *DumpedEntry, showProgress func(totalInc
 			}
 			e.Symlink = string(l)
 		} else if attr.Typ == TypeDirectory {
-			vals, err := m.scanValues(ctx, m.entryKey(inode, ""), 10000, nil)
-			if err != nil {
-				return err
-			}
+			// Reuse this transaction: a nested Badger transaction would take a
+			// second lifecycle read lock and deadlock when Shutdown or capture
+			// has queued its write lock between the two reads.
+			vals := make(map[string][]byte)
+			prefix := m.entryKey(inode, "")
+			tx.scan(prefix, nextKey(prefix), false, func(k, v []byte) bool {
+				vals[string(k)] = v
+				return len(vals) < 10000
+			})
 			if showProgress != nil {
 				showProgress(int64(len(e.Entries)), 0)
 			}
@@ -4398,10 +4403,7 @@ func (m *kvMeta) loadDumpedACLs(ctx Context) error {
 
 func (m *kvMeta) doStoreToken(ctx Context, token []byte) (id uint32, st syscall.Errno) {
 	err := m.txn(ctx, func(tx *kvTxn) error {
-		newId, err := m.incrCounter(krbTokenCounter, 1)
-		if err != nil {
-			return err
-		}
+		newId := tx.incrBy(m.counterKey(krbTokenCounter), 1)
 		tx.set(m.krbTokenKey(uint32(newId)), token)
 		id = uint32(newId)
 		return nil
