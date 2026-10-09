@@ -187,7 +187,12 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 		if ack.Status != "panic" {
 			if firstErr == nil {
 				ack.Status = "ok"
-				ack.SliceAllocationStart = sliceAllocationStart
+				if sliceAllocationStart != nil {
+					if allocator, ok := metaCli.(interface{ Run9SliceAllocationEnd(uint64) uint64 }); ok {
+						end := allocator.Run9SliceAllocationEnd(*sliceAllocationStart)
+						ack.SliceAllocationEnd = &end
+					}
+				}
 				ack.Phase = ""
 				ack.Error = ""
 			} else {

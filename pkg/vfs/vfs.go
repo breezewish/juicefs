@@ -377,9 +377,13 @@ func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newnam
 	var attr = &Attr{}
 	err = v.Meta.Rename(ctx, parent, name, newparent, newname, flags, &inode, attr)
 	if err == 0 {
-		v.invalidateDirHandle(parent, name, 0, nil)
-		v.invalidateDirHandle(newparent, newname, 0, nil)
-		v.invalidateDirHandle(newparent, newname, inode, attr)
+		if parent == newparent {
+			v.renameDirHandle(parent, name, newname, inode, attr)
+		} else {
+			v.invalidateDirHandle(parent, name, 0, nil)
+			v.invalidateDirHandle(newparent, newname, 0, nil)
+			v.invalidateDirHandle(newparent, newname, inode, attr)
+		}
 	}
 	return
 }

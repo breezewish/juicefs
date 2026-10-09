@@ -165,9 +165,7 @@ func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encod
 		if err != nil {
 			return err
 		}
-		// Protected by the capture exclusion above and the finalize read lock.
-		// Include unused preallocated IDs; never roll this conservative floor back.
-		*allocationStart = max(*allocationStart, response.Metadata.AllocationEnd)
+
 		return ctx.Err()
 	}(); err != nil {
 		return err

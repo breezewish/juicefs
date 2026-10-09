@@ -205,7 +205,9 @@ func (l *listThread) reset() {
 }
 
 func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, start, end string, followLink bool) (<-chan Object, error) {
-	entries, _, _, err := store.List(ctx, prefix, start, "", "/", 1e9, followLink)
+	// A leaf marker can sort after its containing directory. Listing the
+	// root with that marker would skip the entire subtree; walk filters start.
+	entries, _, _, err := store.List(ctx, prefix, "", "", "/", 1e9, followLink)
 	if err != nil {
 		logger.Errorf("list %s: %s", prefix, err)
 		return nil, err

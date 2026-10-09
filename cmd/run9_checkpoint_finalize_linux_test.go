@@ -12,12 +12,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type retiredFinalizeMetadata struct{ shutdownErr error }
+type checkpointFinalizeMetadata struct{ shutdownErr error }
 
-func (m *retiredFinalizeMetadata) CloseSession() error { return nil }
-func (m *retiredFinalizeMetadata) Shutdown() error     { return m.shutdownErr }
+func (m *checkpointFinalizeMetadata) CloseSession() error { return nil }
+func (m *checkpointFinalizeMetadata) Shutdown() error     { return m.shutdownErr }
 
-func TestRun9RetiredSlicesFinalizeOnlyReturnsAllocationProof(t *testing.T) {
+func (m *checkpointFinalizeMetadata) Run9SliceAllocationEnd(initial uint64) uint64 { return initial }
+
+func TestRun9CheckpointFinalizeOnlyReturnsAllocationProof(t *testing.T) {
 	flush, measure := forkFinalizeFlushAll, forkFinalizeMeasureSize
 	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
 	forkFinalizeMeasureSize = func(*vfs.VFS) (uint64, uint64, error) { return 0, 0, nil }
@@ -26,7 +28,7 @@ func TestRun9RetiredSlicesFinalizeOnlyReturnsAllocationProof(t *testing.T) {
 	require.NoError(t, err)
 	ackPath := forkFinalizeAckPath(os.Getpid(), pidStart)
 	t.Cleanup(func() { _ = os.Remove(ackPath) })
-	m := &retiredFinalizeMetadata{}
+	m := &checkpointFinalizeMetadata{}
 	start := uint64(1 << 32)
 	// This fixture has no scan/counter method: finalize must need neither.
 	require.NoError(t, runForkFinalizeOnMain(m, &vfs.VFS{Conf: &vfs.Config{}}, nil, &start))
@@ -35,12 +37,12 @@ func TestRun9RetiredSlicesFinalizeOnlyReturnsAllocationProof(t *testing.T) {
 	var ack forkFinalizeAckV1
 	require.NoError(t, json.Unmarshal(raw, &ack))
 	require.Equal(t, "ok", ack.Status)
-	require.Equal(t, &start, ack.SliceAllocationStart)
+	require.Equal(t, &start, ack.SliceAllocationEnd)
 	m.shutdownErr = errors.New("failed persistence")
 	require.ErrorContains(t, runForkFinalizeOnMain(m, &vfs.VFS{Conf: &vfs.Config{}}, nil, &start), "failed persistence")
 	raw, err = os.ReadFile(ackPath)
 	require.NoError(t, err)
 	ack = forkFinalizeAckV1{}
 	require.NoError(t, json.Unmarshal(raw, &ack))
-	require.Nil(t, ack.SliceAllocationStart)
+	require.Nil(t, ack.SliceAllocationEnd)
 }

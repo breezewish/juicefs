@@ -194,11 +194,18 @@ func ListAll(ctx context.Context, store ObjectStorage, prefix, marker string, fo
 				key := obj.Key()
 				if sort && !first && key <= lastkey {
 					logger.Errorf("The keys are out of order: marker %q, last %q current %q", marker, lastkey, key)
-					out <- nil
+					select {
+					case out <- nil:
+					case <-ctx.Done():
+					}
 					return
 				}
 				lastkey = key
-				out <- obj
+				select {
+				case out <- obj:
+				case <-ctx.Done():
+					return
+				}
 				first = false
 			}
 			if !hasMore {
@@ -210,11 +217,13 @@ func ListAll(ctx context.Context, store ObjectStorage, prefix, marker string, fo
 			logger.Debugf("Continue listing objects from %s marker %q", store, marker)
 			var nextToken2 string
 			objs, hasMore, nextToken2, err = store.List(ctx, prefix, marker, nextToken, "", maxResults, followLink)
-			for err != nil {
-				logger.Warnf("Fail to list: %s, retry again", err.Error())
-				// slow down
-				time.Sleep(time.Millisecond * 100)
-				objs, hasMore, nextToken, err = store.List(ctx, prefix, marker, nextToken, "", maxResults, followLink)
+			if err != nil {
+				logger.Errorf("list %s: %s", store, err)
+				select {
+				case out <- nil:
+				case <-ctx.Done():
+				}
+				return
 			}
 			nextToken = nextToken2
 			logger.Debugf("Found %d object from %s in %s", len(objs), store, time.Since(startTime))
@@ -242,31 +251,59 @@ func (s *nextObjects) Pop() interface{} {
 	return o
 }
 
+// ListAll merges ordered shards and preserves both scan errors and cancellation.
 func (s *sharded) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan Object, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	heads := &nextObjects{make([]nextKey, 0)}
-	for i := range s.stores {
-		ch, err := ListAll(ctx, s.stores[i], prefix, marker, followLink, true)
+	for _, store := range s.stores {
+		ch, err := ListAll(ctx, store, prefix, marker, followLink, true)
 		if err != nil {
-			return nil, fmt.Errorf("list %s: %s", s.stores[i], err)
+			cancel()
+			return nil, fmt.Errorf("list %s: %w", store, err)
 		}
-		first := <-ch
-		if first != nil {
-			heads.Push(nextKey{first, ch})
+		select {
+		case <-ctx.Done():
+			cancel()
+			return nil, ctx.Err()
+		case first, ok := <-ch:
+			if ok {
+				if first == nil {
+					cancel()
+					return nil, fmt.Errorf("list shard returned an error")
+				}
+				heads.Push(nextKey{first, ch})
+			}
 		}
 	}
 	heap.Init(heads)
-
 	out := make(chan Object, 1000)
 	go func() {
+		defer close(out)
+		defer cancel()
 		for heads.Len() > 0 {
 			n := heap.Pop(heads).(nextKey)
-			out <- n.o
-			o := <-n.ch
-			if o != nil {
-				heap.Push(heads, nextKey{o, n.ch})
+			select {
+			case out <- n.o:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case obj, ok := <-n.ch:
+				if !ok {
+					continue
+				}
+				if obj == nil {
+					select {
+					case out <- nil:
+					case <-ctx.Done():
+					}
+					return
+				}
+				heap.Push(heads, nextKey{obj, n.ch})
 			}
 		}
-		close(out)
 	}()
 	return out, nil
 }

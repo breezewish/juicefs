@@ -422,15 +422,12 @@ func TestDeleteRun9SliceRangeMatchesStreamsDeletesBeforeScanFinishes(t *testing.
 	}
 	done := make(chan result, 1)
 	go func() {
-		deletedObjects, deletedBytes, hasMore, err := deleteRun9SliceRangeMatches(
+		deletedObjects, deletedBytes, hasMore, _, err := deleteRun9SliceRangeMatches(
 			context.Background(),
 			stopScan,
 			store,
 			objs,
-			false,
-			[]run9GCSliceRange{{Start: 41, EndInclusive: 44}},
-			4,
-			2,
+			run9GCSliceRangesRequest{Ranges: []run9GCSliceRange{{Start: 41, EndInclusive: 44}}, MaxDeleteObjects: 4, Threads: 2},
 		)
 		done <- result{
 			deletedObjects: deletedObjects,

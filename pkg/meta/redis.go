@@ -5503,27 +5503,19 @@ func (s *redisDirHandler) List(ctx Context, offset int) ([]*Entry, syscall.Errno
 	s.Lock()
 	defer s.Unlock()
 	if s.entries == nil {
-		var entries []*Entry
-		err := s.en.hscan(ctx, s.en.entryKey(s.inode), func(keys []string) error {
-			newEntries := make([]Entry, len(keys)/2)
-			newAttrs := make([]Attr, len(keys)/2)
-			for i := 0; i < len(keys); i += 2 {
-				typ, ino := s.en.parseEntry([]byte(keys[i+1]))
-				if keys[i] == "" {
-					logger.Errorf("Corrupt entry with empty name: inode %d parent %d", ino, s.inode)
-					continue
-				}
-				ent := &newEntries[i/2]
-				ent.Inode = ino
-				ent.Name = []byte(keys[i])
-				ent.Attr = &newAttrs[i/2]
-				ent.Attr.Typ = typ
-				entries = append(entries, ent)
-			}
-			return nil
-		})
+		// run9 lineage readers need one directory image: paged HSCAN can
+		// miss a member renamed between hash buckets during registration cleanup.
+		values, err := s.en.rdb.HGetAll(ctx, s.en.entryKey(s.inode)).Result()
 		if err != nil {
 			return nil, errno(err)
+		}
+		entries := make([]*Entry, 0, len(values))
+		for name, value := range values {
+			if name == "" || len(value) != 9 {
+				return nil, syscall.EIO
+			}
+			typ, ino := s.en.parseEntry([]byte(value))
+			entries = append(entries, &Entry{Inode: ino, Name: []byte(name), Attr: &Attr{Typ: typ}})
 		}
 
 		if s.en.conf.SortDir {
