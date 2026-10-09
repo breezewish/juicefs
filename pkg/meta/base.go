@@ -2895,7 +2895,19 @@ func (m *baseMeta) deleteSlice_(id uint64, size uint32) {
 }
 
 func (m *baseMeta) deleteSlice(id uint64, size uint32) {
-	if id == 0 || m.conf.MaxDeletes == 0 {
+	if id == 0 {
+		return
+	}
+	if m.conf.MaxDeletes == 0 {
+		// Run9's Badger mounts leave objects to checkpoint GC, which does not
+		// use negative K records. Reclaim that bookkeeping through the existing
+		// cleanup paths, without sending DeleteSlice to object storage.
+		// A retired ID cannot gain references again; IDs are never reused.
+		if kv, ok := m.en.(*kvMeta); ok && kv.Name() == "badger" {
+			if err := kv.doDeleteSlice(id, size); err != nil {
+				logger.Errorf("Delete meta entry of slice %d (%d bytes): %s", id, size, err)
+			}
+		}
 		return
 	}
 	m.dSliceMu.Lock()
