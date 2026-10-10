@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -65,11 +68,12 @@ type forkFinalizeBlockingPhaseResult struct {
 	panic any
 }
 
-func runForkFinalizeBlockingPhase(ctx context.Context, finalizeTimeout, requestedTimeout time.Duration, fn func() error) error {
+func runForkFinalizeBlockingPhase(ctx context.Context, finalizeTimeout, requestedTimeout time.Duration, diagnostics *slog.Logger, fn func() error) error {
 	done := make(chan forkFinalizeBlockingPhaseResult, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
+				logForkFinalizeStack(diagnostics, "phase_panic", false)
 				done <- forkFinalizeBlockingPhaseResult{panic: r}
 			}
 		}()
@@ -84,6 +88,23 @@ func runForkFinalizeBlockingPhase(ctx context.Context, finalizeTimeout, requeste
 		return result.err
 	case <-ctx.Done():
 		return forkFinalizePhaseTimeoutErr(finalizeTimeout, requestedTimeout, ctx.Err())
+	}
+}
+
+// logForkFinalizeStack captures only Go execution stacks, never files, config,
+// argv or environment. Bound both total memory and each JSON event so the
+// existing CloudWatch file collector can retain the dump without truncating a
+// single large event. PID/starttime and part index identify the ordered chunks.
+func logForkFinalizeStack(diagnostics *slog.Logger, reason string, all bool) {
+	stack := make([]byte, 512*1024)
+	n := runtime.Stack(stack, all)
+	const chunkSize = 16 * 1024
+	for offset := 0; offset < n; offset += chunkSize {
+		end := min(offset+chunkSize, n)
+		diagnostics.Error("finalize stack diagnostic", "event", "juicefs_finalize_stack",
+			"error_reason", reason, "all_goroutines", all, "truncated", n == len(stack),
+			"part", offset/chunkSize+1, "parts", (n+chunkSize-1)/chunkSize,
+			"stack", string(stack[offset:end]))
 	}
 }
 
@@ -147,6 +168,39 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 	finalizeCtx, cancel := context.WithTimeout(context.Background(), finalizeTimeout)
 	defer cancel()
 
+	// stderr is appended to the existing mount log, independently of the
+	// requester and its temporary ack files. Do not read the FUSE mount here.
+	diagnostics := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				a.Key = "ts"
+			}
+			return a
+		},
+	})).With("service", "juicefs", "deployment_prefix", os.Getenv("RUN9_DEPLOYMENT_PREFIX"),
+		"env_name", os.Getenv("RUN9_ENV_NAME"), "region", os.Getenv("RUN9_AWS_REGION"),
+		"host_instance_id", os.Getenv("RUN9_INSTANCE_ID"), "pid", pid, "pid_starttime_ticks", starttimeTicks)
+	if v.Conf != nil && v.Conf.Meta != nil {
+		diagnostics = diagnostics.With("snap_id", filepath.Base(v.Conf.Meta.MountPoint))
+	}
+	diagnostics.Info("finalize requested", "event", "juicefs_finalize_started", "timeout", finalizeTimeout.String())
+	// A synchronous metadata call (including size measurement) can stop the
+	// main goroutine. The independent deadline callback still captures its
+	// stack before the requester's later kill. Join an already-started dump on
+	// the normal timeout path so terminal ack/exit cannot cut its output short.
+	var dumpOnce sync.Once
+	dumpTimeout := func() { dumpOnce.Do(func() { logForkFinalizeStack(diagnostics, "deadline_exceeded", true) }) }
+	stopDiagnostics := context.AfterFunc(finalizeCtx, func() {
+		if finalizeCtx.Err() == context.DeadlineExceeded {
+			dumpTimeout()
+		}
+	})
+	defer func() {
+		if !stopDiagnostics() && finalizeCtx.Err() == context.DeadlineExceeded {
+			dumpTimeout()
+		}
+	}()
+
 	ack := &forkFinalizeAckV1{
 		SchemaVersion:     1,
 		Pid:               pid,
@@ -154,6 +208,7 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 	}
 
 	writePendingAck := func(phase string) {
+		diagnostics.Info("finalize phase started", "event", "juicefs_finalize_phase", "phase", phase)
 		ack.Status = "pending"
 		ack.Phase = phase
 		ack.Error = ""
@@ -176,8 +231,19 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 		logger.Errorf("finalize: %s: %s", phase, err)
 	}
 
+	// A phase can complete at the same instant as its deadline. If that deadline
+	// stops the remaining phases, an empty firstErr must never publish success.
+	deadlineExceeded := func() bool {
+		if finalizeCtx.Err() == nil {
+			return false
+		}
+		recordErr(ack.Phase, forkFinalizePhaseTimeoutErr(finalizeTimeout, requestedTimeout, finalizeCtx.Err()))
+		return true
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
+			logForkFinalizeStack(diagnostics, "finalize_panic", false)
 			ack.Status = "panic"
 			ack.Phase = ""
 			ack.Error = fmt.Sprintf("panic: %v", r)
@@ -204,6 +270,10 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 				}
 			}
 		}
+		if finalizeCtx.Err() == context.DeadlineExceeded {
+			dumpTimeout()
+		}
+		diagnostics.Info("finalize finished", "event", "juicefs_finalize_finished", "status", ack.Status, "phase", ack.Phase, "error_message", ack.Error)
 		ack.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 		if err := writeForkFinalizeAck(ackPath, ack); err != nil {
 			logger.Errorf("finalize: write ack: %s", err)
@@ -214,10 +284,10 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 	}()
 
 	writePendingAck("flush_all")
-	recordErr("flush_all", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
+	recordErr("flush_all", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, diagnostics, func() error {
 		return forkFinalizeFlushAll(v)
 	}))
-	if finalizeCtx.Err() != nil {
+	if deadlineExceeded() {
 		return resultErr
 	}
 
@@ -236,7 +306,7 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 			}
 			recordErr("upload_drain", err)
 		}
-		if finalizeCtx.Err() != nil {
+		if deadlineExceeded() {
 			return resultErr
 		}
 	}
@@ -252,15 +322,15 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 	}
 
 	writePendingAck("close_session")
-	recordErr("close_session", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
+	recordErr("close_session", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, diagnostics, func() error {
 		return metaCli.CloseSession()
 	}))
-	if finalizeCtx.Err() != nil {
+	if deadlineExceeded() {
 		return resultErr
 	}
 
 	writePendingAck("shutdown")
-	recordErr("shutdown", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, func() error {
+	recordErr("shutdown", runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, diagnostics, func() error {
 		return metaCli.Shutdown()
 	}))
 	// Process exit will reclaim object-storage resources. Do not add another

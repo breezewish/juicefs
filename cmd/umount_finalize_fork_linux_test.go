@@ -207,3 +207,27 @@ func TestWaitFinalizeAck_Timeout(t *testing.T) {
 		t.Fatalf("waitFinalizeAck should return context deadline, got %v", err)
 	}
 }
+
+func TestFinalizeKillRetainsIdentityAndSignalResult(t *testing.T) {
+	child := exec.Command("sleep", "30")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	pid := child.Process.Pid
+	start, err := readProcStatStarttimeTicks(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := killForkMountProcess(nil, pid, start+1)
+	if stale["attempted"] != false {
+		t.Fatalf("signalled reused PID: %+v", stale)
+	}
+	if err := child.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("child killed by stale identity: %v", err)
+	}
+	killed := killForkMountProcess(nil, pid, start)
+	if killed["attempted"] != true || killed["signal_sent"] != true || killed["observed_starttime_ticks"] != start {
+		t.Fatalf("missing kill evidence: %+v", killed)
+	}
+}

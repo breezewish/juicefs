@@ -4,9 +4,12 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -786,6 +789,104 @@ func TestRunForkFinalizeOnMain_TimesOutShutdownWritesAck(t *testing.T) {
 		}
 		if ack.FinishedAt == "" {
 			t.Fatalf("ack should include finished_at: %+v", ack)
+		}
+	})
+}
+
+// Use a subprocess because diagnostics own stderr and finalize installs global
+// hooks. A blocked synchronous measurement must still produce evidence before
+// that call returns, without relying on the requester or a responsive FUSE mount.
+func TestFinalizeDiagnosticsSurviveBlockedMeasurement(t *testing.T) {
+	if os.Getenv("JFS_TEST_FINALIZE_DIAGNOSTICS") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestFinalizeDiagnosticsSurviveBlockedMeasurement$")
+		child.Env = append(os.Environ(), "JFS_TEST_FINALIZE_DIAGNOSTICS=1")
+		output, err := child.CombinedOutput()
+		if err != nil {
+			t.Fatalf("child: %v\n%s", err, output)
+		}
+		text := string(output)
+		phase := strings.Index(text, `"phase":"measure_size"`)
+		stack := strings.Index(text, `"event":"juicefs_finalize_stack"`)
+		returned := strings.Index(text, "measurement-returned")
+		if phase < 0 || stack < phase || returned < stack || !strings.Contains(text, `"error_reason":"deadline_exceeded"`) || !strings.Contains(text, `"pid_starttime_ticks":`) {
+			t.Fatalf("missing ordered deadline evidence: %s", output)
+		}
+		return
+	}
+	pid := os.Getpid()
+	start, err := readProcStatStarttimeTicks(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackPath := forkFinalizeAckPath(pid, start)
+	reqPath := forkFinalizeRequestPath(pid, start)
+	t.Cleanup(func() { _ = os.Remove(ackPath); _ = os.Remove(reqPath) })
+	if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{SchemaVersion: 1, FinalizeTimeout: "100ms"}); err != nil {
+		t.Fatal(err)
+	}
+	forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
+	forkFinalizeMeasureSize = func(*vfs.VFS) (uint64, uint64, error) {
+		time.Sleep(300 * time.Millisecond)
+		fmt.Fprintln(os.Stderr, "measurement-returned")
+		return 0, 0, nil
+	}
+	if err := runForkFinalizeOnMain(&fakeFinalizeSessionShutdowner{}, &vfs.VFS{Conf: &vfs.Config{}}, nil, nil); err == nil {
+		t.Fatal("expected deadline failure")
+	}
+}
+
+func TestFinalizePhasePanicRetainsOriginalStack(t *testing.T) {
+	var output bytes.Buffer
+	diagnostics := slog.New(slog.NewJSONHandler(&output, nil))
+	defer func() {
+		if recover() != "phase panic" {
+			t.Error("panic was not propagated")
+		}
+		if !strings.Contains(output.String(), `"error_reason":"phase_panic"`) || !strings.Contains(output.String(), "panicFinalizePhaseForTest") {
+			t.Fatalf("original panic stack missing: %s", output.String())
+		}
+	}()
+	_ = runForkFinalizeBlockingPhase(context.Background(), time.Second, time.Second, diagnostics, panicFinalizePhaseForTest)
+}
+
+func panicFinalizePhaseForTest() error { panic("phase panic") }
+
+type deadlineCompletingChunkStore struct{ fakeFinalizeChunkStore }
+
+func (*deadlineCompletingChunkStore) WaitForUploadDrain(ctx context.Context) error {
+	<-ctx.Done()
+	return nil
+}
+
+func TestFinalizeDeadlineCannotSkipShutdownAndPublishSuccess(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pid := os.Getpid()
+		start, err := readProcStatStarttimeTicks(pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ackPath := forkFinalizeAckPath(pid, start)
+		reqPath := forkFinalizeRequestPath(pid, start)
+		t.Cleanup(func() { _ = os.Remove(ackPath); _ = os.Remove(reqPath) })
+		if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{SchemaVersion: 1, FinalizeTimeout: "20ms"}); err != nil {
+			t.Fatal(err)
+		}
+		origFlush := forkFinalizeFlushAll
+		forkFinalizeFlushAll = func(*vfs.VFS) error { return nil }
+		t.Cleanup(func() { forkFinalizeFlushAll = origFlush })
+		metaCli := &fakeFinalizeSessionShutdowner{}
+		err = runForkFinalizeOnMain(metaCli, &vfs.VFS{Conf: &vfs.Config{Chunk: &chunk.Config{Writeback: true}}, Store: &deadlineCompletingChunkStore{}}, nil, nil)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected deadline failure, got %v", err)
+		}
+		ack, err := readFinalizeAckFile(ackPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ack.Status != "error" || ack.Phase != "upload_drain" || metaCli.shutdownCalls != 0 {
+			t.Fatalf("skipped shutdown must not prove finalize: %+v", ack)
 		}
 	})
 }

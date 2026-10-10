@@ -237,7 +237,7 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 		}
 		if startErr != nil {
 			result.Reason = startErr.Error()
-			killForkMountProcess(conf, pid, expectedStarttime)
+			result.Termination = killForkMountProcess(conf, pid, expectedStarttime)
 			return result, 1
 		}
 		if startAck.Status == "ok" {
@@ -246,7 +246,7 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 			result.DaemonExitObserved = waitProcessExit(ctx.Context, pid, expectedStarttime, exitObserveTimeout)
 			if !result.DaemonExitObserved {
 				logger.Warnf("finalize ack is ok but mount daemon didn't exit within %s, killing it best-effort", exitObserveTimeout)
-				killForkMountProcess(conf, pid, expectedStarttime)
+				result.Termination = killForkMountProcess(conf, pid, expectedStarttime)
 			}
 			return result, 0
 		}
@@ -278,7 +278,7 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 		reason, shouldKill := forkFinalizeAckWaitFailure(ackErr, finalizeTimeout)
 		result.Reason = reason
 		if shouldKill {
-			killForkMountProcess(conf, pid, expectedStarttime)
+			result.Termination = killForkMountProcess(conf, pid, expectedStarttime)
 		}
 		return result, 1
 	}
@@ -289,7 +289,7 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 	result.DaemonExitObserved = waitProcessExit(ctx.Context, pid, expectedStarttime, exitObserveTimeout)
 	if !result.DaemonExitObserved {
 		logger.Warnf("finalize ack is ok but mount daemon didn't exit within %s, killing it best-effort", exitObserveTimeout)
-		killForkMountProcess(conf, pid, expectedStarttime)
+		result.Termination = killForkMountProcess(conf, pid, expectedStarttime)
 	}
 
 	return result, 0
@@ -620,18 +620,35 @@ func waitProcessExit(ctx context.Context, pid int, expectedStarttime uint64, tim
 	}
 }
 
-func killForkMountProcess(conf *vfs.Config, pid int, expectedStarttime uint64) {
+// Return identity and syscall evidence before the caller loses the daemon.
+// Missing or reused PIDs are explicit observations, never successful kills.
+func killForkMountProcess(conf *vfs.Config, pid int, expectedStarttime uint64) map[string]any {
+	d := map[string]any{"pid": pid, "expected_starttime_ticks": expectedStarttime, "signal": "SIGKILL", "attempted": false}
 	starttime, ppid, err := readProcStatStarttimeTicksAndPPid(pid)
 	if err != nil {
-		return
+		d["error_message"] = err.Error()
+		return d
 	}
+	d["observed_starttime_ticks"] = starttime
 	if starttime != expectedStarttime {
-		return
+		d["error_message"] = "process identity changed"
+		return d
 	}
-	_ = syscall.Kill(pid, syscall.SIGKILL)
+	d["attempted"] = true
+	err = syscall.Kill(pid, syscall.SIGKILL)
+	d["signal_sent"] = err == nil
+	if err != nil {
+		d["error_message"] = err.Error()
+	}
 	if conf != nil && conf.CommPath != "" && conf.PPid > 1 && ppid == conf.PPid {
-		_ = syscall.Kill(conf.PPid, syscall.SIGKILL)
+		err = syscall.Kill(conf.PPid, syscall.SIGKILL)
+		d["supervisor_pid"] = conf.PPid
+		d["supervisor_signal_sent"] = err == nil
+		if err != nil {
+			d["supervisor_error_message"] = err.Error()
+		}
 	}
+	return d
 }
 
 func processMatches(pid int, expectedStarttime uint64) bool {
