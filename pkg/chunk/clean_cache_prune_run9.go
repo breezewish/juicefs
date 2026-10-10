@@ -2,6 +2,7 @@ package chunk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -30,6 +31,29 @@ type CleanCacheUsage struct {
 // root. Limits are host watermarks, not admission reservations: concurrent fills
 // can temporarily exceed them. The only cross-process lock is between cleaners.
 func PruneCleanCache(ctx context.Context, root string, maxBytes, maxItems uint64) (result CleanCacheUsage, err error) {
+	// Stage records are bounded and contain no paths or object keys. Emit before
+	// synchronous filesystem work so a caller killing this process retains the
+	// last reached stage, even when a syscall never returns.
+	started := time.Now()
+	phase := "lock"
+	report := func(state string) {
+		_ = json.NewEncoder(os.Stderr).Encode(struct {
+			Event      string          `json:"event"`
+			Phase      string          `json:"phase"`
+			State      string          `json:"state"`
+			DurationMS int64           `json:"duration_ms"`
+			Usage      CleanCacheUsage `json:"usage"`
+		}{"clean_cache_prune", phase, state, time.Since(started).Milliseconds(), result})
+	}
+	report("started")
+	defer func() {
+		result.OK = err == nil
+		if err != nil {
+			report("failed")
+		} else {
+			report("finished")
+		}
+	}()
 	result.OK = true
 	info, err := os.Lstat(root)
 	if os.IsNotExist(err) {
@@ -63,6 +87,8 @@ func PruneCleanCache(ctx context.Context, root string, maxBytes, maxItems uint64
 	var blocks []entry
 	var directories []string
 	now := time.Now()
+	phase = "scan"
+	report("started")
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -125,10 +151,15 @@ func PruneCleanCache(ctx context.Context, root string, maxBytes, maxItems uint64
 		return result, err
 	}
 	defer func() {
+		phase = "prune_empty_dirs"
+		report("started")
 		// Reverse walk order visits children before parents. Remove only empty
 		// directories; concurrent publishers can make them non-empty again.
 		for i := len(directories) - 1; i >= 0; i-- {
 			if ctx.Err() != nil {
+				if err == nil {
+					err = ctx.Err()
+				}
 				break
 			}
 			if e := os.Remove(directories[i]); e != nil && !os.IsNotExist(e) && !errors.Is(e, syscall.ENOTEMPTY) && !errors.Is(e, syscall.EEXIST) {
@@ -140,6 +171,8 @@ func PruneCleanCache(ctx context.Context, root string, maxBytes, maxItems uint64
 	}()
 	// Reserve 10% of both physical bytes and inodes for non-cache work, including
 	// writeback. Pinned prewarm blocks consume this space but are never removed.
+	phase = "disk_usage"
+	report("started")
 	total, free, files, ffree := diskUsageFn(root)
 	byteTarget, itemTarget := maxBytes, maxItems
 	if free < total/10 {
@@ -154,7 +187,11 @@ func PruneCleanCache(ctx context.Context, root string, maxBytes, maxItems uint64
 	// Leave headroom so the next pass does not repeatedly evict only one block.
 	byteTarget = byteTarget * 9 / 10
 	itemTarget = itemTarget * 9 / 10
+	phase = "sort"
+	report("started")
 	sort.Slice(blocks, func(i, j int) bool { return blocks[i].accessed.Before(blocks[j].accessed) })
+	phase = "evict"
+	report("started")
 	for _, block := range blocks {
 		if result.Bytes <= byteTarget && result.Blocks <= itemTarget {
 			break

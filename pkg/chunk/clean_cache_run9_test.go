@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -323,4 +324,29 @@ func TestCleanCachePruneSerializesCleanersAndRemovesAbandonedFills(t *testing.T)
 	require.NoFileExists(t, abandoned)
 	require.FileExists(t, active)
 	require.FileExists(t, filepath.Join(cache.dir, cacheDir, key))
+}
+
+func TestCleanCachePruneCannotReportSuccessAfterDirectoryCleanupCancellation(t *testing.T) {
+	// Other cache tests leave background disk probes running. Isolate the
+	// process-wide statfs stub from those readers.
+	if os.Getenv("RUN9_TEST_PRUNE_CANCEL") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestCleanCachePruneCannotReportSuccessAfterDirectoryCleanupCancellation$")
+		cmd.Env = append(os.Environ(), "RUN9_TEST_PRUNE_CANCEL=1")
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s", output)
+		return
+	}
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "empty-volume"), 0700))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	original := diskUsageFn
+	defer func() { diskUsageFn = original }()
+	diskUsageFn = func(string) (uint64, uint64, uint64, uint64) {
+		cancel() // The scan succeeded, but empty-directory cleanup is still pending.
+		return 100, 100, 100, 100
+	}
+	usage, err := PruneCleanCache(ctx, root, 100, 100)
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, usage.OK)
 }
