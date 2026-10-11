@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -31,6 +33,10 @@ type CleanCacheUsage struct {
 // root. Limits are host watermarks, not admission reservations: concurrent fills
 // can temporarily exceed them. The only cross-process lock is between cleaners.
 func PruneCleanCache(ctx context.Context, root string, maxBytes, maxItems uint64) (result CleanCacheUsage, err error) {
+	// Capture a blocked syscall before VMA's 30s process deadline. The watcher
+	// reads no mutable pruning state; progress below stays on the pruning thread.
+	stopDiagnostic := watchCleanCachePrune(os.Stderr, 20*time.Second)
+	defer stopDiagnostic()
 	// Stage records are bounded and contain no paths or object keys. Emit before
 	// synchronous filesystem work so a caller killing this process retains the
 	// last reached stage, even when a syscall never returns.
@@ -89,7 +95,14 @@ func PruneCleanCache(ctx context.Context, root string, maxBytes, maxItems uint64
 	now := time.Now()
 	phase = "scan"
 	report("started")
+	progressAt := time.Now().Add(5 * time.Second)
+	progressReports := 0
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if progressReports < 4 && time.Now().After(progressAt) {
+			report("progress")
+			progressReports++
+			progressAt = time.Now().Add(5 * time.Second)
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -208,4 +221,26 @@ func PruneCleanCache(ctx context.Context, root string, maxBytes, maxItems uint64
 		result.RemovedBlocks++
 	}
 	return result, nil
+}
+
+// watchCleanCachePrune emits one bounded stack snapshot even if filesystem work
+// stops returning. It never logs cache paths, object keys, argv or environment.
+// Stopping joins an already-fired callback, so no diagnostic outlives its pass.
+func watchCleanCachePrune(w io.Writer, after time.Duration) func() {
+	done := make(chan struct{})
+	timer := time.AfterFunc(after, func() {
+		defer close(done)
+		stack := make([]byte, 64*1024)
+		n := runtime.Stack(stack, true)
+		_ = json.NewEncoder(w).Encode(struct {
+			Event     string `json:"event"`
+			Truncated bool   `json:"truncated"`
+			Stack     string `json:"stack"`
+		}{"clean_cache_prune_slow_stack", n == len(stack), string(stack[:n])})
+	})
+	return func() {
+		if !timer.Stop() {
+			<-done
+		}
+	}
 }

@@ -3,6 +3,7 @@ package chunk
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -17,6 +18,29 @@ import (
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCleanCachePruneSlowDiagnostic(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	stop := watchCleanCachePrune(writer, time.Millisecond)
+	var record struct {
+		Event string `json:"event"`
+		Stack string `json:"stack"`
+	}
+	require.NoError(t, json.NewDecoder(reader).Decode(&record))
+	stop()
+	require.Equal(t, "clean_cache_prune_slow_stack", record.Event)
+	require.Contains(t, record.Stack, "TestCleanCachePruneSlowDiagnostic")
+	require.LessOrEqual(t, len(record.Stack), 64*1024)
+}
+
+func TestCleanCachePruneDiagnosticStopsWithPass(t *testing.T) {
+	var output bytes.Buffer
+	stop := watchCleanCachePrune(&output, time.Hour)
+	stop()
+	require.Empty(t, output.String())
+}
 
 func TestCleanCacheSharesOneCopyAcrossIndependentStores(t *testing.T) {
 	mem, err := object.CreateStorage("mem", "", "", "", "")
