@@ -50,6 +50,37 @@ func TestRun9CheckpointEffectiveReferencesAndCorruption(t *testing.T) {
 	require.Nil(t, ids)
 }
 
+// A clone is a new name even when its source was already unlinked and only held
+// open. The scan skips files without links, so the clone must have one.
+func TestRun9CheckpointRetainsCloneOfUnlinkedOpenFile(t *testing.T) {
+	ctx := Background()
+	dir := t.TempDir()
+	client, err := newKVMeta("badger", dir, testConfig())
+	require.NoError(t, err)
+	m := client.(*kvMeta)
+	f := testFormat()
+	f.TrashDays = 0
+	require.NoError(t, m.Init(f, false))
+	require.NoError(t, m.client.txn(ctx, func(tx *kvTxn) error {
+		tx.set(m.inodeKey(2), (&Attr{Typ: TypeFile, Mode: 0644, Nlink: 0, Length: 200}).Marshal())
+		tx.set(m.chunkKey(2, 0), marshalSlice(0, 10, 200, 0, 200))
+		return nil
+	}, 0))
+	var count, total uint64
+	require.Zero(t, m.Clone(ctx, RootInode, 2, RootInode, "clone", 0, 0, 1, &count, &total))
+	var clone Ino
+	var attr Attr
+	require.Zero(t, m.Lookup(ctx, RootInode, "clone", &clone, &attr, false))
+	require.Equal(t, uint32(1), attr.Nlink)
+	require.NoError(t, m.Shutdown())
+	reader, err := OpenRun9Checkpoint(dir)
+	require.NoError(t, err)
+	ids, err := reader.Run9CheckpointSlices(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{10}, ids)
+	require.NoError(t, reader.Shutdown())
+}
+
 func TestRun9CheckpointAllocationEndIncludesUnusedReservations(t *testing.T) {
 	m := &baseMeta{}
 	require.Equal(t, uint64(123), m.Run9SliceAllocationEnd(123))

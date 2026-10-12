@@ -4058,7 +4058,9 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			attr.Ctimensec = uint32(now.Nanosecond())
 		}
 		// TODO: preserve hardlink
-		if attr.Typ == TypeFile && attr.Nlink > 1 {
+		// The clone is one new name. An unlinked source that is still open has no
+		// links; inheriting that would hide the clone from Run9's checkpoint scan.
+		if attr.Typ == TypeFile {
 			attr.Nlink = 1
 		}
 

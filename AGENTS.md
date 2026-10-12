@@ -57,6 +57,26 @@ Related files:
 
 - `pkg/meta/redis_batch_clone_run9.go`
 
+### Run9 Fork Checkpoint GC
+
+- `gc-checkpoint` retains every slice in each direct child's immutable fork
+  checkpoint. The first strict scan stores a checksummed slice list; unreadable
+  evidence falls back to the child's allocation bound. Cached reads use no
+  metadata scan budget. Failed scans retain by the fork bound for the rest of
+  that pass without rescanning, and are retried in a later pass. These records
+  let pending rounds advance without a separate metadata scan cursor.
+- The `--fork-checkpoints` flag makes older helpers reject requests whose
+  deletion ranges require these additional retention proofs.
+- Badger file clones always receive one link, including clones of unlinked
+  open files, so named clones remain visible to strict checkpoint scans.
+
+Related files:
+
+- `cmd/run9_checkpoint.go`
+- `cmd/run9_fork_checkpoint.go`
+- `pkg/meta/run9_checkpoint.go`
+- `pkg/meta/tkv.go`
+
 ### Immutable Read View Server
 
 - The hidden `serve-read-view` command holds one immutable Badger generation and its object storage client open, and serves GET, HEAD, Range, conditional requests, bounded directory listings, and bounded doublestar globs over regular files through a mode-0600 Unix socket. Requests may select a filesystem root; absolute and relative symlinks remain confined to that root. Glob traversal stays inside the reader so remote callers need only one request. A Glob may apply root and nested `.gitignore` files before matching and limiting, with semantics and resource bounds kept identical to run9's online reader.
