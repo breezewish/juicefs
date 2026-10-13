@@ -25,12 +25,20 @@ func TestCleanCachePruneSlowDiagnostic(t *testing.T) {
 	defer writer.Close()
 	stop := watchCleanCachePrune(writer, time.Millisecond)
 	var record struct {
-		Event string `json:"event"`
-		Stack string `json:"stack"`
+		Timestamp time.Time `json:"ts"`
+		Event     string    `json:"event"`
+		Stack     string    `json:"stack"`
 	}
-	require.NoError(t, json.NewDecoder(reader).Decode(&record))
+	decoder := json.NewDecoder(reader)
+	require.NoError(t, decoder.Decode(&record))
+	require.Equal(t, "clean_cache_prune_stack_started", record.Event)
+	require.False(t, record.Timestamp.IsZero())
+	require.Empty(t, record.Stack)
+	started := record.Timestamp
+	require.NoError(t, decoder.Decode(&record))
 	stop()
 	require.Equal(t, "clean_cache_prune_slow_stack", record.Event)
+	require.False(t, record.Timestamp.Before(started))
 	require.Contains(t, record.Stack, "TestCleanCachePruneSlowDiagnostic")
 	require.LessOrEqual(t, len(record.Stack), 64*1024)
 }

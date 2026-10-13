@@ -44,12 +44,13 @@ func PruneCleanCache(ctx context.Context, root string, maxBytes, maxItems uint64
 	phase := "lock"
 	report := func(state string) {
 		_ = json.NewEncoder(os.Stderr).Encode(struct {
+			Timestamp  time.Time       `json:"ts"`
 			Event      string          `json:"event"`
 			Phase      string          `json:"phase"`
 			State      string          `json:"state"`
 			DurationMS int64           `json:"duration_ms"`
 			Usage      CleanCacheUsage `json:"usage"`
-		}{"clean_cache_prune", phase, state, time.Since(started).Milliseconds(), result})
+		}{time.Now().UTC(), "clean_cache_prune", phase, state, time.Since(started).Milliseconds(), result})
 	}
 	report("started")
 	defer func() {
@@ -230,13 +231,24 @@ func watchCleanCachePrune(w io.Writer, after time.Duration) func() {
 	done := make(chan struct{})
 	timer := time.AfterFunc(after, func() {
 		defer close(done)
+		// Emit before stopping goroutines for a stack snapshot. If collection
+		// stalls, the caller still knows the watchdog ran; absolute timestamps
+		// separate child startup time from time spent inside pruning.
+		record := struct {
+			Timestamp time.Time `json:"ts"`
+			Event     string    `json:"event"`
+			Truncated bool      `json:"truncated,omitempty"`
+			Stack     string    `json:"stack,omitempty"`
+		}{Timestamp: time.Now().UTC(), Event: "clean_cache_prune_stack_started"}
+		encoder := json.NewEncoder(w)
+		_ = encoder.Encode(record)
 		stack := make([]byte, 64*1024)
 		n := runtime.Stack(stack, true)
-		_ = json.NewEncoder(w).Encode(struct {
-			Event     string `json:"event"`
-			Truncated bool   `json:"truncated"`
-			Stack     string `json:"stack"`
-		}{"clean_cache_prune_slow_stack", n == len(stack), string(stack[:n])})
+		record.Timestamp = time.Now().UTC()
+		record.Event = "clean_cache_prune_slow_stack"
+		record.Truncated = n == len(stack)
+		record.Stack = string(stack[:n])
+		_ = encoder.Encode(record)
 	})
 	return func() {
 		if !timer.Stop() {
