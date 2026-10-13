@@ -632,11 +632,8 @@ func canShutdownGracefully(mp string, newConf *vfs.Config) bool {
 	if csiCommPath != "" {
 		return false
 	}
-	var ino uint64
-	var err error
-	err = utils.WithTimeout(context.TODO(), func(context.Context) error {
-		ino, err = utils.GetFileInode(mp)
-		return err
+	ino, err := utils.WithTimeoutResult(context.TODO(), func(context.Context) (uint64, error) {
+		return utils.GetFileInode(mp)
 	}, time.Second*3)
 	if err != nil {
 		logger.Warnf("get inode of %s: %s", mp, err)

@@ -388,9 +388,10 @@ func (store *cachedStore) put(key string, p *Page) error {
 
 func (store *cachedStore) delete(key string) error {
 	st := time.Now()
-	var reqID string
-	err := utils.WithTimeout(context.TODO(), func(ctx context.Context) error {
-		return store.storage.Delete(ctx, key, object.WithRequestID(&reqID))
+	reqID, err := utils.WithTimeoutResult(context.TODO(), func(ctx context.Context) (string, error) {
+		var reqID string
+		err := store.storage.Delete(ctx, key, object.WithRequestID(&reqID))
+		return reqID, err
 	}, store.conf.PutTimeout)
 	used := time.Since(st)
 	if err != nil && (strings.Contains(err.Error(), "NoSuchKey") ||
@@ -410,6 +411,7 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	sync := s != nil
 	blen := len(block.Data)
 	cacheUploaded := store.cleanCache != nil && (!sync || blen < store.conf.BlockSize || store.conf.CacheLargeWrite)
+	cacheBeforeUpload := store.cleanCache == nil && sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite)
 	if cacheUploaded {
 		// Keep the uncompressed bytes until PUT confirms this is a clean block.
 		block.Acquire()
@@ -417,15 +419,15 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	}
 	bufSize := store.compressor.CompressBound(blen)
 	var buf *Page
-	if bufSize > blen || (cacheUploaded && !store.seekable) {
+	if bufSize > blen || cacheBeforeUpload || (cacheUploaded && !store.seekable) {
 		buf = NewOffPage(max(bufSize, blen))
 	} else {
 		buf = block
 		buf.Acquire()
 	}
 	defer buf.Release()
-	if store.cleanCache == nil && sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
-		// block will be freed after written into disk
+	if cacheBeforeUpload {
+		// The asynchronous cache writer owns the original bytes and slice header.
 		store.bcache.cache(key, block, false, false)
 	}
 	n, err := store.compressor.Compress(buf.Data, block.Data)
@@ -489,19 +491,18 @@ func (s *wSlice) upload(indx int) {
 			// Register before exposing the staging file: the background scanner
 			// can PUT it immediately, even before stage() returns.
 			s.store.uploads.start(key, blen)
-			stagingPath := "unknown"
-			stageFailed := false
+			var stageFailed atomic.Bool
 			block.Acquire()
-			err := utils.WithTimeout(context.TODO(), func(context.Context) (err error) { // In case it hangs for more than 5 minutes(see fileWriter.flush), fallback to uploading directly to avoid `EIO`
+			stagingPath, err := utils.WithTimeoutResult(context.TODO(), func(ctx context.Context) (string, error) { // A stuck disk must not prevent direct upload.
 				defer block.Release()
-				stagingPath, err = s.store.bcache.stage(key, block.Data)
-				if err == nil && stageFailed { // upload thread already marked me as failed because of timeout
+				stagingPath, err := s.store.bcache.stage(key, block.Data)
+				if err == nil && (stageFailed.Load() || ctx.Err() != nil) { // upload thread already marked me as failed because of timeout
 					_ = s.store.bcache.removeStage(key)
 				}
-				return err
+				return stagingPath, err
 			}, s.store.conf.PutTimeout)
 			if err != nil {
-				stageFailed = true
+				stageFailed.Store(true)
 				if !errors.Is(err, errStageConcurrency) {
 					s.store.stageBlockErrors.Add(1)
 					logger.Warnf("write %s to disk: %s, upload it directly", key, err)
@@ -792,6 +793,27 @@ func logRequest(typeStr, key, param, reqID string, err error, used time.Duration
 
 var errTryFullRead = errors.New("try full read")
 
+// A timed-out object request may still complete. Publish its diagnostics and
+// byte count together, without writing into its caller's error or result fields.
+type objectReadResult struct {
+	n            int
+	requestID    string
+	storageClass string
+}
+
+func (store *cachedStore) readObject(ctx context.Context, key string, data []byte, off, limit int64, compressed bool) (objectReadResult, error) {
+	result := objectReadResult{storageClass: object.DefaultStorageClass}
+	in, err := store.storage.Get(ctx, key, off, limit, object.WithRequestID(&result.requestID), object.WithStorageClass(&result.storageClass))
+	if err == nil {
+		result.n, err = io.ReadFull(in, data)
+		_ = in.Close()
+	}
+	if compressed && err == io.ErrUnexpectedEOF {
+		err = nil
+	}
+	return result, err
+}
+
 func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page, off int) (n int, err error) {
 	p := page.Data
 	fullPage, err := store.group.TryPiggyback(key)
@@ -810,20 +832,18 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	}
 
 	start := time.Now()
-	var (
-		reqID string
-		sc    = object.DefaultStorageClass
-	)
-	page.Acquire()
-	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
-		defer page.Release()
-		in, err := store.storage.Get(cCtx, key, int64(off), int64(len(p)), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
-		if err == nil {
-			n, err = io.ReadFull(in, p)
-			_ = in.Close()
-		}
-		return err
+	readPage := NewOffPage(len(p))
+	defer readPage.Release()
+	readPage.Acquire()
+	result, err := utils.WithTimeoutResult(ctx, func(cCtx context.Context) (objectReadResult, error) {
+		defer readPage.Release()
+		return store.readObject(cCtx, key, readPage.Data, int64(off), int64(len(p)), false)
 	}, store.conf.GetTimeout)
+	n = result.n
+	reqID, sc := result.requestID, result.storageClass
+	if err == nil {
+		copy(p, readPage.Data[:n])
+	}
 
 	used := time.Since(start)
 	logRequest("GET", key, fmt.Sprintf("RANGE(%d,%d) ", off, len(p)), reqID, err, used)
@@ -856,35 +876,18 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 	if store.downLimit != nil && !compressed {
 		store.downLimit.Wait(int64(len(page.Data)))
 	}
-	var (
-		in    io.ReadCloser
-		n     int
-		p     *Page
-		reqID string
-		sc    = object.DefaultStorageClass
-		start = time.Now()
-	)
-	if compressed {
-		c := NewOffPage(needed)
-		defer c.Release()
-		p = c
-	} else {
-		p = page
-	}
+	start := time.Now()
+	// Keep late IO away from a caller that has already retried this page.
+	p := NewOffPage(needed)
+	defer p.Release()
 	p.Acquire()
-	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
+	result, readErr := utils.WithTimeoutResult(ctx, func(cCtx context.Context) (objectReadResult, error) {
 		defer p.Release()
-		// it will be retried in the upper layer.
-		in, err = store.storage.Get(cCtx, key, 0, -1, object.WithRequestID(&reqID), object.WithStorageClass(&sc))
-		if err == nil {
-			n, err = io.ReadFull(in, p.Data)
-			_ = in.Close()
-		}
-		if compressed && err == io.ErrUnexpectedEOF {
-			err = nil
-		}
-		return err
+		return store.readObject(cCtx, key, p.Data, 0, -1, compressed)
 	}, store.conf.GetTimeout)
+	err = readErr
+	n, reqID, sc := result.n, result.requestID, result.storageClass
+
 	if errors.Is(err, context.Canceled) {
 		return err
 	}
@@ -901,6 +904,8 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 	}
 	if compressed {
 		n, err = store.compressor.Decompress(page.Data, p.Data[:n])
+	} else {
+		copy(page.Data, p.Data[:n])
 	}
 	if err != nil || n < len(page.Data) {
 		return fmt.Errorf("read %s fully: %v (%d < %d) after %s", key, err, n, len(page.Data), used)

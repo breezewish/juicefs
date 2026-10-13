@@ -107,26 +107,40 @@ func FindLocalIPs(allowedInterfaces ...string) ([]net.IP, error) {
 	return ips, nil
 }
 
+// WithTimeout returns without waiting for a callback that ignores cancellation.
+// Callbacks must not mutate values the caller accesses after this returns.
 func WithTimeout(pCtx context.Context, f func(context.Context) error, timeout time.Duration) error {
-	var done = make(chan int, 1)
-	var t = time.NewTimer(timeout)
-	var err error
+	_, err := WithTimeoutResult(pCtx, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, f(ctx)
+	}, timeout)
+	return err
+}
+
+// WithTimeoutResult publishes callback results only after completion. Late results
+// remain private to the callback, even when it ignores cancellation.
+func WithTimeoutResult[T any](pCtx context.Context, f func(context.Context) (T, error), timeout time.Duration) (T, error) {
+	type result struct {
+		value T
+		err   error
+	}
+	done := make(chan result, 1)
+	t := time.NewTimer(timeout)
+	defer t.Stop()
 	ctx, cancel := context.WithCancel(pCtx)
+	defer cancel()
 	go func() {
-		err = f(ctx)
-		done <- 1
+		value, err := f(ctx)
+		done <- result{value, err}
 	}()
+	var zero T
 	select {
 	case <-ctx.Done():
-		err = ctx.Err()
-		t.Stop()
-	case <-done:
-		t.Stop()
+		return zero, ctx.Err()
+	case r := <-done:
+		return r.value, r.err
 	case <-t.C:
-		err = fmt.Errorf("timeout after %s: %w", timeout, ErrFuncTimeout)
+		return zero, fmt.Errorf("timeout after %s: %w", timeout, ErrFuncTimeout)
 	}
-	cancel()
-	return err
 }
 
 func RemovePassword(uri string) string {
