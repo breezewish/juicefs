@@ -4007,30 +4007,62 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 	close(kv)
 	wg.Wait()
 
-	// update nlinks and parents for hardlinks
-	st := make(map[Ino]int64)
-	defer m.loadDumpedQuotas(Background(), dm.Quotas)
-	return m.txn(Background(), func(tx *kvTxn) error {
-		for i, ps := range parents {
-			if len(ps) > 1 {
-				a := tx.get(m.inodeKey(i))
-				// reset nlink and parent
-				binary.BigEndian.PutUint32(a[47:51], uint32(len(ps))) // nlink
-				binary.BigEndian.PutUint64(a[63:71], 0)
-				tx.set(m.inodeKey(i), a)
-				for k := range st {
-					delete(st, k)
-				}
-				for _, p := range ps {
-					st[p] = st[p] + 1
-				}
-				for p, c := range st {
-					tx.set(m.parentKey(i, p), packCounter(c))
-				}
+	// Hardlink metadata can exceed one transaction even for a single inode.
+	// The destination is offline, so publish these adjustments in bounded batches.
+	var pending []*pair
+	var pendingBytes int
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		err := m.txn(Background(), func(tx *kvTxn) error {
+			for _, p := range pending {
+				tx.set(p.key, p.value)
 			}
+			return nil
+		})
+		pending, pendingBytes = pending[:0], 0
+		return err
+	}
+	add := func(key, value []byte) error {
+		pending = append(pending, &pair{key, value})
+		pendingBytes += len(key) + len(value)
+		if len(pending) >= batch || pendingBytes > 5<<20 {
+			return flush()
 		}
 		return nil
-	})
+	}
+	for i, ps := range parents {
+		if len(ps) <= 1 {
+			continue
+		}
+		var attr []byte
+		if err := m.txn(Background(), func(tx *kvTxn) error {
+			attr = tx.get(m.inodeKey(i))
+			return nil
+		}); err != nil {
+			return err
+		}
+		binary.BigEndian.PutUint32(attr[47:51], uint32(len(ps)))
+		binary.BigEndian.PutUint64(attr[63:71], 0)
+		if err := add(m.inodeKey(i), attr); err != nil {
+			return err
+		}
+		counts := make(map[Ino]int64)
+		for _, p := range ps {
+			counts[p]++
+		}
+		for p, count := range counts {
+			if err := add(m.parentKey(i, p), packCounter(count)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return err
+	}
+	m.loadDumpedQuotas(Background(), dm.Quotas)
+	return nil
 }
 
 func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, originAttr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {

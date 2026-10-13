@@ -19,6 +19,7 @@ package cmd
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,7 +29,6 @@ import (
 
 	"github.com/DataDog/zstd"
 	"github.com/juicedata/juicefs/pkg/object"
-	"github.com/pkg/errors"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -189,7 +189,7 @@ func convert(path string, key, algo string) (string, error) {
 	return nPath, nil
 }
 
-func load(ctx *cli.Context) error {
+func load(ctx *cli.Context) (retErr error) {
 	setup0(ctx, 1, 2)
 
 	key, algo := ctx.String("encrypt-rsa-key"), ctx.String("encrypt-algo")
@@ -222,6 +222,12 @@ func load(ctx *cli.Context) error {
 	}
 
 	m := meta.NewClient(metaUri, nil)
+	defer func() {
+		retErr = errors.Join(retErr, m.Shutdown())
+		if retErr == nil {
+			logger.Infof("load metadata from %s succeed", src)
+		}
+	}()
 	if format, err := m.Load(false); err == nil {
 		return fmt.Errorf("database %s is used by volume %s", utils.RemovePassword(metaUri), format.Name)
 	}
@@ -255,7 +261,6 @@ func load(ctx *cli.Context) error {
 	} else {
 		return err
 	}
-	logger.Infof("load metadata from %s succeed", src)
 	return nil
 }
 
