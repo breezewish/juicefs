@@ -924,7 +924,9 @@ func deleteRun9SliceRangeMatches(
 	deleteCtx, cancelDelete := context.WithCancel(ctx)
 	defer cancelDelete()
 
-	deleteJobs := make(chan []run9GCExactObject, threads*2)
+	// Admit work only to an available worker. A queued backlog cannot be
+	// guaranteed to drain inside the caller's IO grace after the work budget.
+	deleteJobs := make(chan []run9GCExactObject)
 	supportsBulkDelete := object.SupportsBulkDelete(store)
 	var deletedObjects atomic.Uint64
 	var deletedBytes atomic.Uint64
@@ -969,46 +971,41 @@ func deleteRun9SliceRangeMatches(
 		}()
 	}
 
-	sendBatch := func(batch []run9GCExactObject) error {
+	var workDone <-chan struct{}
+	if !req.WorkDeadline.IsZero() {
+		workCtx, cancelWork := context.WithDeadline(ctx, req.WorkDeadline)
+		defer cancelWork()
+		workDone = workCtx.Done()
+	}
+	sendBatch := func(batch []run9GCExactObject) (bool, error) {
 		if len(batch) == 0 {
-			return nil
+			return true, nil
 		}
-		firstDeleteErrMu.Lock()
-		hasDeleteErr := firstDeleteErr != nil
-		err := firstDeleteErr
-		firstDeleteErrMu.Unlock()
-		if hasDeleteErr {
-			return err
+		if !req.WorkDeadline.IsZero() && !time.Now().Before(req.WorkDeadline) {
+			return false, nil
 		}
-
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-deleteCtx.Done():
+			return false, deleteCtx.Err()
+		case <-workDone:
+			return false, nil
 		case deleteJobs <- batch:
-			return nil
+			return true, nil
 		}
 	}
 
 	matches := make([]run9GCExactObject, 0, batchSize)
 	var matchedForDelete uint64
 	var hasMore bool
-	last := req.After
-	// Listing can stop producing objects while traversing directories or waiting
-	// for a page. The work budget must wake that wait without cancelling deletes
-	// already admitted; those retain the caller's separate IO grace.
-	var workDeadline <-chan time.Time
-	if !req.WorkDeadline.IsZero() {
-		timer := time.NewTimer(time.Until(req.WorkDeadline))
-		defer timer.Stop()
-		workDeadline = timer.C
-	}
+	var scanErr error
+	last, batchAfter := req.After, req.After
 scan:
 	for {
 		var obj object.Object
 		select {
 		case <-ctx.Done():
 			break scan
-		case <-workDeadline:
+		case <-workDone:
 			hasMore = true
 			stopListing()
 			break scan
@@ -1019,9 +1016,8 @@ scan:
 			obj = next
 		}
 		if obj == nil {
-			close(deleteJobs)
-			wg.Wait()
-			return 0, 0, false, "", fmt.Errorf("list range objects returned out-of-order results")
+			scanErr = fmt.Errorf("list range objects returned out-of-order results")
+			break
 		}
 		if !req.WorkDeadline.IsZero() && time.Now().After(req.WorkDeadline) {
 			hasMore = true
@@ -1042,6 +1038,9 @@ scan:
 			break
 		}
 
+		if len(matches) == 0 {
+			batchAfter = last
+		}
 		last = obj.Key()
 		matches = append(matches, run9GCExactObject{
 			Key:  obj.Key(),
@@ -1051,24 +1050,28 @@ scan:
 		if len(matches) >= batchSize || matchedForDelete == req.MaxDeleteObjects {
 			batch := matches
 			matches = make([]run9GCExactObject, 0, batchSize)
-			if err := sendBatch(batch); err != nil {
-				close(deleteJobs)
-				wg.Wait()
-				if err == nil {
-					err = firstDeleteErr
-				}
-				return 0, 0, false, "", err
+			sent, err := sendBatch(batch)
+			if err != nil {
+				scanErr = err
+				break
+			}
+			if !sent {
+				last, hasMore = batchAfter, true
+				stopListing()
+				break
 			}
 		}
 	}
-	if err := sendBatch(matches); err != nil {
-		close(deleteJobs)
-		wg.Wait()
-		if err == nil {
-			err = firstDeleteErr
+	if scanErr == nil {
+		sent, err := sendBatch(matches)
+		scanErr = err
+		if !sent {
+			// Unadmitted matches must be revisited, even if later retained
+			// objects were scanned. All earlier admitted batches finish below.
+			last, hasMore = batchAfter, true
 		}
-		return 0, 0, false, "", err
 	}
+	stopListing()
 	close(deleteJobs)
 	wg.Wait()
 
@@ -1077,6 +1080,9 @@ scan:
 	firstDeleteErrMu.Unlock()
 	if err != nil {
 		return 0, 0, false, "", err
+	}
+	if scanErr != nil {
+		return 0, 0, false, "", scanErr
 	}
 	if ctx.Err() != nil {
 		return 0, 0, false, "", ctx.Err()
