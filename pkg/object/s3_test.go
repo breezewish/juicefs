@@ -78,3 +78,48 @@ func TestS3ClientDeleteObjectsRetriesSlowDown(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int32(2), calls.Load())
 }
+
+func TestS3ClientListRetriesSlowDown(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Query().Get("list-type") != "2" {
+			t.Errorf("unexpected listing request: %s %s", r.Method, r.URL)
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>`))
+			return
+		}
+		_, _ = w.Write([]byte(`<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>chunks/0/0/1_0_1</Key><Size>1</Size><LastModified>2026-10-14T00:00:00Z</LastModified></Contents></ListBucketResult>`))
+	}))
+	t.Cleanup(server.Close)
+	storage, err := newS3(server.URL+"/bucket", "access-key", "secret-key", "")
+	require.NoError(t, err)
+	objects, more, token, err := storage.List(context.Background(), "chunks/", "", "", "", 1000, false)
+	require.NoError(t, err)
+	require.Len(t, objects, 1)
+	require.Equal(t, "chunks/0/0/1_0_1", objects[0].Key())
+	require.False(t, more)
+	require.Empty(t, token)
+	require.Equal(t, int32(2), calls.Load())
+}
+
+func TestS3ClientListDoesNotRetryAccessDenied(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code><Message>Access denied</Message></Error>`))
+	}))
+	t.Cleanup(server.Close)
+	storage, err := newS3(server.URL+"/bucket", "access-key", "secret-key", "")
+	require.NoError(t, err)
+	objects, more, token, err := storage.List(context.Background(), "chunks/", "", "", "", 1000, false)
+	require.ErrorContains(t, err, "AccessDenied")
+	require.Empty(t, objects)
+	require.False(t, more)
+	require.Empty(t, token)
+	require.Equal(t, int32(1), calls.Load())
+}

@@ -800,3 +800,42 @@ func TestListRun9AccountingPartitionsRejectsIncompleteDiscovery(t *testing.T) {
 	require.Equal(t, uint64(2), requests)
 	require.Nil(t, partitions)
 }
+
+func TestDeleteRun9SliceRangeMatchesStopsWaitingForListingAtWorkDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	listCtx, stopListing := context.WithCancel(ctx)
+	defer stopListing()
+	objects := make(chan object.Object, 1)
+	key := chunk.FormatObjectBlockKey(41, 0, 1, false)
+	objects <- testRun9GCObject(key)
+	go func() {
+		defer close(objects)
+		<-listCtx.Done()
+	}()
+	store, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	deleted, bytes, more, next, err := deleteRun9SliceRangeMatches(ctx, stopListing, store, objects, run9GCSliceRangesRequest{
+		Ranges:           []run9GCSliceRange{{Start: 41, EndInclusive: 42}},
+		MaxDeleteObjects: 2, WorkDeadline: time.Now().Add(20 * time.Millisecond),
+	})
+	require.NoError(t, err)
+	require.NoError(t, ctx.Err(), "the work budget must leave the IO grace available")
+	require.Equal(t, uint64(1), deleted)
+	require.Equal(t, uint64(1), bytes)
+	require.True(t, more)
+	require.Equal(t, key, next, "only already examined objects may advance the cursor")
+}
+
+func TestDeleteRun9SliceRangeMatchesDoesNotTreatCallerCancellationAsBudget(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	store, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	deleted, bytes, more, next, err := deleteRun9SliceRangeMatches(ctx, func() {}, store, make(chan object.Object), run9GCSliceRangesRequest{MaxDeleteObjects: 1})
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, deleted)
+	require.Zero(t, bytes)
+	require.False(t, more)
+	require.Empty(t, next)
+}

@@ -59,6 +59,11 @@ Related files:
 
 ### Run9 Fork Checkpoint GC
 
+- The object work deadline interrupts waiting for the next listing result.
+  Already admitted deletes finish within the existing IO grace; a partial
+  cursor covers only examined objects. Caller cancellation and delete failures
+  still fail the round.
+
 - `gc-checkpoint` retains every slice in each direct child's immutable fork
   checkpoint. The first strict scan stores a checksummed slice list; unreadable
   evidence falls back to the child's allocation bound. Cached reads use no
@@ -275,6 +280,7 @@ Related files:
 - `list-live-slices` reports the format name, object block layout, and slice ids/sizes from one metadata DB; run9rt passes `--scan-pending` when materializing manifests from metadata state instead of only the live view.
 - `describe-format` reports the persisted object storage descriptor and object layout so runtime can operate after candidate metadata has been removed, and also seeds a prepared writable epoch through the `?nextchunk=` badger path.
 - `gc-slice-ranges` lists only the loaded format prefix, parses `slice_id` from object keys, and deletes only keys whose `slice_id` falls within the requested ranges. It may stop early at `max_delete_objects` and return `has_more=true`.
+- S3 listing and bulk deletion allow at most four provider SDK attempts with its standard backoff for transient failures; caller cancellation and permanent errors still propagate. Foreground object reads and writes retain their existing retry policy.
 - Range GC and accounting propagate object listing failures after provider SDK retries, rather than retrying forever until the worker deadline. Partial scans never produce successful accounting or GC completion. Alternative listing is used only when paged listing is unsupported.
 - Accounting discovers actual first-level chunk directories through delimited listing and scans those disjoint partitions with at most four concurrent listings. Fixed leading-digit partitions can serialize large epoch lineages; directory partitions bound worker load while sharing that work. It publishes totals only after discovery and every partition succeed, including zero accounts for empty storage.
 - When the loaded storage is sharded, range deletion reuses bulk delete and fans out independent shard groups in parallel so GC does not serialize shard-local deletes.

@@ -993,7 +993,31 @@ func deleteRun9SliceRangeMatches(
 	var matchedForDelete uint64
 	var hasMore bool
 	last := req.After
-	for obj := range objs {
+	// Listing can stop producing objects while traversing directories or waiting
+	// for a page. The work budget must wake that wait without cancelling deletes
+	// already admitted; those retain the caller's separate IO grace.
+	var workDeadline <-chan time.Time
+	if !req.WorkDeadline.IsZero() {
+		timer := time.NewTimer(time.Until(req.WorkDeadline))
+		defer timer.Stop()
+		workDeadline = timer.C
+	}
+scan:
+	for {
+		var obj object.Object
+		select {
+		case <-ctx.Done():
+			break scan
+		case <-workDeadline:
+			hasMore = true
+			stopListing()
+			break scan
+		case next, ok := <-objs:
+			if !ok {
+				break scan
+			}
+			obj = next
+		}
 		if obj == nil {
 			close(deleteJobs)
 			wg.Wait()
