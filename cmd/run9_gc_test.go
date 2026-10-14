@@ -839,3 +839,67 @@ func TestDeleteRun9SliceRangeMatchesDoesNotTreatCallerCancellationAsBudget(t *te
 	require.False(t, more)
 	require.Empty(t, next)
 }
+
+type blockedRun9RangeDeleteStore struct {
+	object.ObjectStorage
+	listingStopped <-chan struct{}
+	deleted        []string
+}
+
+func (s *blockedRun9RangeDeleteStore) Delete(ctx context.Context, key string, _ ...object.AttrGetter) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.listingStopped:
+		s.deleted = append(s.deleted, key)
+		return nil
+	}
+}
+
+func TestDeleteRun9SliceRangeMatchesStopsAdmittingDeletesAtWorkDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	stopped := make(chan struct{})
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	store := &blockedRun9RangeDeleteStore{ObjectStorage: base, listingStopped: stopped}
+	first := chunk.FormatObjectBlockKey(41, 0, 1, false)
+	second := chunk.FormatObjectBlockKey(42, 0, 1, false)
+	objects := make(chan object.Object, 2)
+	objects <- testRun9GCObject(first)
+	objects <- testRun9GCObject(second)
+	close(objects)
+
+	deleted, bytes, more, next, err := deleteRun9SliceRangeMatches(ctx, func() { close(stopped) }, store, objects, run9GCSliceRangesRequest{
+		Ranges:           []run9GCSliceRange{{Start: 41, EndInclusive: 42}},
+		MaxDeleteObjects: 2, Threads: 1, WorkDeadline: time.Now().Add(50 * time.Millisecond),
+	})
+	require.NoError(t, err)
+	require.NoError(t, ctx.Err())
+	require.EqualValues(t, 1, deleted)
+	require.EqualValues(t, 1, bytes)
+	require.True(t, more)
+	require.Equal(t, first, next)
+	require.Equal(t, []string{first}, store.deleted)
+}
+
+func TestDeleteRun9SliceRangeMatchesKeepsCursorBeforeUnadmittedPartialBatch(t *testing.T) {
+	base, err := object.CreateStorage("mem", "test", "", "", "")
+	require.NoError(t, err)
+	store := &fakeRun9GCExactObjectsBulkDeleteStore{ObjectStorage: base}
+	objects := make(chan object.Object, 1002)
+	for id := uint64(1000); id <= 2001; id++ {
+		objects <- testRun9GCObject(chunk.FormatObjectBlockKey(id, 0, 1, false))
+	}
+	deleted, bytes, more, next, err := deleteRun9SliceRangeMatches(t.Context(), func() { close(objects) }, store, objects, run9GCSliceRangesRequest{
+		Ranges: []run9GCSliceRange{{Start: 1000, EndInclusive: 2001}}, RetainSliceIDs: map[uint64]bool{2001: true},
+		MaxDeleteObjects: 2000, Threads: 1, WorkDeadline: time.Now().Add(50 * time.Millisecond),
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 1000, deleted)
+	require.EqualValues(t, 1000, bytes)
+	require.True(t, more)
+	require.Equal(t, chunk.FormatObjectBlockKey(1999, 0, 1, false), next)
+	require.Len(t, store.bulkCalls, 1)
+	require.Len(t, store.bulkCalls[0], 1000)
+}
