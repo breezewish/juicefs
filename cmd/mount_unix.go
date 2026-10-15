@@ -893,11 +893,19 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 			sig := <-signalChan
 			logger.Infof("Received signal %s, exiting...", sig.String())
 			if sig == syscall.SIGHUP {
+				// Supervisor restart closes the same VFS and metadata as finalize.
+				// Do not race an accepted flush/capture or a terminal shutdown.
+				forkMountLifecycle.Lock()
+				if forkFinalizeInProgress {
+					forkMountLifecycle.Unlock()
+					continue
+				}
 				path := v.Conf.StatePath
 				if path == "" {
 					path = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
 				}
 				if err := v.FlushAll(""); err == nil {
+					forkFinalizeInProgress = true
 					fuse.Shutdown()
 					err = v.FlushAll(path)
 					if err != nil {
@@ -910,6 +918,7 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 					logger.Warnf("exit with code 1")
 					os.Exit(1)
 				} else {
+					forkMountLifecycle.Unlock()
 					logger.Warnf("flush buffered data failed: %s, don't restart", err)
 					continue
 				}
@@ -927,7 +936,6 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 	}()
 
 	installForkFinalizeHandler(m, v, blob)
-	installForkFlushDrainHandler(v)
 }
 
 func prepareMountRuntime(c *cli.Context, mp string, conf *vfs.Config) (func(), error) {

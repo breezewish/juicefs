@@ -1,29 +1,31 @@
 //go:build linux
-// +build linux
 
 package cmd
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
-	"syscall"
 	"time"
 
 	"github.com/urfave/cli/v2"
 )
-
-const forkFlushDrainAckDir = "/tmp/juicefs-flush-drain-ack"
 
 type forkFlushDrainResult struct {
 	Ok      bool               `json:"ok"`
 	Drained bool               `json:"drained"`
 	Reason  string             `json:"reason,omitempty"`
 	Ack     *forkFinalizeAckV1 `json:"ack,omitempty"`
+}
+
+type forkFlushDrainRequest struct {
+	DeadlineUnixMS int64 `json:"deadline_unix_ms"`
 }
 
 func cmdFlushDrainFork() *cli.Command {
@@ -33,25 +35,16 @@ func cmdFlushDrainFork() *cli.Command {
 		Category:  "SERVICE",
 		Usage:     "Flush a mounted volume and wait for writeback uploads without unmounting (fork)",
 		ArgsUsage: "MOUNTPOINT",
-		Description: `
-This command is a fork-only publish fence for deferred fsync mounts:
-it flushes delayed VFS data and waits for writeback uploads while keeping the mount daemon alive.
-
-Examples:
-$ juicefs flush-drain /mnt/jfs`,
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:  "timeout",
-				Value: "10m",
-				Usage: "timeout waiting for mount daemon to flush and drain uploads (e.g. 10m, 30s)",
-			},
-		},
+		Flags: []cli.Flag{&cli.StringFlag{
+			Name:  "timeout",
+			Value: "10m",
+			Usage: "total timeout including queueing, VFS flush and writeback uploads",
+		}},
 	}
 }
 
 func flushDrain(ctx *cli.Context) error {
 	setup0(ctx, 0, 0)
-
 	result, exitCode := flushDrainRun(ctx)
 	printJson(result)
 	if exitCode != 0 {
@@ -61,201 +54,89 @@ func flushDrain(ctx *cli.Context) error {
 }
 
 func flushDrainRun(ctx *cli.Context) (*forkFlushDrainResult, int) {
-	if ctx.NArg() != 1 {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("expected exactly 1 argument MOUNTPOINT, got %d", ctx.NArg()),
-		}, 1
-	}
-
-	mp := ctx.Args().Get(0)
-
-	if runtime.GOOS != "linux" {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("flush-drain is only supported on linux (current: %s)", runtime.GOOS),
-		}, 1
-	}
-
-	flushTimeout, err := parsePositiveDuration(ctx.String("timeout"))
-	if err != nil {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("invalid --timeout: %v", err),
-		}, 1
-	}
-
-	conf, err := readVFSConfigWithTimeout(ctx.Context, mp, 3*time.Second)
-	if err != nil {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("failed to read mount config: %v", err),
-		}, 1
-	}
-	if conf.Pid <= 0 {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("invalid mount pid %d in config", conf.Pid),
-		}, 1
-	}
-
-	pid := conf.Pid
-	expectedStarttime, err := readProcStatStarttimeTicks(pid)
-	if err != nil {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("failed to read /proc/%d/stat: %v", pid, err),
-		}, 1
-	}
-
-	statusInfo, err := readProcStatusEUIDAndSignals(pid)
-	if err != nil {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("failed to read /proc/%d/status: %v", pid, err),
-		}, 1
-	}
-	mountEUID := statusInfo.EUID
-	sigusr1 := int(syscall.SIGUSR1)
-	if sigusr1 <= 0 || sigusr1 > 64 {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("unexpected SIGUSR1 value %d", sigusr1),
-		}, 1
-	}
-	sigusr1Mask := uint64(1) << (sigusr1 - 1)
-	if statusInfo.SigIgn&sigusr1Mask != 0 {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("mount daemon ignores SIGUSR1 (SigIgn), refusing to send flush-drain signal to pid %d", pid),
-		}, 1
-	}
-	if statusInfo.SigCgt&sigusr1Mask == 0 {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("mount daemon does not catch SIGUSR1 (SigCgt), refusing to send flush-drain signal to pid %d", pid),
-		}, 1
-	}
-
-	ackPath := forkFlushDrainAckPath(pid, expectedStarttime)
-	reqPath := forkFlushDrainRequestPath(pid, expectedStarttime)
-	if err := ensureForkFinalizeAckDirForRequester(filepath.Dir(ackPath), mountEUID); err != nil {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("flush-drain ack dir is unsafe: %v", err),
-		}, 1
-	}
-	if _, err := finalizeAckDirReady(filepath.Dir(ackPath), mountEUID); err != nil {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("flush-drain ack dir is unsafe: %v", err),
-		}, 1
-	}
-	if err := removeRegularFlushDrainAck(ackPath); err != nil {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: err.Error(),
-		}, 1
-	}
-
-	if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
-		SchemaVersion:   1,
-		FinalizeTimeout: flushTimeout.String(),
-	}); err != nil {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("write flush-drain request: %v", err),
-		}, 1
-	}
-	if os.Geteuid() == 0 && mountEUID != uint32(os.Geteuid()) {
-		if err := os.Chown(reqPath, int(mountEUID), -1); err != nil {
-			logger.Warnf("flush-drain: chown request to uid %d: %s", mountEUID, err)
+	result := &forkFlushDrainResult{}
+	err := func() error {
+		if ctx.NArg() != 1 {
+			return fmt.Errorf("expected exactly 1 argument MOUNTPOINT, got %d", ctx.NArg())
 		}
-	}
-	if err := os.Chmod(reqPath, 0o600); err != nil {
-		logger.Warnf("flush-drain: chmod request: %s", err)
-	}
-
-	if st3, err := readProcStatStarttimeTicks(pid); err != nil || st3 != expectedStarttime {
-		reason := fmt.Sprintf("mount pid %d changed before signalling (starttime %d -> %d)", pid, expectedStarttime, st3)
+		timeout, err := parsePositiveDuration(ctx.String("timeout"))
 		if err != nil {
-			reason = fmt.Sprintf("mount pid %d changed before signalling: %v", pid, err)
+			return fmt.Errorf("invalid --timeout: %w", err)
 		}
-		return &forkFlushDrainResult{Ok: false, Reason: reason}, 1
-	}
-
-	if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
-		return &forkFlushDrainResult{
-			Ok:     false,
-			Reason: fmt.Sprintf("failed to send flush-drain signal to pid %d: %v", pid, err),
-		}, 1
-	}
-
-	startTimeout := 3 * time.Second
-	if flushTimeout > 0 && flushTimeout < startTimeout {
-		startTimeout = flushTimeout
-	}
-	startCtx, cancelStart := context.WithTimeout(ctx.Context, startTimeout)
-	startAck, startErr := waitFinalizeStart(startCtx, ackPath, pid, expectedStarttime, mountEUID)
-	cancelStart()
-	if errors.Is(startErr, errForkFinalizeAckPending) {
-		startErr = nil
-	}
-	if startAck != nil && startAck.Status == "ok" {
-		return &forkFlushDrainResult{Ok: true, Drained: true, Ack: startAck}, 0
-	}
-	if startErr != nil {
-		result := &forkFlushDrainResult{
-			Ok:      false,
-			Drained: false,
-			Reason:  startErr.Error(),
-			Ack:     startAck,
+		requestCtx, cancel := context.WithTimeout(ctx.Context, timeout)
+		defer cancel()
+		conf, err := readVFSConfigWithTimeout(requestCtx, ctx.Args().Get(0), 3*time.Second)
+		if err != nil {
+			return fmt.Errorf("read mount config: %w", err)
 		}
+		if conf.Pid <= 0 {
+			return fmt.Errorf("invalid mount pid %d in config", conf.Pid)
+		}
+		ticks, err := readProcStatStarttimeTicks(conf.Pid)
+		if err != nil {
+			return err
+		}
+		status, err := readProcStatusEUIDAndSignals(conf.Pid)
+		if err != nil {
+			return err
+		}
+		socket := forkFlushDrainSocketPath(conf.Pid, ticks)
+		ready, err := finalizeAckDirReady(filepath.Dir(socket), status.EUID)
+		if err != nil {
+			return fmt.Errorf("unsafe flush-drain socket directory: %w", err)
+		}
+		if !ready {
+			return fmt.Errorf("mount pid %d has no owner-only flush-drain socket; mount daemon upgrade required", conf.Pid)
+		}
+		result, err = requestForkFlushDrain(requestCtx, socket)
+		return err
+	}()
+	if err != nil {
+		return &forkFlushDrainResult{Reason: err.Error()}, 1
+	}
+	if !result.Ok || !result.Drained {
 		return result, 1
 	}
-
-	flushCtx, cancel := context.WithTimeout(ctx.Context, flushTimeout)
-	ack, ackErr := waitFinalizeAck(flushCtx, ackPath, pid, expectedStarttime, mountEUID)
-	cancel()
-	if ackErr != nil {
-		result := &forkFlushDrainResult{
-			Ok:      false,
-			Drained: false,
-			Ack:     ack,
-		}
-		if errors.Is(ackErr, context.DeadlineExceeded) {
-			result.Reason = fmt.Sprintf("timeout waiting flush-drain ack: %s", flushTimeout)
-		} else if errors.Is(ackErr, context.Canceled) {
-			result.Reason = "canceled waiting flush-drain ack"
-		} else {
-			result.Reason = strings.ReplaceAll(ackErr.Error(), "finalize ack", "flush-drain ack")
-		}
-		return result, 1
-	}
-
-	return &forkFlushDrainResult{
-		Ok:      true,
-		Drained: true,
-		Ack:     ack,
-	}, 0
+	return result, 0
 }
 
-func removeRegularFlushDrainAck(ackPath string) error {
-	fi, err := os.Lstat(ackPath)
-	if os.IsNotExist(err) {
-		return nil
+// Each connection owns its response. Unlike SIGUSR1 and a shared ack file,
+// concurrent or cancelled callers cannot delete or consume each other's proof.
+func requestForkFlushDrain(ctx context.Context, socket string) (*forkFlushDrainResult, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil, fmt.Errorf("flush-drain requires a deadline")
 	}
+	body, err := json.Marshal(forkFlushDrainRequest{DeadlineUnixMS: deadline.UnixMilli()})
 	if err != nil {
-		return fmt.Errorf("stat flush-drain ack: %w", err)
+		return nil, err
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("flush-drain ack path is a symlink: %s", ackPath)
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+		},
 	}
-	if fi.IsDir() {
-		return fmt.Errorf("flush-drain ack path is a directory: %s", ackPath)
+	defer transport.CloseIdleConnections()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://mount/flush", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("flush-drain ack path is not a regular file: %s", ackPath)
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("flush-drain request: %w", err)
 	}
-	return os.Remove(ackPath)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("flush-drain response: %s", response.Status)
+	}
+	var result forkFlushDrainResult
+	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode flush-drain response: %w", err)
+	}
+	return &result, nil
+}
+
+func forkFlushDrainSocketPath(pid int, ticks uint64) string {
+	return filepath.Join("/tmp", fmt.Sprintf("run9-flush-%d-%d", pid, ticks), "control.sock")
 }

@@ -1,134 +1,161 @@
 //go:build linux
-// +build linux
 
 package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"flag"
 	"os"
-	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/stretchr/testify/require"
+	"github.com/urfave/cli/v2"
 )
 
-func TestRunForkFlushDrain_FlushesAndDrainsWithoutClosingSession(t *testing.T) {
-	pid := os.Getpid()
-	starttimeTicks, err := readProcStatStarttimeTicks(pid)
-	if err != nil {
-		t.Fatalf("readProcStatStarttimeTicks: %v", err)
-	}
-
-	ackPath := forkFlushDrainAckPath(pid, starttimeTicks)
-	_ = os.Remove(ackPath)
-	t.Cleanup(func() {
-		_ = os.Remove(ackPath)
-	})
-
-	store := &fakeFinalizeChunkStore{}
-	v := &vfs.VFS{
-		Conf: &vfs.Config{
-			Chunk: &chunk.Config{Writeback: true},
-		},
-		Store: store,
-	}
-
-	flushCalls := 0
-	origFlushAll := forkFlushDrainFlushAll
+func TestFlushDrainConcurrentRequestsKeepSeparateResults(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	original := forkFlushDrainFlushAll
 	forkFlushDrainFlushAll = func(*vfs.VFS) error {
-		flushCalls++
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			return errors.New("first request flush failed")
+		}
 		return nil
 	}
-	defer func() { forkFlushDrainFlushAll = origFlushAll }()
+	defer func() { forkFlushDrainFlushAll = original }()
+	store := &fakeFinalizeChunkStore{}
+	stop, err := installForkFlushDrain(&vfs.VFS{
+		Conf: &vfs.Config{Chunk: &chunk.Config{Writeback: true}}, Store: store,
+	})
+	require.NoError(t, err)
+	defer stop()
+	releaseFlush := sync.OnceFunc(func() { close(release) })
+	defer releaseFlush()
+	ticks, err := readProcStatStarttimeTicks(os.Getpid())
+	require.NoError(t, err)
+	socket := forkFlushDrainSocketPath(os.Getpid(), ticks)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	first := make(chan *forkFlushDrainResult, 1)
+	firstErr := make(chan error, 1)
+	go func() {
+		result, err := requestForkFlushDrain(ctx, socket)
+		first <- result
+		firstErr <- err
+	}()
+	<-started
 
-	if err := runForkFlushDrain(v); err != nil {
-		t.Fatalf("runForkFlushDrain should succeed, got %v", err)
-	}
-	if flushCalls != 1 {
-		t.Fatalf("FlushAll should be called once, got %d", flushCalls)
-	}
-	if store.waitCalls != 1 {
-		t.Fatalf("WaitForUploadDrain should be called once, got %d", store.waitCalls)
-	}
-
-	data, err := os.ReadFile(ackPath)
+	// A second connection must wait, not delete the first request's proof or
+	// run another FlushAll concurrently. Expiry only cancels its own queue slot.
+	queuedCtx, cancelQueued := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancelQueued()
+	queued, err := requestForkFlushDrain(queuedCtx, socket)
+	// Either endpoint may observe the shared deadline first.
 	if err != nil {
-		t.Fatalf("ReadFile ack: %v", err)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	} else {
+		require.False(t, queued.Ok)
+		require.Equal(t, "queue", queued.Ack.Phase)
+		require.Equal(t, context.DeadlineExceeded.Error(), queued.Reason)
 	}
-	var ack forkFinalizeAckV1
-	if err := json.Unmarshal(data, &ack); err != nil {
-		t.Fatalf("Unmarshal ack: %v", err)
-	}
-	if ack.Status != "ok" {
-		t.Fatalf("unexpected ack status: %+v", ack)
-	}
-	if ack.FinishedAt == "" {
-		t.Fatalf("ack should include finished_at: %+v", ack)
-	}
+	require.EqualValues(t, 1, calls.Load())
+
+	second := make(chan *forkFlushDrainResult, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		result, err := requestForkFlushDrain(ctx, socket)
+		second <- result
+		secondErr <- err
+	}()
+	releaseFlush()
+	require.NoError(t, <-firstErr)
+	failed := <-first
+	require.False(t, failed.Ok)
+	require.Equal(t, "first request flush failed", failed.Reason)
+	require.Equal(t, "flush_all", failed.Ack.Phase)
+	require.NoError(t, <-secondErr)
+	success := <-second
+	require.True(t, success.Ok)
+	require.True(t, success.Drained)
+	require.Equal(t, "ok", success.Ack.Status)
+	require.NotEmpty(t, success.Ack.FinishedAt)
+	require.EqualValues(t, 2, calls.Load())
+	require.Equal(t, 1, store.waitCalls)
 }
 
-func TestRunForkFlushDrainDoesNotAbandonTimedOutFlushAll(t *testing.T) {
-	pid := os.Getpid()
-	starttimeTicks, err := readProcStatStarttimeTicks(pid)
-	if err != nil {
-		t.Fatalf("readProcStatStarttimeTicks: %v", err)
-	}
-	ackPath := forkFlushDrainAckPath(pid, starttimeTicks)
-	reqPath := forkFlushDrainRequestPath(pid, starttimeTicks)
-	_ = os.Remove(ackPath)
-	t.Cleanup(func() {
-		_ = os.Remove(ackPath)
-		_ = os.Remove(reqPath)
-	})
-	if err := writeForkFinalizeRequest(reqPath, &forkFinalizeRequestV1{
-		SchemaVersion:   1,
-		FinalizeTimeout: "50ms",
-	}); err != nil {
-		t.Fatalf("writeForkFinalizeRequest: %v", err)
-	}
-
-	flushStarted := make(chan struct{})
-	releaseFlush := make(chan struct{})
-	origFlushAll := forkFlushDrainFlushAll
+func TestFlushDrainCancellationDoesNotAbandonFlushAll(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	original := forkFlushDrainFlushAll
 	forkFlushDrainFlushAll = func(*vfs.VFS) error {
-		close(flushStarted)
-		<-releaseFlush
+		close(started)
+		<-release
 		return nil
 	}
-	defer func() { forkFlushDrainFlushAll = origFlushAll }()
-
-	done := make(chan error, 1)
-	go func() { done <- runForkFlushDrain(&vfs.VFS{Conf: &vfs.Config{}}) }()
-	<-flushStarted
-	time.Sleep(100 * time.Millisecond)
+	defer func() { forkFlushDrainFlushAll = original }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan *forkFlushDrainResult, 1)
+	go func() { done <- runForkFlushDrain(ctx, &vfs.VFS{}) }()
+	<-started
+	cancel()
+	require.False(t, forkMountLifecycle.TryLock(), "finalize must wait for FlushAll to actually finish")
+	require.Len(t, forkMountPublish, 1, "cancellation must not release the publish fence early")
 	select {
-	case err := <-done:
-		t.Fatalf("flush-drain abandoned FlushAll after its timeout: %v", err)
+	case <-done:
+		t.Fatal("abandoned FlushAll")
 	default:
 	}
-
-	close(releaseFlush)
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("expected deadline error after FlushAll returns, got %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("flush-drain did not finish after FlushAll returned")
-	}
+	close(release)
+	result := <-done
+	require.False(t, result.Ok)
+	require.Equal(t, "flush_all", result.Ack.Phase)
+	require.Equal(t, context.Canceled.Error(), result.Reason)
+	require.Empty(t, forkMountPublish)
+	require.True(t, forkMountLifecycle.TryLock())
+	forkMountLifecycle.Unlock()
 }
 
-func TestRemoveRegularFlushDrainAckRejectsUnsafePath(t *testing.T) {
-	ackPath := filepath.Join(t.TempDir(), "ack.json")
-	if err := os.Symlink("target", ackPath); err != nil {
-		t.Fatalf("Symlink: %v", err)
-	}
+func TestFlushDrainReportsUploadErrorAndRejectsFinalize(t *testing.T) {
+	original := forkFlushDrainFlushAll
+	forkFlushDrainFlushAll = func(*vfs.VFS) error { return nil }
+	defer func() { forkFlushDrainFlushAll = original }()
+	store := &fakeFinalizeChunkStore{waitErr: errors.New("object PUT failed")}
+	result := runForkFlushDrain(context.Background(), &vfs.VFS{
+		Conf: &vfs.Config{Chunk: &chunk.Config{Writeback: true}}, Store: store,
+	})
+	require.False(t, result.Ok)
+	require.False(t, result.Drained)
+	require.Equal(t, "upload_drain", result.Ack.Phase)
+	require.Equal(t, "object PUT failed", result.Reason)
 
-	if err := removeRegularFlushDrainAck(ackPath); err == nil {
-		t.Fatalf("removeRegularFlushDrainAck should reject symlink")
+	forkMountLifecycle.Lock()
+	result = runForkFlushDrain(context.Background(), nil)
+	forkMountLifecycle.Unlock()
+	require.False(t, result.Ok)
+	require.Equal(t, "mount is finalizing", result.Reason)
+}
+
+func TestFlushDrainRejectsLegacyMountWithoutSignalling(t *testing.T) {
+	original := readVFSConfigWithTimeout
+	readVFSConfigWithTimeout = func(context.Context, string, time.Duration) (*vfs.Config, error) {
+		return &vfs.Config{Pid: os.Getpid()}, nil
 	}
+	defer func() { readVFSConfigWithTimeout = original }()
+	flags := flag.NewFlagSet("flush-drain", flag.ContinueOnError)
+	flags.String("timeout", "1s", "")
+	require.NoError(t, flags.Parse([]string{"/unused"}))
+	result, exitCode := flushDrainRun(cli.NewContext(cli.NewApp(), flags, nil))
+	require.Equal(t, 1, exitCode)
+	require.False(t, result.Drained)
+	require.Contains(t, result.Reason, "mount daemon upgrade required")
 }

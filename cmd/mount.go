@@ -19,6 +19,7 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -753,9 +754,15 @@ func mount(c *cli.Context) error {
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
 	stopCapture, err := installRun9Capture(v, sliceAllocationStart)
 	if err != nil {
-		return fmt.Errorf("install metadata capture: %w", err)
+		return errors.Join(fmt.Errorf("install metadata capture: %w", err), shutdownSessionAndResources(metaCli, blob))
+	}
+	stopFlush, err := installForkFlushDrain(v)
+	if err != nil {
+		stopCapture()
+		return errors.Join(fmt.Errorf("install flush-drain: %w", err), shutdownSessionAndResources(metaCli, blob))
 	}
 	defer stopCapture()
+	defer stopFlush()
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
@@ -769,6 +776,9 @@ func mount(c *cli.Context) error {
 	if forkFinalizeInProgress {
 		return runForkFinalizeOnMain(metaCli, v, blob, sliceAllocationStart)
 	}
+	// Reject queued local requests after normal unmount, too. Deferred server
+	// shutdown runs after this lifecycle lock is released.
+	forkFinalizeInProgress = true
 	if err := v.FlushAll(""); err != nil {
 		logger.Errorf("flush all delayed data: %s", err)
 	}

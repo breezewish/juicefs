@@ -1,20 +1,17 @@
 package cmd
 
-import (
-	"sync"
-	"sync/atomic"
-)
+import "sync"
 
-// forkFinalizeInProgress records an accepted terminal finalize request.
+// forkFinalizeInProgress records terminal finalize or normal mount teardown.
 // It must be defined on all platforms because other code paths may reference it.
 //
 // Every access is protected by forkMountLifecycle. Once accepted, it remains
-// true until the mount daemon exits after finalizing on the main mount goroutine.
+// true until the mount daemon exits.
 var forkFinalizeInProgress bool
 
-// forkFlushDrainInProgress indicates whether the fork-only flush-drain handler is running.
-// It is intentionally separate from finalize: flush-drain keeps the mount daemon alive.
-var forkFlushDrainInProgress atomic.Bool
+// forkMountPublish serializes flush fences and online metadata capture. A channel
+// allows flush callers to wait with their deadline, rather than drop requests.
+var forkMountPublish = make(chan struct{}, 1)
 
 // forkMountLifecycle serializes the persistent flush-drain operation with the
 // terminal finalize operation. Finalize takes the write lock before unmounting;

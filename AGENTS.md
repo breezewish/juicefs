@@ -239,7 +239,7 @@ Related files:
 ### Deferred File Fsync Flush
 
 - When `JFS_DEFER_FSYNC_FLUSH=1` is set, file `fsync` returns without forcing the current file handle to flush its writer. This is only valid for callers that use a stronger publish fence, such as `umount-finalize`, before the data becomes forkable or externally visible. The option keeps block-disk workloads from fragmenting JuiceFS writeback into tiny per-guest-fsync uploads.
-- New command `juicefs flush-drain <mountpoint>` sends `SIGUSR1` to a live mount daemon and waits for an ack after `FlushAll("")` plus writeback upload drain. Unlike `umount-finalize`, it keeps FUSE, metadata, object storage, and the mount daemon alive. It exists for mounted volumes that use deferred fsync but need an explicit mid-life publish fence. The daemon serializes it against terminal finalize and never abandons a timed-out `FlushAll` goroutine while the mount stays alive.
+- `juicefs flush-drain <mountpoint>` uses an owner-only Unix socket with a response per request after `FlushAll("")` plus writeback upload drain. Concurrent callers queue within their own deadline instead of sharing request/ack files or losing signals. Unlike `umount-finalize`, it keeps FUSE, metadata, object storage, and the mount daemon alive. Flush and capture exclude each other; terminal teardown waits for actual completion of `FlushAll`, even after caller cancellation. Existing mount daemons must be upgraded before using the new command; it does not fall back to the unsafe signal protocol.
 
 Related files:
 

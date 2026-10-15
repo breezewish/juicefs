@@ -39,6 +39,7 @@ func flushDrain(ctx *cli.Context) error {
 	return nil
 }
 
-func installForkFlushDrainHandler(v *vfs.VFS) {
+func installForkFlushDrain(v *vfs.VFS) (func(), error) {
 	// Fork feature: linux only.
+	return func() {}, nil
 }

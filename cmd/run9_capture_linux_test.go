@@ -13,8 +13,8 @@ import (
 )
 
 func TestRun9CaptureReportsErrorBeforeClosing(t *testing.T) {
-	previous := forkFlushDrainInProgress.Swap(true)
-	defer forkFlushDrainInProgress.Store(previous)
+	forkMountPublish <- struct{}{}
+	defer func() { <-forkMountPublish }()
 	server, client := net.Pipe()
 	defer client.Close()
 	require.NoError(t, client.SetDeadline(time.Now().Add(time.Second)))

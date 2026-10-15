@@ -142,10 +142,12 @@ func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encod
 	}
 	var response run9CaptureResponse
 	if err := func() error {
-		if !forkFlushDrainInProgress.CompareAndSwap(false, true) {
+		select {
+		case forkMountPublish <- struct{}{}:
+		default:
 			return fmt.Errorf("mount capture or flush is busy")
 		}
-		defer forkFlushDrainInProgress.Store(false)
+		defer func() { <-forkMountPublish }()
 		resumeWrites := v.SuspendWrites()
 		defer resumeWrites()
 		if err := ctx.Err(); err != nil {
