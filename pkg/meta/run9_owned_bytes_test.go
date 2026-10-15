@@ -1,9 +1,11 @@
 package meta
 
 import (
+	"context"
 	"math"
 	"math/rand"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +16,7 @@ const run9OwnedTestEpoch = 7
 
 // newRun9OwnedTestMeta returns a tracked epoch whose worker is stopped, so that
 // a test decides when marked ranges are recounted.
-func newRun9OwnedTestMeta(t testing.TB, dir string, forkBound uint64) *kvMeta {
+func newRun9OwnedTestMeta(t testing.TB, dir string, forkFloor uint64) *kvMeta {
 	client, err := newKVMeta("badger", dir, testConfig())
 	require.NoError(t, err)
 	m := client.(*kvMeta)
@@ -28,13 +30,14 @@ func newRun9OwnedTestMeta(t testing.TB, dir string, forkBound uint64) *kvMeta {
 		tx.set(m.counterKey("nextChunk"), packCounter(int64(start)))
 		return nil
 	}, 0))
-	m.Run9TrackOwnedBytes(run9OwnedTestEpoch, forkBound, 0, start)
+	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, ForkFloor: forkFloor}))
 	m.run9Owned.stopWorker()
 	return m
 }
 
-func run9OwnedVisible(m *kvMeta) uint64 {
-	m.run9OwnedRecount()
+func run9OwnedVisible(t testing.TB, m *kvMeta) uint64 {
+	t.Helper()
+	require.NoError(t, m.Run9RecountOwnedBytes(context.Background()))
 	return m.run9Owned.visible.Load()
 }
 
@@ -90,15 +93,21 @@ func TestRun9OwnedBytesRecountOnlyWhatChangedAndMatchCheckpointGC(t *testing.T) 
 		if step%7 != 0 {
 			continue
 		}
-		whole := make(map[uint16]uint64)
-		require.NoError(t, m.run9CountOwned([]byte{'A'}, 0, math.MaxUint64, whole))
-		var want uint64
-		for _, bytes := range whole {
-			want += bytes
+		whole := make(map[uint16]map[uint64]uint32)
+		require.NoError(t, m.run9CountOwned(context.Background(), []byte{'A'}, whole))
+		unique := make(map[uint64]uint32)
+		for _, bucket := range whole {
+			for id, size := range bucket {
+				unique[id] = size
+			}
 		}
-		require.Equal(t, want, run9OwnedVisible(m), "after step %d", step)
+		var want uint64
+		for _, size := range unique {
+			want += uint64(size)
+		}
+		require.Equal(t, want, run9OwnedVisible(t, m), "after step %d", step)
 	}
-	visible := run9OwnedVisible(m)
+	visible := run9OwnedVisible(t, m)
 	require.NotZero(t, visible)
 	require.Equal(t, visible, m.Run9SettleOwnedBytes().VisibleBytes)
 
@@ -115,108 +124,293 @@ func TestRun9OwnedBytesRecountOnlyWhatChangedAndMatchCheckpointGC(t *testing.T) 
 	require.Equal(t, kept, visible)
 }
 
-func TestRun9OwnedBytesLeaveOutInheritedDataAndStartAgainAtAFork(t *testing.T) {
+// Copy the actual stable key/value state into a separate closed Badger DB.
+// This is the immutable metadata input used by the online capture counter.
+func snapshotRun9OwnedTestMeta(t testing.TB, m *kvMeta) string {
+	t.Helper()
+	directory := t.TempDir()
+	copy, err := newKVMeta("badger", directory, testConfig())
+	require.NoError(t, err)
+	defer copy.Shutdown()
+	var copyErr error
+	require.NoError(t, m.client.scan(nil, func(key, value []byte) bool {
+		copyErr = copy.(*kvMeta).client.txn(context.Background(), func(tx *kvTxn) error {
+			tx.set(key, value)
+			return nil
+		}, 0)
+		return copyErr == nil
+	}))
+	require.NoError(t, copyErr)
+	require.NoError(t, copy.Shutdown())
+	return directory
+}
+
+func TestRun9OwnedBytesForkCountsCapturedIDsAndLaterCommitsOfEarlierAllocations(t *testing.T) {
 	ctx := Background()
 	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
 	var attr Attr
 	var inode Ino
 	require.Zero(t, m.Create(ctx, RootInode, "file", 0644, 0, 0, &inode, &attr))
-	write := func(id uint64, off uint32) {
-		require.Zero(t, m.Write(ctx, inode, 0, off, Slice{Id: id, Size: 100, Len: 100}, time.Now()))
-	}
-	newID := func() uint64 {
-		var id uint64
-		require.Zero(t, m.NewSlice(ctx, &id))
-		return id
-	}
+	var delayed, captured uint64
+	// Compaction can reserve an ID before capture and commit it afterwards.
+	require.Zero(t, m.NewSlice(ctx, &delayed))
+	require.Zero(t, m.NewSlice(ctx, &captured))
+	require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: captured, Size: 100, Len: 100}, time.Now()))
+	require.Zero(t, m.Write(ctx, inode, 0, 100, Slice{Id: 3<<32 + 5, Size: 100, Len: 100}, time.Now()))
+	snapshot := snapshotRun9OwnedTestMeta(t, m)
+	// Drop the captured data before the asynchronous snapshot scan. It still
+	// belongs to the Fork even though no live recount ever saw it.
+	require.Zero(t, m.Truncate(ctx, inode, 0, 0, &attr, false))
+	require.NoError(t, m.Run9RecordFork(context.Background(), snapshot))
+	require.EqualValues(t, 100, m.run9Owned.offset.Load())
+	require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: delayed, Size: 50, Len: 50}, time.Now()))
+	require.EqualValues(t, 50, run9OwnedVisible(t, m))
+	require.EqualValues(t, 100, m.run9Owned.offset.Load())
+	// Recording the same captured IDs again cannot count them twice.
+	require.NoError(t, m.Run9RecordFork(context.Background(), snapshot))
+	require.Equal(t, Run9OwnedBytes{VisibleBytes: 50, KeptForForksBytes: 100}, *m.Run9SettleOwnedBytes())
+	require.Zero(t, m.Truncate(ctx, inode, 0, 0, &attr, false))
+	require.Zero(t, run9OwnedVisible(t, m))
+}
 
-	write(3<<32+5, 0) // A slice of the Fork source is not this epoch's.
-	write(newID(), 100)
-	require.EqualValues(t, 100, run9OwnedVisible(m))
-	// Written just before the Fork: the worker has not counted it yet.
-	received := newID()
-	write(received, 200)
+// pausedOwnedScanClient stalls a real recount after it takes the dirty ranges
+// and before it reads their metadata.
+type pausedOwnedScanClient struct {
+	tkvClient
+	once   sync.Once
+	paused chan struct{}
+	resume chan struct{}
+}
 
-	// The persisted end covers reserved IDs; the Fork received only used ones.
-	// The capture reads no metadata and takes what is counted so far.
-	persistedEnd := m.Run9SliceAllocationEnd(0)
-	require.Greater(t, persistedEnd, received+1)
-	require.Equal(t, received+1, m.Run9RecordFork(persistedEnd))
+func (c *pausedOwnedScanClient) scan(prefix []byte, handler func([]byte, []byte) bool) error {
+	c.once.Do(func() {
+		close(c.paused)
+		<-c.resume
+	})
+	return c.tkvClient.scan(prefix, handler)
+}
+
+func TestRun9OwnedBytesCancelledForkDoesNotChangeProtectedSlices(t *testing.T) {
+	ctx := Background()
+	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	var attr Attr
+	var inode Ino
+	require.Zero(t, m.Create(ctx, RootInode, "file", 0644, 0, 0, &inode, &attr))
+	var id uint64
+	require.Zero(t, m.NewSlice(ctx, &id))
+	require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: id, Size: 100, Len: 100}, time.Now()))
+	snapshot := snapshotRun9OwnedTestMeta(t, m)
+	client := &pausedOwnedScanClient{tkvClient: m.client, paused: make(chan struct{}), resume: make(chan struct{})}
+	m.client = client
+	resume := sync.OnceFunc(func() { close(client.resume) })
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		done <- m.Run9RecountOwnedBytes(context.Background())
+	}()
+	t.Cleanup(func() { resume(); <-finished })
+	select {
+	case <-client.paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recount did not start")
+	}
+	deadline, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, m.Run9RecordFork(deadline, snapshot), context.DeadlineExceeded)
+	require.Empty(t, m.run9Owned.protected)
+	require.Zero(t, m.run9Owned.offset.Load())
+	resume()
+	require.NoError(t, <-done)
+	require.NoError(t, m.Run9RecordFork(context.Background(), snapshot))
+	require.Zero(t, run9OwnedVisible(t, m))
+	require.EqualValues(t, 100, m.run9Owned.offset.Load())
+}
+
+func TestRun9OwnedBytesCancelledScanKeepsItsDirtyRanges(t *testing.T) {
+	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	var attr Attr
+	var inode Ino
+	require.Zero(t, m.Create(Background(), RootInode, "file", 0644, 0, 0, &inode, &attr))
+	var id uint64
+	require.Zero(t, m.NewSlice(Background(), &id))
+	require.Zero(t, m.Write(Background(), inode, 0, 0, Slice{Id: id, Size: 100, Len: 100}, time.Now()))
+	client := &pausedOwnedScanClient{tkvClient: m.client, paused: make(chan struct{}), resume: make(chan struct{})}
+	m.client = client
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resume := sync.OnceFunc(func() { close(client.resume) })
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		done <- m.Run9RecountOwnedBytes(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		resume()
+		<-finished
+	})
+	select {
+	case <-client.paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recount did not start")
+	}
+	cancel()
+	resume()
+	require.ErrorIs(t, <-done, context.Canceled)
 	require.Zero(t, m.run9Owned.visible.Load())
-	require.EqualValues(t, 100, m.run9Owned.keptForForks.Load())
-
-	// Right after it the woken worker adds what the Fork received but was not
-	// counted yet. Dropping received data changes nothing; later data counts again.
-	m.run9OwnedCountLateChanges()
-	require.EqualValues(t, 200, m.run9Owned.keptForForks.Load())
-	write(newID(), 100)
-	require.EqualValues(t, 100, run9OwnedVisible(m))
-	require.EqualValues(t, 200, m.run9Owned.keptForForks.Load())
-	write(newID(), 100)
-	require.EqualValues(t, 100, run9OwnedVisible(m))
-	owned := m.Run9SettleOwnedBytes()
-	require.Equal(t, Run9OwnedBytes{VisibleBytes: 100, ForkBound: received + 1, KeptForForksBytes: 200}, *owned)
+	require.False(t, m.run9Owned.current.Load())
+	require.EqualValues(t, 100, run9OwnedVisible(t, m))
 }
 
-// A recount that a Fork overtakes loses nothing: its ranges count for the
-// Fork as far as they were written before it, and again for what came after.
-func TestRun9OwnedBytesRecountOvertakenByAFork(t *testing.T) {
+func TestRun9OwnedBytesCountClonedSlicesOnceUntilTheirLastReferenceIsRemoved(t *testing.T) {
 	ctx := Background()
 	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
 	var attr Attr
-	var inode Ino
-	require.Zero(t, m.Create(ctx, RootInode, "file", 0644, 0, 0, &inode, &attr))
-	write := func(off uint32) {
-		var id uint64
-		require.Zero(t, m.NewSlice(ctx, &id))
-		require.Zero(t, m.Write(ctx, inode, 0, off, Slice{Id: id, Size: 100, Len: 100}, time.Now()))
-	}
-	write(0)
-	// The worker has taken the marks of that write when the Fork is captured.
-	o := &m.run9Owned
-	o.mu.Lock()
-	generation := o.generation
-	o.mu.Unlock()
-	taken := o.takeMarked()
-	m.Run9RecordFork(m.Run9SliceAllocationEnd(0))
-	write(100)
-	o.mu.Lock()
-	require.NotEqual(t, generation, o.generation)
-	for _, late := range o.late {
-		late.buckets = append(late.buckets, taken...)
-	}
-	o.mu.Unlock()
-	o.changed(taken)
-	require.EqualValues(t, 100, run9OwnedVisible(m))
-	require.EqualValues(t, 100, o.keptForForks.Load())
+	var source, clone Ino
+	require.Zero(t, m.Create(ctx, RootInode, "source", 0644, 0, 0, &source, &attr))
+	require.Zero(t, m.Create(ctx, RootInode, "clone", 0644, 0, 0, &clone, &attr))
+	require.NotEqual(t, run9OwnedBucket(m.inodeKey(source)), run9OwnedBucket(m.inodeKey(clone)))
+	var id uint64
+	require.Zero(t, m.NewSlice(ctx, &id))
+	require.Zero(t, m.Write(ctx, source, 0, 0, Slice{Id: id, Size: 100, Len: 100}, time.Now()))
+	require.EqualValues(t, 100, run9OwnedVisible(t, m))
+	// Same slice through another chunk in the same file and another inode bucket.
+	require.Zero(t, m.CopyFileRange(ctx, source, 0, source, ChunkSize, 100, 0, nil, nil))
+	require.Zero(t, m.CopyFileRange(ctx, source, 0, clone, 0, 100, 0, nil, nil))
+	require.EqualValues(t, 100, run9OwnedVisible(t, m))
+	m.run9Owned.markAll()
+	require.EqualValues(t, 100, run9OwnedVisible(t, m))
+	require.Zero(t, m.Close(ctx, source))
+	require.Zero(t, m.Unlink(ctx, RootInode, "source"))
+	require.EqualValues(t, 100, run9OwnedVisible(t, m))
+	require.Zero(t, m.Truncate(ctx, clone, 0, 0, &attr, false))
+	require.Zero(t, run9OwnedVisible(t, m))
 }
 
-func TestRun9OwnedBytesCountAtMountOnlyWhenOwnDataCanExistAboveTheBound(t *testing.T) {
-	start := uint64(run9OwnedTestEpoch)<<32 + 500
-	for _, c := range []struct {
-		name      string
-		forkBound uint64
-		count     bool
-	}{
-		{"a new epoch", 0, true},
-		{"everything existed at the last Fork", start, false},
-		{"written since the last Fork", start - 1, true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			client, err := newKVMeta("badger", t.TempDir(), testConfig())
-			require.NoError(t, err)
-			m := client.(*kvMeta)
-			defer m.Shutdown()
-			allocationStart := start
-			if c.name == "a new epoch" {
-				allocationStart, c.count = uint64(run9OwnedTestEpoch)<<32, false
-			}
-			m.Run9TrackOwnedBytes(run9OwnedTestEpoch, c.forkBound, 0, allocationStart)
-			m.run9Owned.stopWorker()
-			require.Equal(t, !c.count, m.run9Owned.current.Load())
-			require.Equal(t, c.count, len(m.run9Owned.takeMarked()) == run9OwnedBuckets)
-		})
-	}
+func TestRun9OwnedBytesRemountKeepsSignedBaselineWhenProtectionChanges(t *testing.T) {
+	directory := t.TempDir()
+	m := newRun9OwnedTestMeta(t, directory, 0)
+	var inode Ino
+	var attr Attr
+	require.Zero(t, m.Create(Background(), RootInode, "file", 0644, 0, 0, &inode, &attr))
+	var id uint64
+	require.Zero(t, m.NewSlice(Background(), &id))
+	require.Zero(t, m.Write(Background(), inode, 0, 0, Slice{Id: id, Size: 100, Len: 100}, time.Now()))
+	start := m.Run9SliceAllocationEnd(0)
+	require.NoError(t, m.Shutdown())
+	// A previous calibrated raw count can be below the newly visible bytes.
+	// Keep that signed difference; clamping here would change Portal's basis.
+	last := int64(20)
+	client, err := newKVMeta("badger", directory, testConfig())
+	require.NoError(t, err)
+	m = client.(*kvMeta)
+	_, err = m.Load(true)
+	require.NoError(t, err)
+	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, ProtectedIDs: []uint64{id}, LastClosedRaw: &last}))
+	m.run9Owned.stopWorker()
+	require.Zero(t, m.run9Owned.visible.Load())
+	require.EqualValues(t, 20, m.run9Owned.offset.Load())
+	require.NoError(t, m.Shutdown())
+	// After the child disappears, that same slice becomes visible again.
+	client, err = newKVMeta("badger", directory, testConfig())
+	require.NoError(t, err)
+	m = client.(*kvMeta)
+	t.Cleanup(func() { _ = m.Shutdown() })
+	_, err = m.Load(true)
+	require.NoError(t, err)
+	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, LastClosedRaw: &last}))
+	m.run9Owned.stopWorker()
+	require.EqualValues(t, 100, m.run9Owned.visible.Load())
+	require.EqualValues(t, -80, m.run9Owned.offset.Load())
+	require.Zero(t, m.Truncate(Background(), inode, 0, 0, &attr, false))
+	require.Equal(t, Run9OwnedBytes{KeptForForksBytes: -80}, *m.Run9SettleOwnedBytes())
+}
+
+func TestRun9OwnedBytesLegacyFloorDoesNotHideFutureWrites(t *testing.T) {
+	directory := t.TempDir()
+	client, err := newKVMeta("badger", directory, testConfig())
+	require.NoError(t, err)
+	m := client.(*kvMeta)
+	defer m.Shutdown()
+	require.NoError(t, m.Init(testFormat(), false))
+	start := uint64(run9OwnedTestEpoch)<<32 + 100
+	require.NoError(t, m.client.txn(context.Background(), func(tx *kvTxn) error {
+		tx.set(m.counterKey("nextChunk"), packCounter(int64(start)))
+		return nil
+	}, 0))
+	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, ForkFloor: math.MaxUint64}))
+	m.run9Owned.stopWorker()
+	var inode Ino
+	var attr Attr
+	require.Zero(t, m.Create(Background(), RootInode, "file", 0644, 0, 0, &inode, &attr))
+	require.Zero(t, m.Write(Background(), inode, 0, 0, Slice{Id: start - 1, Size: 100, Len: 100}, time.Now()))
+	var id uint64
+	require.Zero(t, m.NewSlice(Background(), &id))
+	require.Zero(t, m.Write(Background(), inode, 0, 100, Slice{Id: id, Size: 50, Len: 50}, time.Now()))
+	require.EqualValues(t, 50, run9OwnedVisible(t, m))
+}
+
+func TestRun9OwnedBytesIncludesHistoricalOwnershipWithoutCountingInheritedData(t *testing.T) {
+	client, err := newKVMeta("badger", t.TempDir(), testConfig())
+	require.NoError(t, err)
+	m := client.(*kvMeta)
+	defer m.Shutdown()
+	require.NoError(t, m.Init(testFormat(), false))
+	start := uint64(run9OwnedTestEpoch) << 32
+	require.NoError(t, m.client.txn(context.Background(), func(tx *kvTxn) error {
+		tx.set(m.counterKey("nextChunk"), packCounter(int64(start)))
+		return nil
+	}, 0))
+	var inode Ino
+	var attr Attr
+	require.Zero(t, m.Create(Background(), RootInode, "file", 0644, 0, 0, &inode, &attr))
+	require.Zero(t, m.Write(Background(), inode, 0, 0, Slice{Id: 2<<32 + 1, Size: 100, Len: 100}, time.Now()))
+	require.Zero(t, m.Write(Background(), inode, 0, 100, Slice{Id: 3<<32 + 1, Size: 200, Len: 200}, time.Now()))
+	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{
+		Epoch: run9OwnedTestEpoch, AllocationStart: start,
+		OwnershipRanges: []Run9OwnedEpochRange{{StartEpoch: 2, EndEpoch: 2}, {StartEpoch: run9OwnedTestEpoch, EndEpoch: run9OwnedTestEpoch}},
+	}))
+	m.run9Owned.stopWorker()
+	// Initialization must scan historical data even before this writable epoch
+	// allocates anything. The intervening inherited epoch is never attributed.
+	require.EqualValues(t, 100, m.run9Owned.visible.Load())
+	snapshot := snapshotRun9OwnedTestMeta(t, m)
+	require.NoError(t, m.Run9RecordFork(context.Background(), snapshot))
+	require.Zero(t, m.run9Owned.visible.Load())
+	require.EqualValues(t, 100, m.run9Owned.offset.Load())
+}
+
+func TestRun9OwnedBytesExhaustedBasisDisablesTheOptionalCount(t *testing.T) {
+	client, err := newKVMeta("badger", t.TempDir(), testConfig())
+	require.NoError(t, err)
+	m := client.(*kvMeta)
+	defer m.Shutdown()
+	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, Basis: ^uint64(0)}))
+	require.Equal(t, ^uint64(0), m.run9Owned.basis.Load())
+	require.False(t, m.run9Owned.current.Load())
+	require.Nil(t, m.Run9SettleOwnedBytes())
+	require.NoError(t, m.Run9RecordFork(context.Background(), "/unused"))
+}
+
+func TestRun9OwnedBytesStartupScanFailureLeavesTheOptionalCountUnavailable(t *testing.T) {
+	client, err := newKVMeta("badger", t.TempDir(), testConfig())
+	require.NoError(t, err)
+	m := client.(*kvMeta)
+	defer m.Shutdown()
+	require.NoError(t, m.Init(testFormat(), false))
+	require.NoError(t, m.client.txn(context.Background(), func(tx *kvTxn) error {
+		tx.set(m.chunkKey(2, 0), []byte("corrupt"))
+		return nil
+	}, 0))
+	start := uint64(run9OwnedTestEpoch)<<32 + 1
+	require.ErrorContains(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, Basis: 7}), "malformed chunk")
+	require.EqualValues(t, 7, m.run9Owned.basis.Load())
+	require.False(t, m.run9Owned.current.Load())
+	require.Nil(t, m.Run9SettleOwnedBytes())
+	// Counter failure does not turn a later source Fork into a counter error.
+	require.NoError(t, m.Run9RecordFork(context.Background(), "/unused"))
 }
 
 // What a changed file costs: one recount of its key range.
@@ -237,13 +431,13 @@ func BenchmarkRun9OwnedBytesRecountOneRange(b *testing.B) {
 				}, 0))
 			}
 			start := time.Now()
-			m.run9OwnedRecount()
+			require.NoError(b, m.Run9RecountOwnedBytes(context.Background()))
 			b.ReportMetric(time.Since(start).Seconds(), "s/whole")
 			require.EqualValues(b, files*(8192+4096), m.run9Owned.visible.Load())
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				m.run9Owned.changed([]uint16{uint16(i * 7919)})
-				m.run9OwnedRecount()
+				require.NoError(b, m.Run9RecountOwnedBytes(context.Background()))
 			}
 		})
 	}
@@ -266,7 +460,7 @@ func BenchmarkRun9OwnedBytesWrite(b *testing.B) {
 				return nil
 			}, 0))
 			if tracked {
-				m.Run9TrackOwnedBytes(run9OwnedTestEpoch, 0, 0, start)
+				require.NoError(b, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start}))
 			}
 			ctx := Background()
 			var attr Attr

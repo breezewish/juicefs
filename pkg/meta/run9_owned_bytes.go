@@ -1,7 +1,8 @@
 package meta
 
 import (
-	"math"
+	"context"
+	"fmt"
 	"math/bits"
 	"sync"
 	"sync/atomic"
@@ -18,8 +19,8 @@ import (
 //
 // Inode keys encode the inode little-endian, so the two key bytes after the
 // prefix split all inodes evenly into 65,536 contiguous key ranges. Each range
-// has one sum. A committed transaction marks the ranges it wrote; a background
-// worker recounts marked ranges and the total is the sum of all ranges.
+// tracks unique slices. A committed transaction marks the ranges it wrote; a
+// background worker recounts those ranges and joins their slice sets.
 const run9OwnedBuckets = 1 << 16
 
 // More marked ranges than this are recounted by one pass over all inode keys.
@@ -29,43 +30,53 @@ const run9OwnedFullPass = run9OwnedBuckets / 8
 // The count is for people watching a disk, who do not need it by the second.
 var Run9OwnedRecountInterval = 30 * time.Second
 
-// run9OwnedLateChanges are changes that were committed before a Fork raised
-// the bound to high but were not counted yet. They belong to what is kept for
-// that Fork. sums is what each range had counted for [low, high) by then.
-type run9OwnedLateChanges struct {
-	generation uint64 // The one the Fork ended.
-	low, high  uint64
-	buckets    []uint16
-	sums       []uint64
+// Run9OwnedEpochRange is an inclusive ownership range, shared with GC's proof.
+type Run9OwnedEpochRange struct {
+	StartEpoch uint64 `json:"start_epoch"`
+	EndEpoch   uint64 `json:"end_epoch"`
 }
 
-type run9OwnedBytes struct {
-	// Zero: not a Run9 writable epoch, nothing is counted.
-	epoch atomic.Uint64
-	// Only slices at or above the bound are counted. Slices below it existed at
-	// a Fork of this filesystem and stay kept for that Fork whatever happens here.
-	forkBound atomic.Uint64
+// Run9OwnedBytesConfig describes the source's ownership and existing Fork proofs.
+type Run9OwnedBytesConfig struct {
+	Epoch           uint64
+	AllocationStart uint64
+	ProtectedIDs    []uint64
+	ForkFloor       uint64
+	LastClosedRaw   *int64
+	Basis           uint64
+	OwnershipRanges []Run9OwnedEpochRange
+}
 
+type run9OwnedSliceReference struct {
+	size  uint32
+	count uint32
+}
+
+// Each bucket retains unique slice IDs, and references joins those sets across
+// buckets. Reflinks then count once even when their files occupy different key
+// ranges. Memory grows with slice/bucket memberships: one uint64 ID and uint32
+// size per membership, plus an ID, size and reference count per unique slice
+// (and Go map overhead), instead of one eight-byte sum per bucket.
+type run9OwnedBytes struct {
+	basis  atomic.Uint64
+	epoch  atomic.Uint64
 	marked [run9OwnedBuckets / 64]atomic.Uint64
 
-	// mu orders applying a recount with a change of the bound.
-	mu         sync.Mutex
-	generation uint64 // Advances with the bound.
-	sums       []uint64
-	late       []*run9OwnedLateChanges
-	visible    atomic.Uint64
-	// keptForForks is what was counted each time a Fork raised the bound: own
-	// data below the bound, kept whether or not this filesystem still reads it.
-	keptForForks atomic.Uint64
-	// current: every change committed before the last recount is counted.
-	current atomic.Bool
+	// recount serializes live counts and updates to Fork protection.
+	// A channel lets a capture stop waiting when its deadline expires.
+	recount         chan struct{}
+	buckets         []map[uint64]uint32
+	references      map[uint64]run9OwnedSliceReference
+	visible         atomic.Uint64
+	offset          atomic.Int64
+	protected       map[uint64]struct{}
+	ownershipRanges []Run9OwnedEpochRange
+	forkFloor       uint64
+	current         atomic.Bool
 
 	stop     chan struct{}
 	stopped  chan struct{}
 	stopOnce sync.Once
-	// forked wakes the worker to count the late changes of a Fork at once,
-	// before this filesystem drops data that the Fork received.
-	forked chan struct{}
 }
 
 func run9OwnedBucket(key []byte) uint16 {
@@ -100,13 +111,17 @@ func (o *run9OwnedBytes) takeMarked() []uint16 {
 func (o *run9OwnedBytes) collectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "run9_owned_basis",
+			Help: "Identity of the raw count baseline supplied by run9rt.",
+		}, func() float64 { return float64(o.basis.Load()) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "run9_owned_visible_bytes",
-			Help: "Bytes of own slices at or above the fork bound that a read still reaches.",
+			Help: "Unique own slice bytes still read and not protected for Forks.",
 		}, func() float64 { return float64(o.visible.Load()) }),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "run9_owned_kept_for_forks_bytes",
-			Help: "Bytes of own slices below the fork bound, as counted when each Fork was taken.",
-		}, func() float64 { return float64(o.keptForForks.Load()) }),
+			Help: "Signed baseline preserving closed counts and bytes newly protected for Forks.",
+		}, func() float64 { return float64(o.offset.Load()) }),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "run9_owned_current",
 			Help: "1 when every change committed before the last recount is counted.",
@@ -119,246 +134,311 @@ func (o *run9OwnedBytes) collectors() []prometheus.Collector {
 	}
 }
 
-// Run9TrackOwnedBytes starts counting for a mounted writable epoch whose next
-// slice ID is allocationStart. Slices below forkBound existed at a Fork; they
-// were counted as keptForForks bytes when those Forks were taken.
-func (m *kvMeta) Run9TrackOwnedBytes(epoch uint64, forkBound uint64, keptForForks uint64, allocationStart uint64) {
+// Run9TrackOwnedBytes initializes the live count before writers are exposed.
+// protected and forkFloor use the same child-checkpoint evidence as GC. The
+// signed baseline preserves the previous close's raw count when that evidence
+// changes; Portal's later physical measurement corrects the absolute baseline.
+func (m *kvMeta) Run9TrackOwnedBytes(ctx context.Context, cfg Run9OwnedBytesConfig) error {
+	epoch, allocationStart := cfg.Epoch, cfg.AllocationStart
 	client, ok := m.client.(*badgerClient)
 	if !ok || epoch == 0 {
-		return
+		return nil
 	}
 	o := &m.run9Owned
-	o.sums = make([]uint64, run9OwnedBuckets)
-	o.forkBound.Store(forkBound)
-	o.keptForForks.Store(keptForForks)
-	o.epoch.Store(epoch)
-	// Nothing to find when no own slice at or above the bound exists yet.
-	if allocationStart > max(forkBound, epoch<<32) {
-		o.markAll()
-	} else {
-		o.current.Store(true)
+	o.basis.Store(cfg.Basis)
+	if cfg.Basis == ^uint64(0) {
+		// Exhausted baseline identities permanently disable the optional count.
+		return nil
 	}
-	o.stop, o.stopped, o.forked = make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	o.buckets = make([]map[uint64]uint32, run9OwnedBuckets)
+	o.references = make(map[uint64]run9OwnedSliceReference)
+	o.ownershipRanges = cfg.OwnershipRanges
+	if len(o.ownershipRanges) == 0 {
+		o.ownershipRanges = []Run9OwnedEpochRange{{StartEpoch: epoch, EndEpoch: epoch}}
+	}
+	historical := false
+	for _, r := range o.ownershipRanges {
+		if r.StartEpoch > r.EndEpoch || r.EndEpoch >= 1<<32 {
+			return fmt.Errorf("invalid owned epoch range")
+		}
+		historical = historical || r.StartEpoch != epoch || r.EndEpoch != epoch
+	}
+	if !o.owns(epoch << 32) {
+		return fmt.Errorf("writable epoch is outside ownership ranges")
+	}
+	o.protected = make(map[uint64]struct{}, len(cfg.ProtectedIDs))
+	for _, id := range cfg.ProtectedIDs {
+		if o.owns(id) {
+			o.protected[id] = struct{}{}
+		}
+	}
+	// Legacy unknown bounds protect existing allocations, never future writes.
+	o.forkFloor = min(cfg.ForkFloor, allocationStart)
+	o.epoch.Store(epoch)
+	o.recount = make(chan struct{}, 1)
+	if historical || allocationStart > epoch<<32 {
+		o.markAll()
+	}
+	if err := m.Run9RecountOwnedBytes(ctx); err != nil {
+		// A baseline cannot be reconstructed after exposing writers. Omit this
+		// mount's optional count; the next mount can initialize it again.
+		o.epoch.Store(0)
+		o.current.Store(false)
+		return err
+	}
+	if cfg.LastClosedRaw != nil {
+		o.offset.Store(*cfg.LastClosedRaw - int64(o.visible.Load()))
+	}
+	o.stop, o.stopped = make(chan struct{}), make(chan struct{})
 	client.run9Owned.Store(o)
 	go m.run9OwnedWorker()
+	return nil
 }
 
-// The worker recounts, rests for the interval, and recounts again. A Fork in
-// between only wakes it for that Fork's late changes.
 func (m *kvMeta) run9OwnedWorker() {
 	o := &m.run9Owned
 	defer close(o.stopped)
-	next := time.Now().Add(Run9OwnedRecountInterval)
 	for {
 		select {
 		case <-o.stop:
 			return
-		case <-o.forked:
-			m.run9OwnedCountLateChanges()
-		case <-time.After(time.Until(next)):
-			m.run9OwnedRecount()
-			next = time.Now().Add(Run9OwnedRecountInterval)
+		case <-time.After(Run9OwnedRecountInterval):
+			_ = m.Run9RecountOwnedBytes(context.Background())
 		}
 	}
 }
 
-// run9OwnedCount counts the marked ranges, or everything when most are marked.
-func (m *kvMeta) run9OwnedCount(buckets []uint16, low uint64, high uint64) (map[uint16]uint64, error) {
-	counted := make(map[uint16]uint64, len(buckets))
+func (m *kvMeta) run9OwnedCount(ctx context.Context, buckets []uint16) (map[uint16]map[uint64]uint32, error) {
+	counted := make(map[uint16]map[uint64]uint32, len(buckets))
 	if len(buckets) > run9OwnedFullPass {
-		return counted, m.run9CountOwned([]byte{'A'}, low, high, counted)
+		return counted, m.run9CountOwned(ctx, []byte{'A'}, counted)
 	}
 	for _, b := range buckets {
-		if err := m.run9CountOwned([]byte{'A', byte(b >> 8), byte(b)}, low, high, counted); err != nil {
+		if err := m.run9CountOwned(ctx, []byte{'A', byte(b >> 8), byte(b)}, counted); err != nil {
 			return nil, err
 		}
 	}
 	return counted, nil
 }
 
-// run9OwnedRecount brings the sums of the marked ranges up to date.
-func (m *kvMeta) run9OwnedRecount() {
-	m.run9OwnedCountLateChanges()
+// Run9RecountOwnedBytes refreshes marked ranges. Concurrent writes mark them
+// again; initialization and finalize call it before and after exposed writers.
+func (m *kvMeta) Run9RecountOwnedBytes(ctx context.Context) error {
 	o := &m.run9Owned
-	o.mu.Lock()
-	generation := o.generation
-	o.mu.Unlock()
-	bound := o.forkBound.Load()
+	if o.epoch.Load() == 0 {
+		return nil
+	}
+	select {
+	case o.recount <- struct{}{}:
+		defer func() { <-o.recount }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	buckets := o.takeMarked()
-	if len(buckets) == 0 {
-		o.current.Store(true)
-		return
-	}
-	counted, err := m.run9OwnedCount(buckets, bound, math.MaxUint64)
+	counted, err := m.run9OwnedCount(ctx, buckets)
 	if err != nil {
-		// The database is closed for a capture or for good. Count again later.
 		o.changed(buckets)
 		o.current.Store(false)
-		return
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if generation != o.generation {
-		// A Fork moved the bound meanwhile and reset the sums. These ranges
-		// held changes from before it: they join that Fork's late changes.
-		for _, late := range o.late {
-			if late.generation == generation {
-				late.buckets = append(late.buckets, buckets...)
-			}
-		}
-		o.wakeForLateChanges()
-		// Changes after the Fork may be among them too: count these ranges again.
-		o.changed(buckets)
-		o.current.Store(false)
-		return
+		return err
 	}
 	visible := o.visible.Load()
 	for _, b := range buckets {
-		visible += counted[b] - o.sums[b]
-		o.sums[b] = counted[b]
+		for id := range o.buckets[b] {
+			ref := o.references[id]
+			ref.count--
+			if ref.count == 0 {
+				if !o.keptForFork(id) {
+					visible -= uint64(ref.size)
+				}
+				delete(o.references, id)
+			} else {
+				o.references[id] = ref
+			}
+		}
+		for id, size := range counted[b] {
+			ref := o.references[id]
+			if ref.count == 0 {
+				if !o.keptForFork(id) {
+					visible += uint64(size)
+				}
+				ref.size = size
+			}
+			ref.count++
+			o.references[id] = ref
+		}
+		o.buckets[b] = counted[b]
 	}
 	o.visible.Store(visible)
 	o.current.Store(true)
+	return nil
 }
 
-func (o *run9OwnedBytes) wakeForLateChanges() {
-	select {
-	case o.forked <- struct{}{}:
-	default:
+// run9CountOwned collects unique own slices read by linked regular files.
+// The chunk keys sort before the inode attributes. It uses the same overlay
+// as checkpoint GC, but deduplicates references across chunks and files.
+func (m *kvMeta) run9CountOwned(ctx context.Context, prefix []byte, counted map[uint16]map[uint64]uint32) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-}
-
-// run9OwnedCountLateChanges adds to what is kept for Forks the changes that
-// were committed before a Fork but counted only now. What this filesystem has
-// dropped of them since is missed; the worker is woken at once to keep that
-// moment short.
-func (m *kvMeta) run9OwnedCountLateChanges() {
-	o := &m.run9Owned
-	for {
-		o.mu.Lock()
-		if len(o.late) == 0 {
-			o.mu.Unlock()
-			return
-		}
-		late := o.late[0]
-		buckets := late.buckets
-		late.buckets = nil
-		o.mu.Unlock()
-		counted, err := m.run9OwnedCount(buckets, late.low, late.high)
-		o.mu.Lock()
-		if err != nil {
-			late.buckets = append(late.buckets, buckets...)
-			o.mu.Unlock()
-			return
-		}
-		kept := o.keptForForks.Load()
-		for _, b := range buckets {
-			kept += counted[b] - late.sums[b]
-			late.sums[b] = counted[b]
-		}
-		o.keptForForks.Store(kept)
-		if len(late.buckets) == 0 {
-			o.late = o.late[1:]
-		}
-		o.mu.Unlock()
-	}
-}
-
-// run9CountOwned adds, per key range, the bytes of the own slices in
-// [low, high) that a read reaches, for the inode keys under prefix. It applies the
-// rule of ScanRun9CheckpointSlices: only chunks of linked regular files count,
-// through the overlay a read uses. The chunk keys of an inode sort before its
-// attribute key. A slice read through two files counts for each of them.
-func (m *kvMeta) run9CountOwned(prefix []byte, low uint64, high uint64, counted map[uint16]uint64) error {
-	epoch := m.run9Owned.epoch.Load()
-	owned := func(id uint64) bool { return id>>32 == epoch && id >= low && id < high }
 	var inode Ino
 	var chunks [][]byte
-	var seen []uint64
-	return m.client.scan(prefix, func(k, v []byte) bool {
+	var scanErr error
+	err := m.client.scan(prefix, func(k, v []byte) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		if len(k) < 10 {
-			return true
+			scanErr = fmt.Errorf("malformed inode key")
+			return false
 		}
 		if current := m.decodeInode(k[1:9]); current != inode {
 			inode, chunks = current, chunks[:0]
 		}
 		switch k[9] {
 		case 'C':
-			if len(k) == 14 && len(v)%sliceBytes == 0 {
-				chunks = append(chunks, v)
+			if len(k) != 14 || len(v)%sliceBytes != 0 {
+				scanErr = fmt.Errorf("malformed chunk record")
+				return false
 			}
+			for _, s := range readSliceBuf(v) {
+				if s.len == 0 || uint64(s.pos)+uint64(s.len) > ChunkSize || (s.id != 0 && (s.size == 0 || s.size > ChunkSize || uint64(s.off)+uint64(s.len) > uint64(s.size))) {
+					scanErr = fmt.Errorf("invalid chunk slice")
+					return false
+				}
+			}
+			chunks = append(chunks, v)
 		case 'I':
-			if len(chunks) == 0 || (len(v) != 64 && len(v) != 72 && len(v) != 80) {
+			if len(chunks) == 0 {
 				return true
+			}
+			if len(v) != 64 && len(v) != 72 && len(v) != 80 {
+				scanErr = fmt.Errorf("malformed inode attributes")
+				return false
 			}
 			var attr Attr
 			attr.Unmarshal(v)
-			if attr.Typ != TypeFile || attr.Nlink == 0 {
+			if attr.Typ != TypeFile {
+				scanErr = fmt.Errorf("chunk belongs to non-file inode")
+				return false
+			}
+			if attr.Nlink == 0 {
 				return true
 			}
-			var bytes uint64
+			bucket := run9OwnedBucket(k)
+			add := func(id uint64, size uint32) {
+				if !m.run9Owned.owns(id) {
+					return
+				}
+				if counted[bucket] == nil {
+					counted[bucket] = make(map[uint64]uint32)
+				}
+				counted[bucket][id] = size
+			}
 			for _, chunk := range chunks {
-				if len(chunk) == sliceBytes { // The usual chunk: one record, read as it is.
+				if len(chunk) == sliceBytes {
 					var s slice
 					s.read(chunk)
-					if s.len > 0 && owned(s.id) {
-						bytes += uint64(s.size)
+					if s.len > 0 {
+						add(s.id, s.size)
 					}
 					continue
 				}
-				// An overwrite can leave one slice readable in several pieces.
-				seen = seen[:0]
-			pieces:
 				for _, s := range buildSlice(readSliceBuf(chunk)) {
-					if !owned(s.Id) {
-						continue
-					}
-					for _, id := range seen {
-						if id == s.Id {
-							continue pieces
-						}
-					}
-					seen = append(seen, s.Id)
-					bytes += uint64(s.Size)
+					add(s.Id, s.Size)
 				}
 			}
-			counted[run9OwnedBucket(k)] += bytes
 		}
 		return true
 	})
+	if err != nil {
+		return err
+	}
+	if scanErr != nil {
+		return scanErr
+	}
+	return ctx.Err()
 }
 
-// Run9RecordFork records a Fork captured while mounted, whose metadata ends
-// at allocationEnd, and returns its bound: the first slice ID that the Fork
-// cannot have received. The persisted allocation end includes IDs this mount
-// has reserved but not used yet; those are still to be written here.
-//
-// Everything counted so far is below the new bound: it stays kept for the
-// Fork, and the count starts again from zero. Writes are sealed during a
-// capture, so no slice at or above the bound is referenced yet. The capture
-// itself reads no metadata: it must not wait for a count.
-func (m *baseMeta) Run9RecordFork(allocationEnd uint64) uint64 {
-	m.freeMu.Lock()
-	bound := allocationEnd
-	if m.freeSlices.next < m.freeSlices.maxid {
-		bound = m.freeSlices.next
+func (o *run9OwnedBytes) owns(id uint64) bool {
+	if id == 0 {
+		return false
 	}
-	m.freeMu.Unlock()
+	epoch := id >> 32
+	for _, r := range o.ownershipRanges {
+		if epoch >= r.StartEpoch && epoch <= r.EndEpoch {
+			return true
+		}
+	}
+	return false
+}
+
+// keptForFork must be called while holding recount or before starting writers.
+func (o *run9OwnedBytes) keptForFork(id uint64) bool {
+	_, protected := o.protected[id]
+	return protected || id < o.forkFloor
+}
+
+// Run9RecordFork reads the immutable captured metadata before its candidate is
+// exposed to the caller. Allocation order cannot prove which slices a capture
+// received: background compaction can commit an earlier allocation afterwards.
+// Only captured own IDs become protected. Reading happens outside the recount
+// gate so live writes and counts may proceed while the snapshot is scanned.
+func (m *kvMeta) Run9RecordFork(ctx context.Context, directory string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	o := &m.run9Owned
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.epoch.Load() == 0 || bound <= o.forkBound.Load() {
-		return bound
+	if o.epoch.Load() == 0 {
+		return nil
 	}
-	// Changes committed before the capture may not be counted yet. Their
-	// ranges are counted against the old bound right after it.
-	o.late = append(o.late, &run9OwnedLateChanges{generation: o.generation, low: o.forkBound.Load(), high: bound, buckets: o.takeMarked(), sums: o.sums})
-	o.generation++
-	o.forkBound.Store(bound)
-	o.keptForForks.Add(o.visible.Swap(0))
-	o.sums = make([]uint64, run9OwnedBuckets)
-	o.wakeForLateChanges()
-	return bound
+	snapshot, err := OpenRun9Checkpoint(directory)
+	if err != nil {
+		return err
+	}
+	defer snapshot.Shutdown()
+	format, err := snapshot.Load(true)
+	if err != nil {
+		return err
+	}
+	if format.Name != m.getFormat().Name {
+		return fmt.Errorf("captured metadata belongs to another format")
+	}
+	snapshot.run9Owned.ownershipRanges = o.ownershipRanges
+	counted := make(map[uint16]map[uint64]uint32)
+	if err := snapshot.run9CountOwned(ctx, []byte{'A'}, counted); err != nil {
+		return err
+	}
+	if err := snapshot.Shutdown(); err != nil {
+		return err
+	}
+	select {
+	case o.recount <- struct{}{}:
+		defer func() { <-o.recount }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	visible, offset := o.visible.Load(), o.offset.Load()
+	for _, bucket := range counted {
+		for id, size := range bucket {
+			if o.keptForFork(id) {
+				continue
+			}
+			o.protected[id] = struct{}{}
+			offset += int64(size)
+			if ref := o.references[id]; ref.count != 0 {
+				visible -= uint64(ref.size)
+			}
+		}
+	}
+	o.visible.Store(visible)
+	o.offset.Store(offset)
+	return nil
 }
 
 // stopWorker returns once no recount is running any more.
@@ -372,12 +452,11 @@ func (o *run9OwnedBytes) stopWorker() {
 
 // Run9OwnedBytes is what a closing mount reports.
 type Run9OwnedBytes struct {
-	// VisibleBytes are the own slices at or above ForkBound that are read.
+	// VisibleBytes are unique own slices read and not protected for a Fork.
 	VisibleBytes uint64 `json:"visible_bytes"`
-	ForkBound    uint64 `json:"fork_bound"`
-	// KeptForForksBytes are the own slices below ForkBound, as counted when
-	// each Fork was taken.
-	KeptForForksBytes uint64 `json:"kept_for_forks_bytes"`
+	// KeptForForksBytes is the signed baseline. VisibleBytes plus this offset
+	// is the raw count; it preserves the previous close across evidence changes.
+	KeptForForksBytes int64 `json:"kept_for_forks_bytes"`
 }
 
 // Run9SettleOwnedBytes stops the worker and counts what is still marked. The
@@ -389,9 +468,8 @@ func (m *kvMeta) Run9SettleOwnedBytes() *Run9OwnedBytes {
 		return nil
 	}
 	o.stopWorker()
-	m.run9OwnedRecount()
-	if !o.current.Load() {
+	if err := m.Run9RecountOwnedBytes(context.Background()); err != nil {
 		return nil
 	}
-	return &Run9OwnedBytes{VisibleBytes: o.visible.Load(), ForkBound: o.forkBound.Load(), KeptForForksBytes: o.keptForForks.Load()}
+	return &Run9OwnedBytes{VisibleBytes: o.visible.Load(), KeptForForksBytes: o.offset.Load()}
 }

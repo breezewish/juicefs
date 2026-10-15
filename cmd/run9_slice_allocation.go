@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -38,21 +40,49 @@ func beginRun9SliceAllocation(m meta.Meta) (*uint64, error) {
 	return &start, nil
 }
 
-// beginRun9OwnedBytes starts counting the bytes this writable epoch owns.
+type run9OwnedBytesRequest struct {
+	ForkCheckpoints []run9ForkCheckpoint       `json:"fork_checkpoints"`
+	ForkFloor       uint64                     `json:"fork_floor"`
+	LastClosedRaw   *int64                     `json:"last_closed_raw"`
+	Basis           uint64                     `json:"basis"`
+	OwnershipRanges []meta.Run9OwnedEpochRange `json:"ownership_ranges"`
+}
+
+// beginRun9OwnedBytes uses GC's child checkpoint proofs and ownership ranges.
+// A per-mount request file keeps large checkpoint lists out of the process's
+// argument/environment limit. Cached slice lists avoid rescanning children.
 func beginRun9OwnedBytes(m meta.Meta, epoch uint64, start uint64) error {
-	// Slices below the bound existed at a Fork of this filesystem and were
-	// counted as kept when it was taken. Absent: never forked before this mount.
-	var forkBound, keptForForks uint64
-	var err error
-	if raw := os.Getenv("JFS_RUN9_FORK_BOUND"); raw != "" {
-		if forkBound, err = strconv.ParseUint(raw, 10, 64); err != nil {
-			return fmt.Errorf("invalid JFS_RUN9_FORK_BOUND")
+	ctx := context.Background()
+	var request run9OwnedBytesRequest
+	if path := os.Getenv("JFS_RUN9_OWNED_BYTES_REQUEST"); path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read owned bytes request: %w", err)
+		}
+		// The launch owns this private one-use file; child startup has consumed it.
+		_ = os.Remove(path)
+		if err := json.Unmarshal(raw, &request); err != nil {
+			return fmt.Errorf("invalid owned bytes request: %w", err)
 		}
 	}
-	if raw := os.Getenv("JFS_RUN9_KEPT_FOR_FORKS_BYTES"); raw != "" {
-		if keptForForks, err = strconv.ParseUint(raw, 10, 64); err != nil {
-			return fmt.Errorf("invalid JFS_RUN9_KEPT_FOR_FORKS_BYTES")
+	format, err := m.Load(true)
+	if err != nil {
+		return err
+	}
+	cfg := meta.Run9OwnedBytesConfig{
+		Epoch: epoch, AllocationStart: start, ForkFloor: request.ForkFloor,
+		LastClosedRaw: request.LastClosedRaw, Basis: request.Basis,
+		OwnershipRanges: request.OwnershipRanges,
+	}
+	scan := run9ForkCheckpointScan{remaining: run9ForkCheckpointScanBudget, failed: make(map[string]string)}
+	for _, checkpoint := range request.ForkCheckpoints {
+		ids, err := run9ForkCheckpointSlices(ctx, checkpoint.Directory, format.Name, &scan)
+		if err != nil {
+			cfg.ForkFloor = max(cfg.ForkFloor, checkpoint.SourceAllocationEnd)
+			logger.Warnf("owned bytes: keep fork checkpoint %s by allocation floor: %s", checkpoint.Directory, err)
+			continue
 		}
+		cfg.ProtectedIDs = append(cfg.ProtectedIDs, ids...)
 	}
 	// Tests shorten the rest between recounts.
 	if raw := os.Getenv("JFS_RUN9_OWNED_RECOUNT_INTERVAL"); raw != "" {
@@ -60,8 +90,10 @@ func beginRun9OwnedBytes(m meta.Meta, epoch uint64, start uint64) error {
 			return fmt.Errorf("invalid JFS_RUN9_OWNED_RECOUNT_INTERVAL")
 		}
 	}
-	m.(interface {
-		Run9TrackOwnedBytes(uint64, uint64, uint64, uint64)
-	}).Run9TrackOwnedBytes(epoch, forkBound, keptForForks, start)
+	if err := m.(interface {
+		Run9TrackOwnedBytes(context.Context, meta.Run9OwnedBytesConfig) error
+	}).Run9TrackOwnedBytes(ctx, cfg); err != nil {
+		logger.Warnf("owned bytes unavailable for this mount: %s", err)
+	}
 	return nil
 }

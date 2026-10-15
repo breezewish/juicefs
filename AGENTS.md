@@ -345,3 +345,19 @@ For non-divergent code, we should keep as it is in upstream as much as possible,
   source parent's setgid group. Other metadata backends return `ENOTSUP`.
 - `pkg/meta/run9_rename_whiteout_test.go` covers replacement, no-replace failure,
   cross-directory hardlinks, setgid inheritance, quota failure and Badger reopen.
+
+## Run9 live owned bytes
+
+- Managed writable Badger mounts track the unique own slices still reachable
+  through linked regular files, excluding inherited slices. Dirty metadata
+  ranges are recounted in the background so Box storage can follow changes
+  without listing objects or scanning all metadata on every write.
+- Fork capture records exact protected slices from its immutable metadata
+  after writes resume and before acknowledging capture. Unique references and
+  a signed baseline preserve counts across reflinks and membership changes.
+  Initialization runs before writers; failures disable this optional counter.
+  Finalize settles the count within its deadline and returns it alongside the
+  allocation boundary. A counter basis identifies discontinuous resets.
+- Sources and coverage: `pkg/meta/run9_owned_bytes.go`,
+  `pkg/meta/run9_owned_bytes_test.go`, `cmd/run9_slice_allocation.go`,
+  `cmd/run9_capture_linux.go`, and `cmd/mount_finalize_fork_linux.go`.
