@@ -29,8 +29,10 @@ type run9CaptureResponse struct {
 	Error    string                   `json:"error,omitempty"`
 	Code     string                   `json:"code,omitempty"`
 	Metadata meta.Run9MetadataCapture `json:"metadata"`
-	Uploads  *chunk.PendingUploads    `json:"uploads,omitempty"`
-	FlushMS  int64                    `json:"flush_ms"`
+	// ForkBound is the first slice ID the captured metadata cannot reference.
+	ForkBound uint64                `json:"fork_bound"`
+	Uploads   *chunk.PendingUploads `json:"uploads,omitempty"`
+	FlushMS   int64                 `json:"flush_ms"`
 }
 
 // The owner-local socket serves only managed writable mounts. The coordinator
@@ -167,6 +169,9 @@ func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encod
 		if err != nil {
 			return err
 		}
+		// What this mount later drops of the slices the Fork received stays
+		// kept for that Fork.
+		response.ForkBound = v.Meta.(interface{ Run9RecordFork(uint64) uint64 }).Run9RecordFork(response.Metadata.AllocationEnd)
 
 		return ctx.Err()
 	}(); err != nil {

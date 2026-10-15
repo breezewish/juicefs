@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 )
@@ -31,5 +32,36 @@ func beginRun9SliceAllocation(m meta.Meta) (*uint64, error) {
 	if start < epoch<<32 || start > (epoch+1)<<32 {
 		return nil, fmt.Errorf("slice allocation counter %d outside owned epoch %d", start, epoch)
 	}
+	if err := beginRun9OwnedBytes(m, epoch, start); err != nil {
+		return nil, err
+	}
 	return &start, nil
+}
+
+// beginRun9OwnedBytes starts counting the bytes this writable epoch owns.
+func beginRun9OwnedBytes(m meta.Meta, epoch uint64, start uint64) error {
+	// Slices below the bound existed at a Fork of this filesystem and were
+	// counted as kept when it was taken. Absent: never forked before this mount.
+	var forkBound, keptForForks uint64
+	var err error
+	if raw := os.Getenv("JFS_RUN9_FORK_BOUND"); raw != "" {
+		if forkBound, err = strconv.ParseUint(raw, 10, 64); err != nil {
+			return fmt.Errorf("invalid JFS_RUN9_FORK_BOUND")
+		}
+	}
+	if raw := os.Getenv("JFS_RUN9_KEPT_FOR_FORKS_BYTES"); raw != "" {
+		if keptForForks, err = strconv.ParseUint(raw, 10, 64); err != nil {
+			return fmt.Errorf("invalid JFS_RUN9_KEPT_FOR_FORKS_BYTES")
+		}
+	}
+	// Tests shorten the rest between recounts.
+	if raw := os.Getenv("JFS_RUN9_OWNED_RECOUNT_INTERVAL"); raw != "" {
+		if meta.Run9OwnedRecountInterval, err = time.ParseDuration(raw); err != nil || meta.Run9OwnedRecountInterval <= 0 {
+			return fmt.Errorf("invalid JFS_RUN9_OWNED_RECOUNT_INTERVAL")
+		}
+	}
+	m.(interface {
+		Run9TrackOwnedBytes(uint64, uint64, uint64, uint64)
+	}).Run9TrackOwnedBytes(epoch, forkBound, keptForForks, start)
+	return nil
 }

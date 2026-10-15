@@ -219,6 +219,7 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 
 	var firstPhase string
 	var firstErr error
+	var ownedBytes *meta.Run9OwnedBytes
 	recordErr := func(phase string, err error) {
 		if err == nil {
 			return
@@ -258,6 +259,7 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 						end := allocator.Run9SliceAllocationEnd(*sliceAllocationStart)
 						ack.SliceAllocationEnd = &end
 					}
+					ack.OwnedBytes = ownedBytes
 				}
 				ack.Phase = ""
 				ack.Error = ""
@@ -319,6 +321,12 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 		ack.UsedBytes = &usedBytes
 		ack.UsedInodes = &usedInodes
 		ack.SizeMeasuredAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	// Counted from metadata while it is still open; the close changes none of it.
+	if counter, ok := metaCli.(interface{ Run9SettleOwnedBytes() *meta.Run9OwnedBytes }); ok {
+		writePendingAck("count_owned_bytes")
+		ownedBytes = counter.Run9SettleOwnedBytes()
 	}
 
 	writePendingAck("close_session")

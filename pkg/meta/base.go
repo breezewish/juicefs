@@ -319,6 +319,7 @@ type baseMeta struct {
 	prefetchedInodes freeID
 
 	usedSpaceG   prometheus.Gauge
+	run9Owned    run9OwnedBytes
 	usedInodesG  prometheus.Gauge
 	totalSpaceG  prometheus.Gauge
 	totalInodesG prometheus.Gauge
@@ -602,6 +603,7 @@ func (m *baseMeta) InitMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(m.opDist)
 	reg.MustRegister(m.opCount)
 	reg.MustRegister(m.opDuration)
+	reg.MustRegister(m.run9Owned.collectors()...)
 }
 
 func (m *baseMeta) timeit(method string, start time.Time) {

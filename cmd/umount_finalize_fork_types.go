@@ -1,5 +1,7 @@
 package cmd
 
+import "github.com/juicedata/juicefs/pkg/meta"
+
 // forkFinalizeAckV1 is the finalize ack schema written by the mount daemon for `juicefs umount-finalize`.
 //
 // The mount daemon writes a terminal ack to prove whether the correctness-critical finalize has finished.
@@ -17,6 +19,8 @@ type forkFinalizeAckV1 struct {
 	SizeMeasuredAt     string  `json:"size_measured_at,omitempty"`
 	SizeError          string  `json:"size_error,omitempty"`
 	SliceAllocationEnd *uint64 `json:"slice_allocation_end,omitempty"`
+	// OwnedBytes is absent when the mount could not count before closing.
+	OwnedBytes *meta.Run9OwnedBytes `json:"owned_bytes,omitempty"`
 }
 
 // forkUmountFinalizeResult is the structured JSON output of `juicefs umount-finalize`.

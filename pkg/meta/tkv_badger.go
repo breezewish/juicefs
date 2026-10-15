@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -38,6 +39,21 @@ import (
 type badgerTxn struct {
 	t *badger.Txn
 	c *badger.DB
+	// owned is nil unless a Run9 writable epoch counts its own bytes.
+	owned   *run9OwnedBytes
+	changed []uint16
+}
+
+// noteChange remembers which part of the inode key space a write touches.
+// Only chunk and attribute records decide what a mount owns.
+func (tx *badgerTxn) noteChange(key []byte) {
+	if tx.owned == nil || len(key) < 10 || key[0] != 'A' || (key[9] != 'C' && key[9] != 'I') {
+		return
+	}
+	// A write usually touches a file's chunk and attributes: one range.
+	if b := run9OwnedBucket(key); len(tx.changed) == 0 || tx.changed[len(tx.changed)-1] != b {
+		tx.changed = append(tx.changed, b)
+	}
 }
 
 func (tx *badgerTxn) get(key []byte) []byte {
@@ -111,6 +127,7 @@ func (tx *badgerTxn) exist(prefix []byte) bool {
 }
 
 func (tx *badgerTxn) set(key, value []byte) {
+	tx.noteChange(key)
 	if err := tx.t.Set(key, value); err != nil {
 		panic(err)
 	}
@@ -132,6 +149,7 @@ func (tx *badgerTxn) incrBy(key []byte, value int64) int64 {
 }
 
 func (tx *badgerTxn) delete(key []byte) {
+	tx.noteChange(key)
 	if err := tx.t.Delete(key); err != nil {
 		panic(err)
 	}
@@ -150,6 +168,7 @@ type badgerClient struct {
 	gcDone    chan struct{}
 	closeOnce sync.Once
 	closeErr  error
+	run9Owned atomic.Pointer[run9OwnedBytes]
 }
 
 func (c *badgerClient) name() string {
@@ -174,8 +193,11 @@ func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int)
 	if c.dbError != nil {
 		return c.dbError
 	}
-	tx := &badgerTxn{c.client.NewTransaction(!c.readOnly), c.client}
+	tx := &badgerTxn{t: c.client.NewTransaction(!c.readOnly), c: c.client, owned: c.run9Owned.Load()}
 	defer func() { tx.t.Discard() }()
+	// After the commit, so that a recount started before it is repeated. A
+	// failed transaction may have committed a part; a spurious mark is harmless.
+	defer func() { tx.owned.changed(tx.changed) }()
 	defer func() {
 		if r := recover(); r != nil {
 			fe, ok := r.(error)
