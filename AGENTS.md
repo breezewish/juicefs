@@ -202,6 +202,10 @@ Related files:
 
 ### Umount with Finalize Semantics
 
+- Mount config discovery and finalization share the requested finalize deadline.
+  A short FUSE discovery timeout must not kill an unflushed writer during host
+  reclaim stalls; process identity and successful ACK remain mandatory.
+
 - New command `juicefs umount-finalize <mountpoint>`: strict finalize semantics for badger (SkipWAL=true). It sends `SIGUSR2` to the mount daemon and returns success only after receiving a success finalize ack written by the mount daemon.
   - A short force-umount observation is done in parallel, but it does not affect correctness (ack is the source of truth).
 

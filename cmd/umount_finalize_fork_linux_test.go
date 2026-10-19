@@ -96,6 +96,114 @@ func TestUmountFinalizeRejectsInvalidSuccessAck(t *testing.T) {
 	}
 }
 
+func TestUmountFinalizeSlowConfigStillFinalizes(t *testing.T) {
+	if os.Getenv("JFS_TEST_SLOW_CONFIG") == "1" {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGUSR2)
+		defer signal.Stop(signals)
+		fmt.Println("ready")
+		<-signals
+		pid := os.Getpid()
+		start, err := readProcStatStarttimeTicks(pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeForkFinalizeAck(forkFinalizeAckPath(pid, start), &forkFinalizeAckV1{
+			SchemaVersion: 1, Pid: pid, PidStarttimeTicks: start, Status: "ok",
+			FinishedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestUmountFinalizeSlowConfigStillFinalizes$")
+	child.Env = append(os.Environ(), "JFS_TEST_SLOW_CONFIG=1")
+	child.Stderr = os.Stderr
+	stdout, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var ackPath, requestPath string
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+		if ackPath != "" {
+			_ = os.Remove(ackPath)
+			_ = os.Remove(requestPath)
+		}
+	})
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "ready\n" {
+		t.Fatalf("signal handler readiness: %q, %v", line, err)
+	}
+	pid := child.Process.Pid
+	start, err := readProcStatStarttimeTicks(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackPath, requestPath = forkFinalizeAckPath(pid, start), forkFinalizeRequestPath(pid, start)
+	// Only replace the FUSE config read. The actual process identity, signal,
+	// ACK validation and command result handling remain under test.
+	original := readVFSConfigWithTimeout
+	readVFSConfigWithTimeout = func(ctx context.Context, _ string, timeout time.Duration) (*vfs.Config, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > timeout || timeout != 8*time.Second {
+			t.Fatalf("config read must share the finalize budget: deadline=%v timeout=%v", deadline, timeout)
+		}
+		// Reproduce a FUSE response arriving after the former 3s cutoff.
+		if err := withTimeout(ctx, timeout, func() error {
+			time.Sleep(3100 * time.Millisecond)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		return &vfs.Config{Pid: pid}, nil
+	}
+	t.Cleanup(func() { readVFSConfigWithTimeout = original })
+	flags := flag.NewFlagSet("umount-finalize", flag.ContinueOnError)
+	flags.String("finalize-timeout", "8s", "")
+	flags.String("umount-observe-timeout", "50ms", "")
+	flags.String("exit-observe-timeout", "50ms", "")
+	if err := flags.Parse([]string{"/unused-test-mount"}); err != nil {
+		t.Fatal(err)
+	}
+	cliCtx := cli.NewContext(cli.NewApp(), flags, nil)
+	cliCtx.Context = ctx
+	result, exitCode := umountFinalizeRun(cliCtx)
+	if exitCode != 0 || !result.Ok || !result.Finalized || result.Ack == nil {
+		t.Fatalf("slow config must still obtain a valid finalize ACK: exit=%d result=%+v", exitCode, result)
+	}
+}
+
+func TestUmountFinalizeConfigHonorsCallerDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	original := readVFSConfigWithTimeout
+	readVFSConfigWithTimeout = func(ctx context.Context, _ string, _ time.Duration) (*vfs.Config, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { readVFSConfigWithTimeout = original })
+	flags := flag.NewFlagSet("umount-finalize", flag.ContinueOnError)
+	flags.String("finalize-timeout", "8s", "")
+	flags.String("umount-observe-timeout", "50ms", "")
+	flags.String("exit-observe-timeout", "50ms", "")
+	if err := flags.Parse([]string{"/unused-test-mount"}); err != nil {
+		t.Fatal(err)
+	}
+	cliCtx := cli.NewContext(cli.NewApp(), flags, nil)
+	cliCtx.Context = ctx
+	result, exitCode := umountFinalizeRun(cliCtx)
+	if exitCode == 0 || result.Ok || result.Finalized || !strings.Contains(result.Reason, "context deadline exceeded") {
+		t.Fatalf("caller cancellation must fail without finalization: exit=%d result=%+v", exitCode, result)
+	}
+}
+
 func TestWaitFinalizeAck_WaitsForFile(t *testing.T) {
 	pid := os.Getpid()
 	starttimeTicks, err := readProcStatStarttimeTicks(pid)

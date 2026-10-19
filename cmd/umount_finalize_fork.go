@@ -115,7 +115,12 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 		}, 1
 	}
 
-	conf, err := readVFSConfigWithTimeout(ctx.Context, mp, 3*time.Second)
+	// Config is a FUSE request to the writer we are about to finalize. Reclaim
+	// stalls must not turn a short discovery timeout into killing that writer
+	// without ever requesting a flush. Discovery and ACK share one total budget.
+	finalizeCtx, cancel := context.WithTimeout(ctx.Context, finalizeTimeout)
+	defer cancel()
+	conf, err := readVFSConfigWithTimeout(finalizeCtx, mp, finalizeTimeout)
 	if err != nil {
 		return &forkUmountFinalizeResult{
 			Ok:     false,
@@ -210,6 +215,9 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 		return &forkUmountFinalizeResult{Ok: false, Reason: reason}, 1
 	}
 
+	if err := finalizeCtx.Err(); err != nil {
+		return &forkUmountFinalizeResult{Ok: false, Reason: err.Error()}, 1
+	}
 	if err := syscall.Kill(pid, syscall.SIGUSR2); err != nil {
 		return &forkUmountFinalizeResult{
 			Ok:     false,
@@ -221,7 +229,7 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 	if finalizeTimeout > 0 && finalizeTimeout < startTimeout {
 		startTimeout = finalizeTimeout
 	}
-	startCtx, cancelStart := context.WithTimeout(ctx.Context, startTimeout)
+	startCtx, cancelStart := context.WithTimeout(finalizeCtx, startTimeout)
 	startAck, startErr := waitFinalizeStart(startCtx, ackPath, pid, expectedStarttime, mountEUID)
 	cancelStart()
 	if errors.Is(startErr, errForkFinalizeAckPending) {
@@ -258,7 +266,7 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 		}, 1
 	}
 
-	kernelUmountObserved := observeForceUmount(ctx.Context, mp, umountObserveTimeout)
+	kernelUmountObserved := observeForceUmount(finalizeCtx, mp, umountObserveTimeout)
 
 	result := &forkUmountFinalizeResult{
 		Ok:                   false,
@@ -267,9 +275,7 @@ func umountFinalizeRun(ctx *cli.Context) (*forkUmountFinalizeResult, int) {
 		DaemonExitObserved:   false,
 	}
 
-	finalizeCtx, cancel := context.WithTimeout(ctx.Context, finalizeTimeout)
 	ack, ackErr := waitFinalizeAck(finalizeCtx, ackPath, pid, expectedStarttime, mountEUID)
-	cancel()
 
 	if ack != nil {
 		result.Ack = ack
