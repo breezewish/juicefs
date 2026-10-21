@@ -80,7 +80,12 @@ func (fs *fileSystem) replyEntry(ctx *fuseContext, out *fuse.EntryOut, e *meta.E
 		out.SetEntryTimeout(fs.conf.EntryTimeout)
 	}
 	fs.replyAttr(ctx, e, &out.Attr, out.SetAttrTimeout)
+	fs.v.Meta.Reference(e.Inode)
 	return 0
+}
+
+func (fs *fileSystem) Forget(nodeid, nlookup uint64) {
+	fs.v.Meta.Forget(Ino(nodeid), nlookup)
 }
 
 func (fs *fileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) (status fuse.Status) {
@@ -404,7 +409,8 @@ func (fs *fileSystem) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *
 			fs.v.UpdateReaddirOffset(ctx, Ino(in.NodeId), in.Fh, int(in.Offset)+i)
 			break
 		}
-		if e.Attr.Full {
+		// The kernel takes no lookup reference for "." and "..".
+		if e.Attr.Full && de.Name != "." && de.Name != ".." {
 			fs.replyEntry(ctx, eo, e)
 		} else {
 			eo.Ino = uint64(e.Inode)

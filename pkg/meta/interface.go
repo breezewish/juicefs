@@ -452,6 +452,10 @@ type Meta interface {
 	Open(ctx Context, inode Ino, flags uint32, attr *Attr) syscall.Errno
 	// Close a file.
 	Close(ctx Context, inode Ino) syscall.Errno
+	// Reference records a kernel lookup reference handed out by an entry reply.
+	Reference(inode Ino)
+	// Forget drops kernel lookup references; an unlinked file is deleted when no reference remains.
+	Forget(inode Ino, nlookup uint64)
 	// Read returns the list of slices on the given chunk.
 	Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) syscall.Errno
 	// NewSlice returns an id for new slice.

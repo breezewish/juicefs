@@ -46,13 +46,17 @@ type openfiles struct {
 	expire time.Duration
 	limit  uint64
 	files  map[Ino]*openFile
+	// lookups counts the references the kernel holds through entry replies.
+	// The kernel may reopen an unlinked inode by node ID until it forgets it.
+	lookups map[Ino]uint64
 }
 
 func newOpenFiles(expire time.Duration, limit uint64) *openfiles {
 	of := &openfiles{
-		expire: expire,
-		limit:  limit,
-		files:  make(map[Ino]*openFile),
+		expire:  expire,
+		limit:   limit,
+		files:   make(map[Ino]*openFile),
+		lookups: make(map[Ino]uint64),
 	}
 	go of.cleanup()
 	return of
@@ -140,15 +144,42 @@ func (o *openfiles) Open(ino Ino, attr *Attr) {
 	of.lastCheck = time.Now().Unix()
 }
 
+// Close releases one open handle and reports whether the inode is no longer in use.
 func (o *openfiles) Close(ino Ino) bool {
 	o.Lock()
 	defer o.Unlock()
 	of, ok := o.files[ino]
 	if ok {
 		of.refs--
-		return of.refs <= 0
 	}
-	return true
+	return o.unusedLocked(ino)
+}
+
+// Reference records one kernel lookup reference.
+func (o *openfiles) Reference(ino Ino) {
+	o.Lock()
+	defer o.Unlock()
+	o.lookups[ino]++
+}
+
+// Forget drops kernel lookup references and reports whether the inode is no longer in use.
+func (o *openfiles) Forget(ino Ino, nlookup uint64) bool {
+	o.Lock()
+	defer o.Unlock()
+	if o.lookups[ino] > nlookup {
+		o.lookups[ino] -= nlookup
+	} else {
+		delete(o.lookups, ino)
+	}
+	return o.unusedLocked(ino)
+}
+
+func (o *openfiles) unusedLocked(ino Ino) bool {
+	if o.lookups[ino] > 0 {
+		return false
+	}
+	of, ok := o.files[ino]
+	return !ok || of.refs <= 0
 }
 
 func (o *openfiles) Check(ino Ino, attr *Attr) bool {
@@ -185,11 +216,11 @@ func (o *openfiles) Update(ino Ino, attr *Attr) bool {
 	return false
 }
 
+// IsOpen reports whether an open handle or a kernel lookup reference still uses the inode.
 func (o *openfiles) IsOpen(ino Ino) bool {
 	o.Lock()
 	defer o.Unlock()
-	of, ok := o.files[ino]
-	return ok && of.refs > 0
+	return !o.unusedLocked(ino)
 }
 
 func (o *openfiles) ReadChunk(ino Ino, indx uint32) ([]Slice, bool) {

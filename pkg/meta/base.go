@@ -2054,17 +2054,31 @@ func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
 
 func (m *baseMeta) Close(ctx Context, inode Ino) syscall.Errno {
 	if m.of.Close(inode) {
-		m.Lock()
-		_, removed := m.removedFiles[inode]
-		if removed {
-			delete(m.removedFiles, inode)
-		}
-		m.Unlock()
-		if removed {
-			_ = m.en.doDeleteSustainedInode(m.sid, inode)
-		}
+		m.deleteRemovedFile(inode)
 	}
 	return 0
+}
+
+func (m *baseMeta) Reference(inode Ino) {
+	m.of.Reference(inode)
+}
+
+func (m *baseMeta) Forget(inode Ino, nlookup uint64) {
+	if m.of.Forget(inode, nlookup) {
+		m.deleteRemovedFile(inode)
+	}
+}
+
+func (m *baseMeta) deleteRemovedFile(inode Ino) {
+	m.Lock()
+	_, removed := m.removedFiles[inode]
+	if removed {
+		delete(m.removedFiles, inode)
+	}
+	m.Unlock()
+	if removed {
+		_ = m.en.doDeleteSustainedInode(m.sid, inode)
+	}
 }
 
 func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
