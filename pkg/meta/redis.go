@@ -2981,6 +2981,16 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 			*outLength = attr.Length
 		}
 
+		// Compaction changes chunk lists without updating the source inode. Watch
+		// those lists before reading so EXEC cannot publish references retired by
+		// a concurrent compactor; the existing transaction retry reads new slices.
+		var sourceChunks []string
+		for i := offIn / ChunkSize; i <= (offIn+size)/ChunkSize; i++ {
+			sourceChunks = append(sourceChunks, m.chunkKey(fin, uint32(i)))
+		}
+		if err := tx.Watch(ctx, sourceChunks...).Err(); err != nil {
+			return err
+		}
 		var vals [][]string
 		for i := offIn / ChunkSize; i <= (offIn+size)/ChunkSize; i++ {
 			val, err := tx.LRange(ctx, m.chunkKey(fin, uint32(i)), 0, -1).Result()
@@ -5027,6 +5037,15 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			case TypeFile:
 				// copy chunks
 				if attr.Length != 0 {
+					// As in CopyFileRange, inode WATCH alone does not detect
+					// compaction retiring the slices being cloned.
+					var sourceChunks []string
+					for i := 0; i <= int(attr.Length/ChunkSize); i++ {
+						sourceChunks = append(sourceChunks, m.chunkKey(srcIno, uint32(i)))
+					}
+					if err := tx.Watch(ctx, sourceChunks...).Err(); err != nil {
+						return err
+					}
 					var vals [][]string
 					for i := 0; i <= int(attr.Length/ChunkSize); i++ {
 						val, err := tx.LRange(ctx, m.chunkKey(srcIno, uint32(i)), 0, -1).Result()

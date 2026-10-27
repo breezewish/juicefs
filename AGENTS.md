@@ -49,6 +49,12 @@ Related files:
 
 ### Redis Batch Clone
 
+- Redis range copies and ordinary single-entry clones watch source chunk lists
+  before reading them. Compaction does not change the inode key; watching only
+  that key can publish references after their objects have been deleted. A
+  concurrent compaction now retries the copy transaction, as batch clone already
+  does. Covered by `pkg/meta/redis_copy_compaction_run9_test.go`.
+
 - Redis metadata clones all non-directory entries in one watched transaction,
   using pipelined reads and one atomic publish. This keeps run9 snap forks from
   issuing one Redis transaction per Badger metadata file under burst load.
@@ -58,6 +64,11 @@ Related files:
 - `pkg/meta/redis_batch_clone_run9.go`
 
 ### Run9 Fork Checkpoint GC
+
+- Maintenance checkpoint scans copy immutable metadata into a private host-local
+  temporary directory before opening Badger. Shared-FUSE page read failures must
+  surface as ordinary file errors, not SIGBUS from mmap. The copy is removed
+  after shutdown; foreground Fork capture keeps its existing path.
 
 - The object work deadline interrupts waiting for listing results and deletion admission.
   Deletion workers have no pending backlog; unadmitted matches roll the cursor

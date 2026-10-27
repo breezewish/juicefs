@@ -77,7 +77,12 @@ func cmdRun9GCCheckpoint() *cli.Command {
 
 func run9GCCheckpoint(ctx context.Context, req run9GCCheckpointRequest) (run9GCCheckpointOutput, error) {
 	var out run9GCCheckpointOutput
-	m, err := meta.OpenRun9Checkpoint(req.Directory)
+	directory, err := copyRun9GCCheckpoint(ctx, req.Directory)
+	if err != nil {
+		return out, err
+	}
+	defer os.RemoveAll(directory)
+	m, err := meta.OpenRun9Checkpoint(directory)
 	if err != nil {
 		return out, err
 	}
@@ -187,7 +192,12 @@ func cmdRun9CheckpointSlices() *cli.Command {
 		if c.NArg() != 1 {
 			return fmt.Errorf("checkpoint-slices requires an immutable metadata directory")
 		}
-		m, err := meta.OpenRun9Checkpoint(c.Args().First())
+		directory, err := copyRun9GCCheckpoint(c.Context, c.Args().First())
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(directory)
+		m, err := meta.OpenRun9Checkpoint(directory)
 		if err != nil {
 			return err
 		}

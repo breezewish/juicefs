@@ -48,7 +48,12 @@ func run9ForkCheckpointSlices(ctx context.Context, directory string, format stri
 	}
 	started := time.Now()
 	defer func() { scan.remaining -= time.Since(started) }()
-	m, err := meta.OpenRun9Checkpoint(filepath.Join(directory, "meta"))
+	private, err := copyRun9GCCheckpoint(ctx, filepath.Join(directory, "meta"))
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(private)
+	m, err := meta.OpenRun9Checkpoint(private)
 	if err != nil {
 		return nil, err
 	}
