@@ -11,6 +11,11 @@ import (
 	"github.com/juicedata/juicefs/pkg/meta"
 )
 
+// A display counter must not consume the mount readiness deadline. Its initial
+// baseline must be taken before writers, so an expired scan stays unavailable
+// for this mount instead of restarting against already-mutated metadata.
+var run9OwnedBytesInitBudget = 5 * time.Second
+
 // Capture before NewSession can start allocating slices. The counter includes
 // reserved IDs, so unused holes are harmless. Finalize only returns this value;
 // run9rt snapshots the closed metadata before releasing its lifecycle lock.
@@ -52,7 +57,9 @@ type run9OwnedBytesRequest struct {
 // A per-mount request file keeps large checkpoint lists out of the process's
 // argument/environment limit. Cached slice lists avoid rescanning children.
 func beginRun9OwnedBytes(m meta.Meta, epoch uint64, start uint64) error {
-	ctx := context.Background()
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), run9OwnedBytesInitBudget)
+	defer cancel()
 	var request run9OwnedBytesRequest
 	if path := os.Getenv("JFS_RUN9_OWNED_BYTES_REQUEST"); path != "" {
 		raw, err := os.ReadFile(path)
@@ -76,6 +83,9 @@ func beginRun9OwnedBytes(m meta.Meta, epoch uint64, start uint64) error {
 	}
 	scan := run9ForkCheckpointScan{remaining: run9ForkCheckpointScanBudget, failed: make(map[string]string)}
 	for _, checkpoint := range request.ForkCheckpoints {
+		if ctx.Err() != nil {
+			break // The initial counter will remain unavailable; no partial proof is published.
+		}
 		ids, err := run9ForkCheckpointSlices(ctx, checkpoint.Directory, format.Name, &scan)
 		if err != nil {
 			cfg.ForkFloor = max(cfg.ForkFloor, checkpoint.SourceAllocationEnd)
@@ -93,7 +103,9 @@ func beginRun9OwnedBytes(m meta.Meta, epoch uint64, start uint64) error {
 	if err := m.(interface {
 		Run9TrackOwnedBytes(context.Context, meta.Run9OwnedBytesConfig) error
 	}).Run9TrackOwnedBytes(ctx, cfg); err != nil {
-		logger.Warnf("owned bytes unavailable for this mount: %s", err)
+		logger.Warnf("owned bytes initialization unavailable: dur_ms=%d budget_ms=%d error=%s", time.Since(started).Milliseconds(), run9OwnedBytesInitBudget.Milliseconds(), err)
+	} else {
+		logger.Infof("owned bytes initialization finished: dur_ms=%d budget_ms=%d", time.Since(started).Milliseconds(), run9OwnedBytesInitBudget.Milliseconds())
 	}
 	return nil
 }

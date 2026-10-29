@@ -370,7 +370,9 @@ For non-divergent code, we should keep as it is in upstream as much as possible,
 - Fork capture records exact protected slices from its immutable metadata
   after writes resume and before acknowledging capture. Unique references and
   a signed baseline preserve counts across reflinks and membership changes.
-  Initialization runs before writers; failures disable this optional counter.
+  Initialization runs before writers within a shared five-second budget; failures
+  or budget exhaustion disable this optional counter and log duration/error,
+  rather than consuming mount readiness and invalidating user data.
   Finalize settles the count within its deadline and returns it alongside the
   allocation boundary. A counter basis identifies discontinuous resets.
 - Sources and coverage: `pkg/meta/run9_owned_bytes.go`,
