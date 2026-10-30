@@ -94,7 +94,7 @@ func TestRun9OwnedBytesRecountOnlyWhatChangedAndMatchCheckpointGC(t *testing.T) 
 			continue
 		}
 		whole := make(map[uint16]map[uint64]uint32)
-		require.NoError(t, m.run9CountOwned(context.Background(), []byte{'A'}, whole))
+		require.NoError(t, m.run9CountOwned(context.Background(), m.client.scan, []byte{'A'}, whole))
 		unique := make(map[uint64]uint32)
 		for _, bucket := range whole {
 			for id, size := range bucket {
@@ -124,25 +124,18 @@ func TestRun9OwnedBytesRecountOnlyWhatChangedAndMatchCheckpointGC(t *testing.T) 
 	require.Equal(t, kept, visible)
 }
 
-// Copy the actual stable key/value state into a separate closed Badger DB.
-// This is the immutable metadata input used by the online capture counter.
-func snapshotRun9OwnedTestMeta(t testing.TB, m *kvMeta) string {
+// pinRun9TestFork pins the metadata a capture hands to a running Fork and
+// returns its record, run synchronously, so that a test decides when it scans.
+func pinRun9TestFork(t testing.TB, m *kvMeta) func() {
 	t.Helper()
-	directory := t.TempDir()
-	copy, err := newKVMeta("badger", directory, testConfig())
-	require.NoError(t, err)
-	defer copy.Shutdown()
-	var copyErr error
-	require.NoError(t, m.client.scan(nil, func(key, value []byte) bool {
-		copyErr = copy.(*kvMeta).client.txn(context.Background(), func(tx *kvTxn) error {
-			tx.set(key, value)
-			return nil
-		}, 0)
-		return copyErr == nil
-	}))
-	require.NoError(t, copyErr)
-	require.NoError(t, copy.Shutdown())
-	return directory
+	c := m.client.(*badgerClient)
+	m.run9Owned.forkSnapshot <- struct{}{}
+	c.dbMu.Lock()
+	record := m.run9PinForkRecord(c)
+	c.dbMu.Unlock()
+	var once sync.Once
+	t.Cleanup(func() { once.Do(record.Discard) })
+	return func() { once.Do(func() { m.run9RecordFork(record.snapshot) }) }
 }
 
 func TestRun9OwnedBytesForkCountsCapturedIDsAndLaterCommitsOfEarlierAllocations(t *testing.T) {
@@ -157,17 +150,15 @@ func TestRun9OwnedBytesForkCountsCapturedIDsAndLaterCommitsOfEarlierAllocations(
 	require.Zero(t, m.NewSlice(ctx, &captured))
 	require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: captured, Size: 100, Len: 100}, time.Now()))
 	require.Zero(t, m.Write(ctx, inode, 0, 100, Slice{Id: 3<<32 + 5, Size: 100, Len: 100}, time.Now()))
-	snapshot := snapshotRun9OwnedTestMeta(t, m)
-	// Drop the captured data before the asynchronous snapshot scan. It still
-	// belongs to the Fork even though no live recount ever saw it.
+	record := pinRun9TestFork(t, m)
+	// Drop the captured data before the snapshot scan. It still belongs to the
+	// Fork even though no live recount ever saw it.
 	require.Zero(t, m.Truncate(ctx, inode, 0, 0, &attr, false))
-	require.NoError(t, m.Run9RecordFork(context.Background(), snapshot))
+	record()
 	require.EqualValues(t, 100, m.run9Owned.offset.Load())
 	require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: delayed, Size: 50, Len: 50}, time.Now()))
 	require.EqualValues(t, 50, run9OwnedVisible(t, m))
 	require.EqualValues(t, 100, m.run9Owned.offset.Load())
-	// Recording the same captured IDs again cannot count them twice.
-	require.NoError(t, m.Run9RecordFork(context.Background(), snapshot))
 	require.Equal(t, Run9OwnedBytes{VisibleBytes: 50, KeptForForksBytes: 100}, *m.Run9SettleOwnedBytes())
 	require.Zero(t, m.Truncate(ctx, inode, 0, 0, &attr, false))
 	require.Zero(t, run9OwnedVisible(t, m))
@@ -190,7 +181,7 @@ func (c *pausedOwnedScanClient) scan(prefix []byte, handler func([]byte, []byte)
 	return c.tkvClient.scan(prefix, handler)
 }
 
-func TestRun9OwnedBytesCancelledForkDoesNotChangeProtectedSlices(t *testing.T) {
+func TestRun9OwnedBytesForkRecordWithholdsSamplesUntilAppliedAfterARunningRecount(t *testing.T) {
 	ctx := Background()
 	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
 	var attr Attr
@@ -199,7 +190,9 @@ func TestRun9OwnedBytesCancelledForkDoesNotChangeProtectedSlices(t *testing.T) {
 	var id uint64
 	require.Zero(t, m.NewSlice(ctx, &id))
 	require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: id, Size: 100, Len: 100}, time.Now()))
-	snapshot := snapshotRun9OwnedTestMeta(t, m)
+	require.True(t, m.run9Owned.sampleCurrent())
+	record := pinRun9TestFork(t, m)
+	require.False(t, m.run9Owned.sampleCurrent())
 	client := &pausedOwnedScanClient{tkvClient: m.client, paused: make(chan struct{}), resume: make(chan struct{})}
 	m.client = client
 	resume := sync.OnceFunc(func() { close(client.resume) })
@@ -215,16 +208,52 @@ func TestRun9OwnedBytesCancelledForkDoesNotChangeProtectedSlices(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("recount did not start")
 	}
-	deadline, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	require.ErrorIs(t, m.Run9RecordFork(deadline, snapshot), context.DeadlineExceeded)
-	require.Empty(t, m.run9Owned.protected)
-	require.Zero(t, m.run9Owned.offset.Load())
+	recorded := make(chan struct{})
+	go func() {
+		defer close(recorded)
+		record()
+	}()
+	select {
+	case <-recorded:
+		t.Fatal("a Fork record must not change the count during a recount")
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.False(t, m.run9Owned.sampleCurrent())
 	resume()
 	require.NoError(t, <-done)
-	require.NoError(t, m.Run9RecordFork(context.Background(), snapshot))
+	<-recorded
+	require.True(t, m.run9Owned.sampleCurrent())
 	require.Zero(t, run9OwnedVisible(t, m))
 	require.EqualValues(t, 100, m.run9Owned.offset.Load())
+}
+
+func TestRun9OwnedBytesFailedForkRecordLeavesTheOptionalCountUnavailable(t *testing.T) {
+	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	corrupt := m.chunkKey(2, 0)
+	require.NoError(t, m.client.txn(context.Background(), func(tx *kvTxn) error {
+		tx.set(corrupt, []byte("corrupt"))
+		return nil
+	}, 0))
+	record := pinRun9TestFork(t, m)
+	// Only the pinned capture is unreadable; live recounts still succeed.
+	require.NoError(t, m.client.txn(context.Background(), func(tx *kvTxn) error {
+		tx.delete(corrupt)
+		return nil
+	}, 0))
+	record()
+	// A recount cannot bring the count back before remount.
+	require.NoError(t, m.Run9RecountOwnedBytes(context.Background()))
+	require.False(t, m.run9Owned.sampleCurrent())
+	require.Nil(t, m.Run9SettleOwnedBytes())
+}
+
+func TestRun9OwnedBytesStoppingCancelsAForkRecord(t *testing.T) {
+	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	record := pinRun9TestFork(t, m)
+	m.run9Owned.cancelRecords()
+	record()
+	require.Zero(t, m.run9Owned.epoch.Load())
+	require.Nil(t, m.Run9SettleOwnedBytes())
 }
 
 func TestRun9OwnedBytesCancelledScanKeepsItsDirtyRanges(t *testing.T) {
@@ -376,9 +405,11 @@ func TestRun9OwnedBytesIncludesHistoricalOwnershipWithoutCountingInheritedData(t
 	// Initialization must scan historical data even before this writable epoch
 	// allocates anything. The intervening inherited epoch is never attributed.
 	require.EqualValues(t, 100, m.run9Owned.visible.Load())
-	snapshot := snapshotRun9OwnedTestMeta(t, m)
-	require.NoError(t, m.Run9RecordFork(context.Background(), snapshot))
+	pinRun9TestFork(t, m)()
 	require.Zero(t, m.run9Owned.visible.Load())
+	require.EqualValues(t, 100, m.run9Owned.offset.Load())
+	// Recording the same captured IDs again cannot count them twice.
+	pinRun9TestFork(t, m)()
 	require.EqualValues(t, 100, m.run9Owned.offset.Load())
 }
 
@@ -391,7 +422,8 @@ func TestRun9OwnedBytesExhaustedBasisDisablesTheOptionalCount(t *testing.T) {
 	require.Equal(t, ^uint64(0), m.run9Owned.basis.Load())
 	require.False(t, m.run9Owned.current.Load())
 	require.Nil(t, m.Run9SettleOwnedBytes())
-	require.NoError(t, m.Run9RecordFork(context.Background(), "/unused"))
+	// No Fork snapshot slot: a capture never pins a record for this mount.
+	require.Nil(t, m.run9Owned.forkSnapshot)
 }
 
 func TestRun9OwnedBytesStartupScanFailureLeavesTheOptionalCountUnavailable(t *testing.T) {
@@ -409,8 +441,8 @@ func TestRun9OwnedBytesStartupScanFailureLeavesTheOptionalCountUnavailable(t *te
 	require.EqualValues(t, 7, m.run9Owned.basis.Load())
 	require.False(t, m.run9Owned.current.Load())
 	require.Nil(t, m.Run9SettleOwnedBytes())
-	// Counter failure does not turn a later source Fork into a counter error.
-	require.NoError(t, m.Run9RecordFork(context.Background(), "/unused"))
+	// No Fork snapshot slot: a later source Fork records nothing.
+	require.Nil(t, m.run9Owned.forkSnapshot)
 }
 
 // What a changed file costs: one recount of its key range.

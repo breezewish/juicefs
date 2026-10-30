@@ -158,7 +158,8 @@ func (tx *badgerTxn) delete(key []byte) {
 type badgerClient struct {
 	// Metadata capture closes and reopens only the database,
 	// keeping the metadata session and FUSE handles alive. Every database user,
-	// including value-log GC, must participate in this lifecycle gate.
+	// including value-log GC, must participate in this lifecycle gate. The only
+	// exception is a pinned snapshot: closing waits for it through run9Owned.
 	dbMu      sync.RWMutex
 	dbError   error
 	client    *badger.DB
@@ -223,7 +224,7 @@ func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int)
 // may write through the same client or wait for workers that do: holding an
 // RWMutex read lock there deadlocks as soon as capture queues its write lock.
 // A bounded key page owns copied bytes only. Each page reopens at the last key;
-// callers that require an immutable scan already use a private metadata clone.
+// callers that require an immutable scan use a pinned snapshot or a clone.
 func (c *badgerClient) scan(prefix []byte, handler func(key []byte, value []byte) bool) error {
 	var cursor []byte
 	for {
@@ -277,6 +278,43 @@ func (c *badgerClient) scan(prefix []byte, handler func(key []byte, value []byte
 	}
 }
 
+// badgerSnapshot reads one commit point of the database without dbMu.
+type badgerSnapshot struct {
+	txn *badger.Txn
+	it  *badger.Iterator
+}
+
+// pinSnapshot must be called with dbMu held exclusively, so that no commit
+// interleaves with the read point. The open iterator also defers value-log
+// deletion. The database must stay open until release.
+func (c *badgerClient) pinSnapshot() *badgerSnapshot {
+	txn := c.client.NewTransaction(false)
+	// Metadata values are inline in the LSM; prefetching would only copy twice.
+	options := badger.DefaultIteratorOptions
+	options.PrefetchValues = false
+	return &badgerSnapshot{txn: txn, it: txn.NewIterator(options)}
+}
+
+// scan has badgerClient.scan's contract, but its read point never moves.
+func (s *badgerSnapshot) scan(prefix []byte, handler func(key, value []byte) bool) error {
+	for s.it.Seek(prefix); s.it.ValidForPrefix(prefix); s.it.Next() {
+		item := s.it.Item()
+		value, err := item.ValueCopy(nil)
+		if err != nil {
+			return err
+		}
+		if !handler(item.KeyCopy(nil), value) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *badgerSnapshot) release() {
+	s.it.Close()
+	s.txn.Discard()
+}
+
 func (c *badgerClient) reset(prefix []byte) error {
 	c.dbMu.RLock()
 	defer c.dbMu.RUnlock()
@@ -294,6 +332,10 @@ func (c *badgerClient) close() error {
 		close(c.done)
 		c.ticker.Stop()
 		<-c.gcDone
+		if o := c.run9Owned.Load(); o != nil {
+			// The owner cancelled Fork records first; wait until none reads.
+			_ = o.waitForkRecords(context.Background())
+		}
 		c.dbMu.Lock()
 		defer c.dbMu.Unlock()
 		if c.dbError != nil {

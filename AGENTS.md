@@ -367,14 +367,19 @@ For non-divergent code, we should keep as it is in upstream as much as possible,
   through linked regular files, excluding inherited slices. Dirty metadata
   ranges are recounted in the background so Box storage can follow changes
   without listing objects or scanning all metadata on every write.
-- Fork capture records exact protected slices from its immutable metadata
-  after writes resume and before acknowledging capture. Unique references and
-  a signed baseline preserve counts across reflinks and membership changes.
+- Fork capture pins a Badger read snapshot of exactly the captured metadata
+  while it still holds the database lock, and records its protected slices in
+  the background once the caller proceeds with the Fork; samples are withheld
+  until then. Only one Fork snapshot exists at a time; the next capture and
+  database close wait for it, and stopping the count cancels it. Unique
+  references and a signed baseline preserve counts across reflinks and
+  membership changes.
   Initialization runs before writers within a shared five-second budget; failures
   or budget exhaustion disable this optional counter and log duration/error,
   rather than consuming mount readiness and invalidating user data.
   Finalize settles the count within its deadline and returns it alongside the
   allocation boundary. A counter basis identifies discontinuous resets.
 - Sources and coverage: `pkg/meta/run9_owned_bytes.go`,
-  `pkg/meta/run9_owned_bytes_test.go`, `cmd/run9_slice_allocation.go`,
+  `pkg/meta/run9_owned_bytes_test.go`, `pkg/meta/run9_metadata_capture_linux.go`,
+  `pkg/meta/tkv_badger.go`, `cmd/run9_slice_allocation.go`,
   `cmd/run9_capture_linux.go`, and `cmd/mount_finalize_fork_linux.go`.

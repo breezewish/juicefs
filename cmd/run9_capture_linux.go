@@ -24,6 +24,12 @@ type run9CaptureRequest struct {
 	DeadlineUnixMS int64  `json:"deadline_unix_ms"`
 }
 
+// run9CaptureMeta is the metadata a managed writable mount captures from.
+type run9CaptureMeta interface {
+	Run9WaitForkRecord(context.Context) error
+	Run9CaptureMetadata(context.Context, string) (meta.Run9MetadataCapture, *meta.Run9ForkRecord, error)
+}
+
 type run9CaptureResponse struct {
 	Phase    string                   `json:"phase"`
 	Error    string                   `json:"error,omitempty"`
@@ -40,9 +46,7 @@ func installRun9Capture(v *vfs.VFS, allocationStart *uint64) (func(), error) {
 	if allocationStart == nil {
 		return func() {}, nil
 	}
-	if _, ok := v.Meta.(interface {
-		Run9CaptureMetadata(context.Context, string) (meta.Run9MetadataCapture, error)
-	}); !ok {
+	if _, ok := v.Meta.(run9CaptureMeta); !ok {
 		return nil, fmt.Errorf("managed mount lacks metadata capture")
 	}
 	ticks, err := readProcStatStarttimeTicks(os.Getpid())
@@ -141,6 +145,7 @@ func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encod
 		return fmt.Errorf("mount is finalizing")
 	}
 	var response run9CaptureResponse
+	var record *meta.Run9ForkRecord
 	if err := func() error {
 		select {
 		case forkMountPublish <- struct{}{}:
@@ -148,6 +153,10 @@ func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encod
 			return fmt.Errorf("mount capture or flush is busy")
 		}
 		defer func() { <-forkMountPublish }()
+		metaCapture := v.Meta.(run9CaptureMeta)
+		if err := metaCapture.Run9WaitForkRecord(ctx); err != nil {
+			return err
+		}
 		resumeWrites := v.SuspendWrites()
 		defer resumeWrites()
 		if err := ctx.Err(); err != nil {
@@ -161,24 +170,18 @@ func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encod
 		response.FlushMS = time.Since(start).Milliseconds()
 		response.Uploads = v.Store.(interface{ CaptureUploads() *chunk.PendingUploads }).CaptureUploads()
 		var err error
-		response.Metadata, err = v.Meta.(interface {
-			Run9CaptureMetadata(context.Context, string) (meta.Run9MetadataCapture, error)
-		}).Run9CaptureMetadata(ctx, request.Directory)
+		response.Metadata, record, err = metaCapture.Run9CaptureMetadata(ctx, request.Directory)
 		if err != nil {
 			return err
 		}
 
 		return ctx.Err()
 	}(); err != nil {
+		record.Discard()
 		return err
 	}
-	// The candidate is still immutable: the caller cannot prepare it until
-	// receiving this response. Source writes have resumed; count only the copy.
-	if err := v.Meta.(interface {
-		Run9RecordFork(context.Context, string) error
-	}).Run9RecordFork(ctx, request.Directory); err != nil {
-		return err
-	}
+	// The Fork proceeds. Its owned-bytes record scans in the background.
+	record.Start()
 	response.Phase = "captured"
 	if err := encoder.Encode(response); err != nil {
 		return err

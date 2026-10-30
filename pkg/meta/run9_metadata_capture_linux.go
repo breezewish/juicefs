@@ -32,24 +32,40 @@ type Run9MetadataCapture struct {
 // Run9CaptureMetadata closes only Badger, clones its complete stable file set,
 // and reopens the same options. The caller must seal VFS writes first and keep
 // the mount alive. No session, allocator, or chunk-store state is recreated.
-func (m *kvMeta) Run9CaptureMetadata(ctx context.Context, directory string) (out Run9MetadataCapture, resultErr error) {
+// With a live owned-bytes count, it also returns the Fork's record; the caller
+// starts it when the Fork proceeds, or discards it.
+func (m *kvMeta) Run9CaptureMetadata(ctx context.Context, directory string) (out Run9MetadataCapture, record *Run9ForkRecord, resultErr error) {
 	c, ok := m.client.(*badgerClient)
 	if !ok || c.readOnly {
-		return out, fmt.Errorf("metadata capture requires writable Badger")
+		return out, nil, fmt.Errorf("metadata capture requires writable Badger")
 	}
 	if !filepath.IsAbs(directory) {
-		return out, fmt.Errorf("metadata capture requires an absolute destination")
+		return out, nil, fmt.Errorf("metadata capture requires an absolute destination")
 	}
 	if _, err := os.Lstat(directory); !os.IsNotExist(err) {
-		return out, fmt.Errorf("metadata capture destination must not exist: %s (%v)", directory, err)
+		return out, nil, fmt.Errorf("metadata capture destination must not exist: %s (%v)", directory, err)
+	}
+	// The previous Fork's record may still read the database this closes.
+	// Callers already waited for it with Run9WaitForkRecord before sealing.
+	o := &m.run9Owned
+	held, waitErr := o.acquireForkSnapshot(ctx)
+	if waitErr != nil {
+		return out, nil, waitErr
+	}
+	if held {
+		defer func() {
+			if record == nil {
+				<-o.forkSnapshot
+			}
+		}()
 	}
 	c.dbMu.Lock()
 	defer c.dbMu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return out, err
+		return out, nil, err
 	}
 	if c.dbError != nil {
-		return out, c.dbError
+		return out, nil, c.dbError
 	}
 	if err := c.client.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte("CnextChunk"))
@@ -66,18 +82,18 @@ func (m *kvMeta) Run9CaptureMetadata(ctx context.Context, directory string) (out
 		out.AllocationEnd = uint64(parseCounter(value))
 		return nil
 	}); err != nil {
-		return out, err
+		return out, nil, err
 	}
 	options := c.client.Opts()
 	if options.Dir != options.ValueDir {
-		return out, fmt.Errorf("metadata capture requires a single Badger directory")
+		return out, nil, fmt.Errorf("metadata capture requires a single Badger directory")
 	}
 	start := time.Now()
 	err := c.client.Close()
 	out.CloseMS = time.Since(start).Milliseconds()
 	if err != nil {
 		c.dbError = fmt.Errorf("%w: metadata capture close failed: %w", ErrRun9MetadataUnavailable, err)
-		return out, c.dbError
+		return out, nil, c.dbError
 	}
 	// Reopening is source recovery, so it must run even after cancellation or
 	// a failed copy. Keep the access lock until the replacement is installed.
@@ -91,11 +107,15 @@ func (m *kvMeta) Run9CaptureMetadata(ctx context.Context, directory string) (out
 			return
 		}
 		c.client = db
+		if resultErr == nil && held && o.epoch.Load() != 0 {
+			// Until dbMu is released, the reopened database is the copy.
+			record = m.run9PinForkRecord(c)
+		}
 	}()
 	start = time.Now()
 	err = cloneRun9Metadata(ctx, options.Dir, directory)
 	out.CloneMS = time.Since(start).Milliseconds()
-	return out, err
+	return out, nil, err
 }
 
 func cloneRun9Metadata(ctx context.Context, source, destination string) error {
