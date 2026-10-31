@@ -2756,7 +2756,9 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 	if once && len(ss) < maxSlices {
 		return
 	}
+	var tail []*slice
 	if len(ss) > maxCompactSlices {
+		tail = ss[maxCompactSlices:]
 		ss = ss[:maxCompactSlices]
 	}
 	skipped := skipSome(ss)
@@ -2764,6 +2766,11 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 	pos, size, slices := compactChunk(compacted)
 	if len(compacted) < 2 || size == 0 {
 		return
+	}
+	if len(tail) > 0 && m.conf.MaxDeletes == 0 {
+		if kv, ok := m.en.(*kvMeta); ok && kv.Name() == "badger" {
+			slices = run9CompactionSlices(compacted, tail, pos, size)
+		}
 	}
 	for _, s := range ss[:skipped] {
 		if pos+size > s.pos && s.pos+s.len > pos {
@@ -2783,7 +2790,7 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 	err := m.newMsg(CompactChunk, slices, id)
 	if err != nil {
 		if !strings.Contains(err.Error(), "not exist") && !strings.Contains(err.Error(), "not found") {
-			logger.Warnf("compact %d %d with %d slices: %s", inode, indx, len(compacted), err)
+			logger.Warnf("compact %d %d with %d slices (uncompacted tail: %d): %s", inode, indx, len(compacted), len(tail), err)
 		}
 		return
 	}

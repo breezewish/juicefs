@@ -65,6 +65,13 @@ Related files:
 
 ### Run9 Fork Checkpoint GC
 
+- Badger mounts with online deletion disabled mask a bounded compaction prefix
+  with the untouched tail before reading objects. Checkpoint GC may already
+  have collected overwritten prefix references; tail-covered bytes become holes
+  only in the replacement prefix, while the atomic metadata edit keeps the tail.
+  The original prefix bounds, reference retirement and batch limit stay intact.
+  Sources: `pkg/meta/run9_compaction.go`, `pkg/meta/run9_compaction_test.go`.
+
 - Maintenance checkpoint scans copy immutable metadata into a private host-local
   temporary directory before opening Badger. Shared-FUSE page read failures must
   surface as ordinary file errors, not SIGBUS from mmap. The copy is removed
