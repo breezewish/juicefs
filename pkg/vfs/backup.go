@@ -19,14 +19,10 @@ package vfs
 import (
 	"compress/gzip"
 	"context"
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
-	"strings"
-	"syscall"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -100,21 +96,21 @@ func Backup(m meta.Meta, blob object.ObjectStorage, interval time.Duration, skip
 
 func backup(m meta.Meta, blob object.ObjectStorage, now time.Time, fast, skipTrash bool) (string, error) {
 	name := "dump-" + now.UTC().Format("2006-01-02-150405") + ".json.gz"
-	localDir := os.TempDir()
-	if !strings.HasSuffix(localDir, "/") {
-		localDir += "/"
-	}
-	fp, err := os.Create(filepath.Join(localDir, "meta", name))
-	if errors.Is(err, syscall.ENOENT) || (errors.Is(err, syscall.ENOTDIR) && runtime.GOOS == "windows") {
-		if err = os.MkdirAll(filepath.Join(localDir, "meta"), 0755); err != nil {
-			return "", err
-		}
-		fp, err = os.Create(filepath.Join(localDir, "meta", name))
-	}
+	// Different mounts can back up during the same second. The object key
+	// remains timestamp-based, but each upload must own its local dump until
+	// all reads finish; another mount must never truncate or unlink it.
+	localDir, err := os.MkdirTemp("", "juicefs-meta-backup-")
 	if err != nil {
 		return "", err
 	}
-	defer os.Remove(fp.Name())
+	defer os.RemoveAll(localDir)
+	if err := os.Mkdir(filepath.Join(localDir, "meta"), 0700); err != nil {
+		return "", err
+	}
+	fp, err := os.Create(filepath.Join(localDir, "meta", name))
+	if err != nil {
+		return "", err
+	}
 	defer fp.Close()
 	zw, _ := gzip.NewWriterLevel(fp, gzip.BestSpeed)
 	var threads = 2
@@ -122,7 +118,9 @@ func backup(m meta.Meta, blob object.ObjectStorage, now time.Time, fast, skipTra
 		threads = 10
 	}
 	err = m.DumpMeta(zw, 0, threads, false, fast, skipTrash) // force dump the whole tree
-	_ = zw.Close()
+	if closeErr := zw.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		return "", err
 	}
@@ -132,7 +130,7 @@ func backup(m meta.Meta, blob object.ObjectStorage, now time.Time, fast, skipTra
 	}
 
 	fpath := "meta/" + name
-	disk, err := object.CreateStorage("file", localDir, "", "", "")
+	disk, err := object.CreateStorage("file", localDir+string(os.PathSeparator), "", "", "")
 	if err != nil {
 		return "", err
 	}

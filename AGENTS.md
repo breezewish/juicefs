@@ -16,6 +16,16 @@ When introducing new changes, first identify whether it is a divergence from ups
 - Record divergences in doc comments.
 - Cover divergences via proper tests (unit / end to end).
 
+### Concurrent metadata backup staging
+
+- Each metadata backup owns a private temporary directory until upload returns.
+  Independent mounts can use the same timestamp-based object key without
+  truncating or unlinking another mount's local dump. Remote keys and retention
+  stay unchanged. This fixes an upstream staging collision, not a new backup
+  format or run9-specific retention policy.
+- `pkg/vfs/backup_isolation_test.go` covers the deterministic overlap;
+  run9's `scripts/test-concurrent-metadata-backup.py` covers real Badger/FUSE mounts.
+
 ### Makefile targets
 
 - A new target named `juicefs.run9` is introduced.
