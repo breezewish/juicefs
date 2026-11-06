@@ -17,16 +17,17 @@ import (
 
 var forkFlushDrainFlushAll = func(v *vfs.VFS) error { return v.FlushAll("") }
 
-// installForkFlushDrain serves request-scoped publish fences on an owner-only
-// Unix socket. Shutdown joins handlers; FlushAll must finish before teardown,
-// even when the requesting connection disappears or its deadline expires.
-func installForkFlushDrain(v *vfs.VFS) (func(), error) {
+// installForkControlSocket serves run9 requests on an owner-only Unix socket:
+// request-scoped publish fences and the recorded prewarm page-cache routes.
+// Shutdown joins handlers; FlushAll must finish before teardown, even when the
+// requesting connection disappears or its deadline expires.
+func installForkControlSocket(v *vfs.VFS) (func(), error) {
 	pid := os.Getpid()
 	ticks, err := readProcStatStarttimeTicks(pid)
 	if err != nil {
 		return nil, err
 	}
-	socket := forkFlushDrainSocketPath(pid, ticks)
+	socket := forkControlSocketPath(pid, ticks)
 	directory := filepath.Dir(socket)
 	if err := os.Mkdir(directory, 0700); err != nil {
 		return nil, err
@@ -36,34 +37,30 @@ func installForkFlushDrain(v *vfs.VFS) (func(), error) {
 		_ = os.Remove(directory)
 		return nil, err
 	}
-	server := &http.Server{
-		ReadTimeout: 10 * time.Second,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost || r.URL.Path != "/flush" {
-				http.NotFound(w, r)
-				return
-			}
-			var request forkFlushDrainRequest
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			deadline := time.UnixMilli(request.DeadlineUnixMS)
-			ctx, cancel := context.WithDeadline(r.Context(), deadline)
-			defer cancel()
-			result := runForkFlushDrain(ctx, v)
-			result.Ack.Pid = pid
-			result.Ack.PidStarttimeTicks = ticks
-			if !result.Ok {
-				logger.Errorf("flush-drain: phase=%s: %s", result.Ack.Phase, result.Reason)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(result)
-		}),
-	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /flush", func(w http.ResponseWriter, r *http.Request) {
+		var request forkFlushDrainRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		deadline := time.UnixMilli(request.DeadlineUnixMS)
+		ctx, cancel := context.WithDeadline(r.Context(), deadline)
+		defer cancel()
+		result := runForkFlushDrain(ctx, v)
+		result.Ack.Pid = pid
+		result.Ack.PidStarttimeTicks = ticks
+		if !result.Ok {
+			logger.Errorf("flush-drain: phase=%s: %s", result.Ack.Phase, result.Reason)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	})
+	routeForkPageCache(mux, v)
+	server := &http.Server{ReadTimeout: 10 * time.Second, Handler: mux}
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-			logger.Errorf("flush-drain server: %s", err)
+			logger.Errorf("control socket server: %s", err)
 		}
 	}()
 	return func() {

@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime"
@@ -39,7 +40,17 @@ func flushDrain(ctx *cli.Context) error {
 	return nil
 }
 
-func installForkFlushDrain(v *vfs.VFS) (func(), error) {
+func installForkControlSocket(v *vfs.VFS) (func(), error) {
 	// Fork feature: linux only.
 	return func() {}, nil
 }
+
+func requestForkControlForMount(ctx context.Context, mountpoint, method, path string, body []byte, result any) error {
+	return fmt.Errorf("run9 control requests are only supported on linux (current: %s)", runtime.GOOS)
+}
+
+// stopForkPageCacheWarms has nothing to stop: page cache warming is linux only.
+func stopForkPageCacheWarms() {}
+
+// cancelForkPageCacheWarms has nothing to cancel: page cache warming is linux only.
+func cancelForkPageCacheWarms() {}

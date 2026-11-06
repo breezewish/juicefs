@@ -33,7 +33,7 @@ func TestFlushDrainConcurrentRequestsKeepSeparateResults(t *testing.T) {
 	}
 	defer func() { forkFlushDrainFlushAll = original }()
 	store := &fakeFinalizeChunkStore{}
-	stop, err := installForkFlushDrain(&vfs.VFS{
+	stop, err := installForkControlSocket(&vfs.VFS{
 		Conf: &vfs.Config{Chunk: &chunk.Config{Writeback: true}}, Store: store,
 	})
 	require.NoError(t, err)
@@ -42,7 +42,7 @@ func TestFlushDrainConcurrentRequestsKeepSeparateResults(t *testing.T) {
 	defer releaseFlush()
 	ticks, err := readProcStatStarttimeTicks(os.Getpid())
 	require.NoError(t, err)
-	socket := forkFlushDrainSocketPath(os.Getpid(), ticks)
+	socket := forkControlSocketPath(os.Getpid(), ticks)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	first := make(chan *forkFlushDrainResult, 1)

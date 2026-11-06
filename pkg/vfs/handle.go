@@ -234,14 +234,20 @@ func (v *VFS) releaseHandle(inode Ino, fh uint64) {
 	}
 }
 
-func (v *VFS) newFileHandle(inode Ino, length uint64, flags uint32) uint64 {
+// newFileHandle opens a handle; cacheOnly applies to read-only handles, see
+// DataReader.OpenCacheOnly.
+func (v *VFS) newFileHandle(inode Ino, length uint64, flags uint32, cacheOnly bool) uint64 {
 	h := v.newHandle(inode, (flags&O_ACCMODE) == syscall.O_RDONLY)
 	h.Lock()
 	defer h.Unlock()
 	h.flags = flags
 	switch flags & O_ACCMODE {
 	case syscall.O_RDONLY:
-		h.reader = v.reader.Open(inode, length)
+		if cacheOnly {
+			h.reader = v.reader.OpenCacheOnly(inode, length)
+		} else {
+			h.reader = v.reader.Open(inode, length)
+		}
 	case syscall.O_WRONLY: // FUSE writeback_cache mode need reader even for WRONLY
 		fallthrough
 	case syscall.O_RDWR:

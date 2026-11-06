@@ -125,6 +125,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	}
 
 	key := s.key(indx)
+	// A cache-only read warms a page cache ahead of a workload; its hits and
+	// misses are not that workload's.
+	cacheOnly := isCacheOnly(ctx)
 	readCachedBlock := func(r ReadCloser) (int, error) {
 		n, readErr := r.ReadAt(p, int64(boff))
 		if !s.store.conf.OSCache {
@@ -139,9 +142,11 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		if err == nil {
 			n, err = readCachedBlock(r)
 			if err == nil {
-				s.store.cacheHits.Add(1)
-				s.store.cacheHitBytes.Add(float64(n))
-				s.store.cacheReadHist.Observe(time.Since(start).Seconds())
+				if !cacheOnly {
+					s.store.cacheHits.Add(1)
+					s.store.cacheHitBytes.Add(float64(n))
+					s.store.cacheReadHist.Observe(time.Since(start).Seconds())
+				}
 				return n, nil
 			}
 			logger.Warnf("remove partial cached block %s: %d %s", key, n, err)
@@ -154,16 +159,20 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		if sharedErr == nil {
 			n, sharedErr = readCachedBlock(r)
 			if sharedErr == nil {
-				s.store.cacheHits.Add(1)
-				s.store.cacheHitBytes.Add(float64(n))
-				s.store.sharedCacheHits.Add(1)
-				s.store.sharedCacheHitBytes.Add(float64(n))
-				s.store.cacheReadHist.Observe(time.Since(start).Seconds())
+				if !cacheOnly {
+					s.store.cacheHits.Add(1)
+					s.store.cacheHitBytes.Add(float64(n))
+					s.store.sharedCacheHits.Add(1)
+					s.store.sharedCacheHitBytes.Add(float64(n))
+					s.store.cacheReadHist.Observe(time.Since(start).Seconds())
+				}
 				return n, nil
 			}
 		}
 		if os.IsNotExist(sharedErr) {
-			s.store.sharedCacheMisses.Add(1)
+			if !cacheOnly {
+				s.store.sharedCacheMisses.Add(1)
+			}
 		} else {
 			s.store.sharedCacheErrors.Add(1)
 			logger.Warnf("ignore invalid shared cached block %s: %s", key, sharedErr)
@@ -175,11 +184,13 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		if cacheErr == nil {
 			n, cacheErr = readCachedBlock(r)
 			if cacheErr == nil {
-				s.store.cacheHits.Inc()
-				s.store.cacheHitBytes.Add(float64(n))
-				s.store.cleanCacheHits.Inc()
-				s.store.cleanCacheHitBytes.Add(float64(n))
-				s.store.cacheReadHist.Observe(time.Since(start).Seconds())
+				if !cacheOnly {
+					s.store.cacheHits.Inc()
+					s.store.cacheHitBytes.Add(float64(n))
+					s.store.cleanCacheHits.Inc()
+					s.store.cleanCacheHitBytes.Add(float64(n))
+					s.store.cacheReadHist.Observe(time.Since(start).Seconds())
+				}
 				return n, nil
 			}
 		}
@@ -190,6 +201,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		}
 	}
 
+	if cacheOnly {
+		return 0, ErrNotCached
+	}
 	s.store.cacheMiss.Add(1)
 	s.store.cacheMissBytes.Add(float64(len(p)))
 

@@ -75,6 +75,8 @@ func Main(args []string) error {
 			cmdUmount(),
 			cmdUmountFinalizeFork(),
 			cmdFlushDrainFork(),
+			cmdRun9ReadTrace(),
+			cmdRun9WarmPageCache(),
 			cmdGateway(),
 			cmdWebDav(),
 			cmdBench(),

@@ -129,6 +129,7 @@ func installForkFinalizeHandler(_ meta.Meta, v *vfs.VFS, _ object.ObjectStorage)
 				logger.Warnf("finalize: write pending ack: %s", err)
 			}
 			logger.Infof("Received SIGUSR2, requesting finalize via force umount")
+			stopForkPageCacheWarms()
 			if err := doUmount(v.Conf.Meta.MountPoint, true); err != nil {
 				logger.Warnf("finalize: force umount: %s", err)
 			}

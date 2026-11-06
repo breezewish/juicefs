@@ -18,6 +18,7 @@ package vfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"sort"
@@ -74,6 +75,10 @@ type FileReader interface {
 
 type DataReader interface {
 	Open(inode Ino, length uint64) FileReader
+	// OpenCacheOnly opens a reader that never reads ahead and serves only blocks
+	// already in a local cache. Its first read of an uncached block fails with
+	// EIO and so does every later read; no read ever fetches from object storage.
+	OpenCacheOnly(inode Ino, length uint64) FileReader
 	Truncate(inode Ino, length uint64)
 	Invalidate(inode Ino, off, length uint64)
 }
@@ -121,7 +126,8 @@ func (s *sliceReader) done(err syscall.Errno, delay time.Duration) {
 		s.state = NEW
 	}
 	if err != 0 {
-		if !f.closing {
+		// A cache-only reader expects misses; see DataReader.OpenCacheOnly.
+		if !f.closing && !f.cacheOnly {
 			logger.Errorf("read file %d: %s", f.inode, err)
 		}
 		f.err = err
@@ -206,6 +212,9 @@ func (s *sliceReader) run() {
 	var n int
 
 	ctx := context.WithValue(s.ctx, meta.CtxKey("inode"), inode) // Output inode in log for debugging
+	if f.cacheOnly {
+		ctx = chunk.WithCacheOnly(ctx)
+	}
 	n = f.r.Read(ctx, p, slices, (uint32(s.block.off))%meta.ChunkSize)
 
 	f.Lock()
@@ -218,6 +227,9 @@ func (s *sliceReader) run() {
 		s.file.tried = 0
 		s.lastAccess = time.Now()
 		s.done(0, 0)
+	} else if f.cacheOnly {
+		// A block outside the local caches stays outside: retrying cannot help.
+		s.done(syscall.EIO, 0)
 	} else {
 		s.currentPos = 0 // start again from beginning
 		err = syscall.EIO
@@ -290,6 +302,8 @@ type fileReader struct {
 	sessions [readSessions]session
 	slices   *sliceReader
 	last     **sliceReader
+
+	cacheOnly bool // immutable; see DataReader.OpenCacheOnly
 
 	sync.Mutex
 	closing bool
@@ -650,7 +664,7 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 
 	f.cleanupRequests(block)
 	var lastBS uint64 = 32 << 10
-	if block.off+lastBS > f.length {
+	if !f.cacheOnly && block.off+lastBS > f.length {
 		lastblock := frange{f.length - lastBS, lastBS}
 		if f.length < lastBS {
 			lastblock = frange{0, f.length}
@@ -668,7 +682,9 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 			}
 		}
 	}()
-	f.checkReadahead(block)
+	if !f.cacheOnly {
+		f.checkReadahead(block)
+	}
 	return f.waitForIO(ctx, reqs, buf)
 }
 
@@ -749,10 +765,19 @@ func (r *dataReader) checkReadBuffer() {
 }
 
 func (r *dataReader) Open(inode Ino, length uint64) FileReader {
+	return r.open(inode, length, false)
+}
+
+func (r *dataReader) OpenCacheOnly(inode Ino, length uint64) FileReader {
+	return r.open(inode, length, true)
+}
+
+func (r *dataReader) open(inode Ino, length uint64, cacheOnly bool) FileReader {
 	f := &fileReader{
-		r:      r,
-		inode:  inode,
-		length: length,
+		r:         r,
+		inode:     inode,
+		cacheOnly: cacheOnly,
+		length:    length,
 	}
 	f.last = &(f.slices)
 
@@ -827,6 +852,9 @@ func (r *dataReader) readSlice(ctx context.Context, s *meta.Slice, page *chunk.P
 		n, err := reader.ReadAt(ctx, p, off+int(s.Off))
 		p.Release()
 		if n == 0 && err != nil {
+			if errors.Is(err, chunk.ErrNotCached) {
+				return err
+			}
 			logger.Warningf("fail to read sliceId %d (off:%d, size:%d, clen: %d, inode: %d): %s",
 				s.Id, off+int(s.Off), len(buf)-read, s.Size, ctx.Value(meta.CtxKey("inode")), err)
 			return err

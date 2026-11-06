@@ -540,7 +540,7 @@ func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask u
 	}
 	if err == 0 {
 		v.UpdateLength(inode, attr)
-		fh = v.newFileHandle(inode, attr.Length, flags)
+		fh = v.newFileHandle(inode, attr.Length, flags, false)
 		entry = &meta.Entry{Inode: inode, Attr: attr}
 		v.invalidateDirHandle(parent, name, inode, attr)
 
@@ -595,7 +595,8 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 	err = v.Meta.Open(ctx, ino, flags, attr)
 	if err == 0 {
 		v.UpdateLength(ino, attr)
-		fh = v.newFileHandle(ino, attr.Length, flags)
+		_, cacheOnly := v.cacheOnlyThreads.Load(ctx.Pid())
+		fh = v.newFileHandle(ino, attr.Length, flags, cacheOnly)
 		entry = &meta.Entry{Inode: ino, Attr: attr}
 	}
 	return
@@ -798,6 +799,9 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	n, err = h.reader.Read(ctx, off, buf)
 	for err == syscall.EAGAIN {
 		n, err = h.reader.Read(ctx, off, buf)
+	}
+	if v.readTrace != nil && err == 0 && n > 0 {
+		v.readTrace.record(ino, off, n)
 	}
 	if err == syscall.ENOENT {
 		err = syscall.EBADF
@@ -1258,6 +1262,12 @@ type VFS struct {
 	modifiedAt map[Ino]time.Time
 
 	registry *prometheus.Registry
+
+	readTrace *readTrace // nil unless TraceReads was called
+	// cacheOnlyThreads holds the thread ids of WarmPageCache workers, whose
+	// opens get cache-only handles. A worker stays locked to its OS thread, and
+	// the kernel reports the calling thread id as a FUSE request's pid.
+	cacheOnlyThreads sync.Map
 }
 
 func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer prometheus.Registerer, registry *prometheus.Registry) *VFS {

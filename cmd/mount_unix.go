@@ -362,6 +362,10 @@ func fuseFlags() []cli.Flag {
 			Name:  "enable-ioctl",
 			Usage: "enable ioctl (support GETFLAGS/SETFLAGS only)",
 		},
+		&cli.BoolFlag{
+			Name:  "trace-reads",
+			Usage: "record the file ranges this mount reads, for read-trace (fork)",
+		},
 		&cli.StringFlag{
 			Name:  "root-squash",
 			Usage: "mapping local root user (uid = 0) to another one specified as <uid>:<gid>",
@@ -906,6 +910,7 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 				}
 				if err := v.FlushAll(""); err == nil {
 					forkFinalizeInProgress = true
+					stopForkPageCacheWarms()
 					fuse.Shutdown()
 					err = v.FlushAll(path)
 					if err != nil {
@@ -931,6 +936,9 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 				logger.Errorf("exit after receiving signal %s, but umount does not finish in 30 seconds, force exit", sig)
 				os.Exit(meta.UmountCode)
 			}()
+			// A warm's open files would keep the lazily unmounted connection
+			// alive. Cancel them without waiting: the unmount must not wait.
+			cancelForkPageCacheWarms()
 			go func() { _ = doUmount(mp, true) }()
 		}
 	}()

@@ -752,17 +752,20 @@ func mount(c *cli.Context) error {
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
 	})
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
+	if c.Bool("trace-reads") {
+		v.TraceReads()
+	}
 	stopCapture, err := installRun9Capture(v, sliceAllocationStart)
 	if err != nil {
 		return errors.Join(fmt.Errorf("install metadata capture: %w", err), shutdownSessionAndResources(metaCli, blob))
 	}
-	stopFlush, err := installForkFlushDrain(v)
+	stopControl, err := installForkControlSocket(v)
 	if err != nil {
 		stopCapture()
-		return errors.Join(fmt.Errorf("install flush-drain: %w", err), shutdownSessionAndResources(metaCli, blob))
+		return errors.Join(fmt.Errorf("install control socket: %w", err), shutdownSessionAndResources(metaCli, blob))
 	}
 	defer stopCapture()
-	defer stopFlush()
+	defer stopControl()
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
