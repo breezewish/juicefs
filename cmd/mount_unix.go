@@ -1143,3 +1143,10 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		logger.Fatalf("fuse: %s", err)
 	}
 }
+
+// adoptInheritedFile takes over a descriptor inherited from the launcher and
+// keeps it from leaking into helpers this process starts, such as fusermount.
+func adoptInheritedFile(fd int, name string) *os.File {
+	syscall.CloseOnExec(fd)
+	return os.NewFile(uintptr(fd), name)
+}

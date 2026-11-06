@@ -14,9 +14,27 @@ import (
 
 const run9OwnedTestEpoch = 7
 
+// startRun9OwnedTest tracks the epoch, waits until initialization is applied
+// and stops the worker, so that a test decides when marked ranges are recounted.
+func startRun9OwnedTest(t testing.TB, m *kvMeta, cfg Run9OwnedBytesConfig) {
+	t.Helper()
+	require.NoError(t, m.Run9TrackOwnedBytes(cfg))
+	m.run9Owned.stopWorker()
+}
+
+func run9TestProtection(protection Run9ForkProtection) func(context.Context) (Run9ForkProtection, error) {
+	return func(context.Context) (Run9ForkProtection, error) { return protection, nil }
+}
+
+func markAllRun9Owned(o *run9OwnedBytes) {
+	for i := range o.marked {
+		o.marked[i].Store(^uint64(0))
+	}
+}
+
 // newRun9OwnedTestMeta returns a tracked epoch whose worker is stopped, so that
 // a test decides when marked ranges are recounted.
-func newRun9OwnedTestMeta(t testing.TB, dir string, forkFloor uint64) *kvMeta {
+func newRun9OwnedTestMeta(t testing.TB, dir string) *kvMeta {
 	client, err := newKVMeta("badger", dir, testConfig())
 	require.NoError(t, err)
 	m := client.(*kvMeta)
@@ -30,8 +48,7 @@ func newRun9OwnedTestMeta(t testing.TB, dir string, forkFloor uint64) *kvMeta {
 		tx.set(m.counterKey("nextChunk"), packCounter(int64(start)))
 		return nil
 	}, 0))
-	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, ForkFloor: forkFloor}))
-	m.run9Owned.stopWorker()
+	startRun9OwnedTest(t, m, Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start})
 	return m
 }
 
@@ -46,7 +63,7 @@ func run9OwnedVisible(t testing.TB, m *kvMeta) uint64 {
 func TestRun9OwnedBytesRecountOnlyWhatChangedAndMatchCheckpointGC(t *testing.T) {
 	ctx := Background()
 	dir := t.TempDir()
-	m := newRun9OwnedTestMeta(t, dir, 0)
+	m := newRun9OwnedTestMeta(t, dir)
 	random := rand.New(rand.NewSource(1))
 	sizes := make(map[uint64]uint32)
 	var names []string
@@ -109,7 +126,7 @@ func TestRun9OwnedBytesRecountOnlyWhatChangedAndMatchCheckpointGC(t *testing.T) 
 	}
 	visible := run9OwnedVisible(t, m)
 	require.NotZero(t, visible)
-	require.Equal(t, visible, m.Run9SettleOwnedBytes().VisibleBytes)
+	require.Equal(t, visible, m.Run9SettleOwnedBytes(context.Background()).VisibleBytes)
 
 	require.NoError(t, m.Shutdown())
 	checkpoint, err := OpenRun9Checkpoint(dir)
@@ -140,7 +157,7 @@ func pinRun9TestFork(t testing.TB, m *kvMeta) func() {
 
 func TestRun9OwnedBytesForkCountsCapturedIDsAndLaterCommitsOfEarlierAllocations(t *testing.T) {
 	ctx := Background()
-	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	m := newRun9OwnedTestMeta(t, t.TempDir())
 	var attr Attr
 	var inode Ino
 	require.Zero(t, m.Create(ctx, RootInode, "file", 0644, 0, 0, &inode, &attr))
@@ -159,7 +176,7 @@ func TestRun9OwnedBytesForkCountsCapturedIDsAndLaterCommitsOfEarlierAllocations(
 	require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: delayed, Size: 50, Len: 50}, time.Now()))
 	require.EqualValues(t, 50, run9OwnedVisible(t, m))
 	require.EqualValues(t, 100, m.run9Owned.offset.Load())
-	require.Equal(t, Run9OwnedBytes{VisibleBytes: 50, KeptForForksBytes: 100}, *m.Run9SettleOwnedBytes())
+	require.Equal(t, Run9OwnedBytes{VisibleBytes: 50, KeptForForksBytes: 100}, *m.Run9SettleOwnedBytes(context.Background()))
 	require.Zero(t, m.Truncate(ctx, inode, 0, 0, &attr, false))
 	require.Zero(t, run9OwnedVisible(t, m))
 }
@@ -183,7 +200,7 @@ func (c *pausedOwnedScanClient) scan(prefix []byte, handler func([]byte, []byte)
 
 func TestRun9OwnedBytesForkRecordWithholdsSamplesUntilAppliedAfterARunningRecount(t *testing.T) {
 	ctx := Background()
-	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	m := newRun9OwnedTestMeta(t, t.TempDir())
 	var attr Attr
 	var inode Ino
 	require.Zero(t, m.Create(ctx, RootInode, "file", 0644, 0, 0, &inode, &attr))
@@ -228,7 +245,7 @@ func TestRun9OwnedBytesForkRecordWithholdsSamplesUntilAppliedAfterARunningRecoun
 }
 
 func TestRun9OwnedBytesFailedForkRecordLeavesTheOptionalCountUnavailable(t *testing.T) {
-	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	m := newRun9OwnedTestMeta(t, t.TempDir())
 	corrupt := m.chunkKey(2, 0)
 	require.NoError(t, m.client.txn(context.Background(), func(tx *kvTxn) error {
 		tx.set(corrupt, []byte("corrupt"))
@@ -244,20 +261,20 @@ func TestRun9OwnedBytesFailedForkRecordLeavesTheOptionalCountUnavailable(t *test
 	// A recount cannot bring the count back before remount.
 	require.NoError(t, m.Run9RecountOwnedBytes(context.Background()))
 	require.False(t, m.run9Owned.sampleCurrent())
-	require.Nil(t, m.Run9SettleOwnedBytes())
+	require.Nil(t, m.Run9SettleOwnedBytes(context.Background()))
 }
 
 func TestRun9OwnedBytesStoppingCancelsAForkRecord(t *testing.T) {
-	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	m := newRun9OwnedTestMeta(t, t.TempDir())
 	record := pinRun9TestFork(t, m)
 	m.run9Owned.cancelRecords()
 	record()
 	require.Zero(t, m.run9Owned.epoch.Load())
-	require.Nil(t, m.Run9SettleOwnedBytes())
+	require.Nil(t, m.Run9SettleOwnedBytes(context.Background()))
 }
 
 func TestRun9OwnedBytesCancelledScanKeepsItsDirtyRanges(t *testing.T) {
-	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	m := newRun9OwnedTestMeta(t, t.TempDir())
 	var attr Attr
 	var inode Ino
 	require.Zero(t, m.Create(Background(), RootInode, "file", 0644, 0, 0, &inode, &attr))
@@ -295,7 +312,7 @@ func TestRun9OwnedBytesCancelledScanKeepsItsDirtyRanges(t *testing.T) {
 
 func TestRun9OwnedBytesCountClonedSlicesOnceUntilTheirLastReferenceIsRemoved(t *testing.T) {
 	ctx := Background()
-	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	m := newRun9OwnedTestMeta(t, t.TempDir())
 	var attr Attr
 	var source, clone Ino
 	require.Zero(t, m.Create(ctx, RootInode, "source", 0644, 0, 0, &source, &attr))
@@ -309,7 +326,7 @@ func TestRun9OwnedBytesCountClonedSlicesOnceUntilTheirLastReferenceIsRemoved(t *
 	require.Zero(t, m.CopyFileRange(ctx, source, 0, source, ChunkSize, 100, 0, nil, nil))
 	require.Zero(t, m.CopyFileRange(ctx, source, 0, clone, 0, 100, 0, nil, nil))
 	require.EqualValues(t, 100, run9OwnedVisible(t, m))
-	m.run9Owned.markAll()
+	markAllRun9Owned(&m.run9Owned)
 	require.EqualValues(t, 100, run9OwnedVisible(t, m))
 	require.Zero(t, m.Close(ctx, source))
 	require.Zero(t, m.Unlink(ctx, RootInode, "source"))
@@ -320,7 +337,7 @@ func TestRun9OwnedBytesCountClonedSlicesOnceUntilTheirLastReferenceIsRemoved(t *
 
 func TestRun9OwnedBytesRemountKeepsSignedBaselineWhenProtectionChanges(t *testing.T) {
 	directory := t.TempDir()
-	m := newRun9OwnedTestMeta(t, directory, 0)
+	m := newRun9OwnedTestMeta(t, directory)
 	var inode Ino
 	var attr Attr
 	require.Zero(t, m.Create(Background(), RootInode, "file", 0644, 0, 0, &inode, &attr))
@@ -337,8 +354,7 @@ func TestRun9OwnedBytesRemountKeepsSignedBaselineWhenProtectionChanges(t *testin
 	m = client.(*kvMeta)
 	_, err = m.Load(true)
 	require.NoError(t, err)
-	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, ProtectedIDs: []uint64{id}, LastClosedRaw: &last}))
-	m.run9Owned.stopWorker()
+	startRun9OwnedTest(t, m, Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, LastClosedRaw: &last, Protection: run9TestProtection(Run9ForkProtection{IDs: []uint64{id}})})
 	require.Zero(t, m.run9Owned.visible.Load())
 	require.EqualValues(t, 20, m.run9Owned.offset.Load())
 	require.NoError(t, m.Shutdown())
@@ -349,12 +365,122 @@ func TestRun9OwnedBytesRemountKeepsSignedBaselineWhenProtectionChanges(t *testin
 	t.Cleanup(func() { _ = m.Shutdown() })
 	_, err = m.Load(true)
 	require.NoError(t, err)
-	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, LastClosedRaw: &last}))
-	m.run9Owned.stopWorker()
+	startRun9OwnedTest(t, m, Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, LastClosedRaw: &last})
 	require.EqualValues(t, 100, m.run9Owned.visible.Load())
 	require.EqualValues(t, -80, m.run9Owned.offset.Load())
 	require.Zero(t, m.Truncate(Background(), inode, 0, 0, &attr, false))
-	require.Equal(t, Run9OwnedBytes{KeptForForksBytes: -80}, *m.Run9SettleOwnedBytes())
+	require.Equal(t, Run9OwnedBytes{KeptForForksBytes: -80}, *m.Run9SettleOwnedBytes(context.Background()))
+}
+
+// Writers are admitted before initialization is applied. Its baseline is the
+// stopped metadata, so writes made while run9rt still reads the lineage count
+// exactly as if they followed a synchronous initialization.
+func TestRun9OwnedBytesInitializationCountsWritesMadeBeforeItIsApplied(t *testing.T) {
+	directory := t.TempDir()
+	m := newRun9OwnedTestMeta(t, directory)
+	var kept, dropped Ino
+	var attr Attr
+	require.Zero(t, m.Create(Background(), RootInode, "kept", 0644, 0, 0, &kept, &attr))
+	require.Zero(t, m.Create(Background(), RootInode, "dropped", 0644, 0, 0, &dropped, &attr))
+	var forked, own uint64
+	require.Zero(t, m.NewSlice(Background(), &forked))
+	require.Zero(t, m.NewSlice(Background(), &own))
+	require.Zero(t, m.Write(Background(), kept, 0, 0, Slice{Id: forked, Size: 50, Len: 50}, time.Now()))
+	require.Zero(t, m.Write(Background(), dropped, 0, 0, Slice{Id: own, Size: 100, Len: 100}, time.Now()))
+	start := m.Run9SliceAllocationEnd(0)
+	require.NoError(t, m.Shutdown())
+
+	client, err := newKVMeta("badger", directory, testConfig())
+	require.NoError(t, err)
+	m = client.(*kvMeta)
+	t.Cleanup(func() { _ = m.Shutdown() })
+	_, err = m.Load(true)
+	require.NoError(t, err)
+	last := int64(1000)
+	release := make(chan struct{})
+	require.NoError(t, m.Run9TrackOwnedBytes(Run9OwnedBytesConfig{
+		Epoch: run9OwnedTestEpoch, AllocationStart: start, LastClosedRaw: &last,
+		Protection: func(ctx context.Context) (Run9ForkProtection, error) {
+			select {
+			case <-release:
+				return Run9ForkProtection{IDs: []uint64{forked}}, nil
+			case <-ctx.Done():
+				return Run9ForkProtection{}, ctx.Err()
+			}
+		},
+	}))
+	require.Zero(t, m.Truncate(Background(), dropped, 0, 0, &attr, false))
+	var added uint64
+	require.Zero(t, m.NewSlice(Background(), &added))
+	require.Zero(t, m.Write(Background(), kept, 0, 50, Slice{Id: added, Size: 30, Len: 30}, time.Now()))
+	require.False(t, m.run9Owned.sampleCurrent())
+	// A capture waits until the baseline exists.
+	waitCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, m.Run9WaitForkRecord(waitCtx), context.DeadlineExceeded)
+
+	close(release)
+	m.run9Owned.stopWorker()
+	require.True(t, m.run9Owned.sampleCurrent())
+	// V0 is the 100 dropped bytes; the Fork keeps the other 50. The raw count
+	// continues from 1000: 1000 - 100 + 30.
+	require.Equal(t, Run9OwnedBytes{VisibleBytes: 30, KeptForForksBytes: 900}, *m.Run9SettleOwnedBytes(context.Background()))
+}
+
+// newRun9StoppedTestMeta returns untracked metadata whose file reads one own
+// 100-byte slice, and the allocation start a remount would see.
+func newRun9StoppedTestMeta(t *testing.T) (*kvMeta, uint64) {
+	client, err := newKVMeta("badger", t.TempDir(), testConfig())
+	require.NoError(t, err)
+	m := client.(*kvMeta)
+	t.Cleanup(func() { _ = m.Shutdown() })
+	require.NoError(t, m.Init(testFormat(), false))
+	start := uint64(run9OwnedTestEpoch)<<32 + 100
+	var inode Ino
+	var attr Attr
+	require.Zero(t, m.Create(Background(), RootInode, "file", 0644, 0, 0, &inode, &attr))
+	require.Zero(t, m.Write(Background(), inode, 0, 0, Slice{Id: start - 1, Size: 100, Len: 100}, time.Now()))
+	return m, start
+}
+
+// blockedRun9Protection waits for release, or for initialization to end.
+func blockedRun9Protection(release <-chan struct{}) func(context.Context) (Run9ForkProtection, error) {
+	return func(ctx context.Context) (Run9ForkProtection, error) {
+		select {
+		case <-release:
+			return Run9ForkProtection{}, nil
+		case <-ctx.Done():
+			return Run9ForkProtection{}, ctx.Err()
+		}
+	}
+}
+
+// A short mount's close keeps its count: finalize waits for initialization.
+func TestRun9OwnedBytesFinalizeWaitsForAnUnfinishedInitialization(t *testing.T) {
+	m, start := newRun9StoppedTestMeta(t)
+	release := make(chan struct{})
+	require.NoError(t, m.Run9TrackOwnedBytes(Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, Protection: blockedRun9Protection(release)}))
+	settled := make(chan *Run9OwnedBytes, 1)
+	go func() { settled <- m.Run9SettleOwnedBytes(context.Background()) }()
+	select {
+	case <-settled:
+		t.Fatal("finalize did not wait for initialization")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	require.Equal(t, &Run9OwnedBytes{VisibleBytes: 100}, <-settled)
+}
+
+// At the finalize deadline, initialization over a pinned snapshot is
+// cancelled: the count is omitted and the database can still close.
+func TestRun9OwnedBytesFinalizeDeadlineCancelsInitialization(t *testing.T) {
+	m, start := newRun9StoppedTestMeta(t)
+	require.NoError(t, m.Run9TrackOwnedBytes(Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, Protection: blockedRun9Protection(nil)}))
+	deadline, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	require.Nil(t, m.Run9SettleOwnedBytes(deadline))
+	require.Zero(t, m.run9Owned.epoch.Load())
+	require.NoError(t, m.Shutdown())
 }
 
 func TestRun9OwnedBytesLegacyFloorDoesNotHideFutureWrites(t *testing.T) {
@@ -369,8 +495,7 @@ func TestRun9OwnedBytesLegacyFloorDoesNotHideFutureWrites(t *testing.T) {
 		tx.set(m.counterKey("nextChunk"), packCounter(int64(start)))
 		return nil
 	}, 0))
-	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, ForkFloor: math.MaxUint64}))
-	m.run9Owned.stopWorker()
+	startRun9OwnedTest(t, m, Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, Protection: run9TestProtection(Run9ForkProtection{Floor: math.MaxUint64})})
 	var inode Ino
 	var attr Attr
 	require.Zero(t, m.Create(Background(), RootInode, "file", 0644, 0, 0, &inode, &attr))
@@ -397,11 +522,10 @@ func TestRun9OwnedBytesIncludesHistoricalOwnershipWithoutCountingInheritedData(t
 	require.Zero(t, m.Create(Background(), RootInode, "file", 0644, 0, 0, &inode, &attr))
 	require.Zero(t, m.Write(Background(), inode, 0, 0, Slice{Id: 2<<32 + 1, Size: 100, Len: 100}, time.Now()))
 	require.Zero(t, m.Write(Background(), inode, 0, 100, Slice{Id: 3<<32 + 1, Size: 200, Len: 200}, time.Now()))
-	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{
+	startRun9OwnedTest(t, m, Run9OwnedBytesConfig{
 		Epoch: run9OwnedTestEpoch, AllocationStart: start,
 		OwnershipRanges: []Run9OwnedEpochRange{{StartEpoch: 2, EndEpoch: 2}, {StartEpoch: run9OwnedTestEpoch, EndEpoch: run9OwnedTestEpoch}},
-	}))
-	m.run9Owned.stopWorker()
+	})
 	// Initialization must scan historical data even before this writable epoch
 	// allocates anything. The intervening inherited epoch is never attributed.
 	require.EqualValues(t, 100, m.run9Owned.visible.Load())
@@ -418,10 +542,10 @@ func TestRun9OwnedBytesExhaustedBasisDisablesTheOptionalCount(t *testing.T) {
 	require.NoError(t, err)
 	m := client.(*kvMeta)
 	defer m.Shutdown()
-	require.NoError(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, Basis: ^uint64(0)}))
+	require.NoError(t, m.Run9TrackOwnedBytes(Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, Basis: ^uint64(0)}))
 	require.Equal(t, ^uint64(0), m.run9Owned.basis.Load())
 	require.False(t, m.run9Owned.current.Load())
-	require.Nil(t, m.Run9SettleOwnedBytes())
+	require.Nil(t, m.Run9SettleOwnedBytes(context.Background()))
 	// No Fork snapshot slot: a capture never pins a record for this mount.
 	require.Nil(t, m.run9Owned.forkSnapshot)
 }
@@ -437,19 +561,19 @@ func TestRun9OwnedBytesStartupScanFailureLeavesTheOptionalCountUnavailable(t *te
 		return nil
 	}, 0))
 	start := uint64(run9OwnedTestEpoch)<<32 + 1
-	require.ErrorContains(t, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, Basis: 7}), "malformed chunk")
+	startRun9OwnedTest(t, m, Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, Basis: 7})
 	require.EqualValues(t, 7, m.run9Owned.basis.Load())
 	require.False(t, m.run9Owned.current.Load())
-	require.Nil(t, m.Run9SettleOwnedBytes())
-	// No Fork snapshot slot: a later source Fork records nothing.
-	require.Nil(t, m.run9Owned.forkSnapshot)
+	// A later source Fork records nothing.
+	require.Zero(t, m.run9Owned.epoch.Load())
+	require.Nil(t, m.Run9SettleOwnedBytes(context.Background()))
 }
 
 // What a changed file costs: one recount of its key range.
 func BenchmarkRun9OwnedBytesRecountOneRange(b *testing.B) {
 	for _, files := range []int{200_000, 1_000_000} {
 		b.Run(strconv.Itoa(files), func(b *testing.B) {
-			m := newRun9OwnedTestMeta(b, b.TempDir(), 0)
+			m := newRun9OwnedTestMeta(b, b.TempDir())
 			const batch = 2000
 			for base := 0; base < files; base += batch {
 				require.NoError(b, m.client.txn(Background(), func(tx *kvTxn) error {
@@ -492,7 +616,7 @@ func BenchmarkRun9OwnedBytesWrite(b *testing.B) {
 				return nil
 			}, 0))
 			if tracked {
-				require.NoError(b, m.Run9TrackOwnedBytes(context.Background(), Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start}))
+				require.NoError(b, m.Run9TrackOwnedBytes(Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start}))
 			}
 			ctx := Background()
 			var attr Attr

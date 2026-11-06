@@ -29,7 +29,7 @@ func (c *finalizeOwnedBytesCounter) CloseSession() error {
 	return c.closeErr
 }
 
-func (c *finalizeOwnedBytesCounter) Run9SettleOwnedBytes() *meta.Run9OwnedBytes {
+func (c *finalizeOwnedBytesCounter) Run9SettleOwnedBytes(context.Context) *meta.Run9OwnedBytes {
 	if c.wait != nil {
 		<-c.wait
 	}

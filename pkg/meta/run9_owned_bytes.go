@@ -3,12 +3,15 @@ package meta
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math/bits"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 )
 
 // A mounted Run9 writable epoch keeps current how many bytes of its own
@@ -36,15 +39,28 @@ type Run9OwnedEpochRange struct {
 	EndEpoch   uint64 `json:"end_epoch"`
 }
 
-// Run9OwnedBytesConfig describes the source's ownership and existing Fork proofs.
+// Run9OwnedInitBudget bounds the background initialization: waiting for Fork
+// protection, reading it, and counting the stopped metadata.
+var Run9OwnedInitBudget = 5 * time.Second
+
+// Run9OwnedBytesConfig describes the source's ownership and the previous close.
 type Run9OwnedBytesConfig struct {
 	Epoch           uint64
 	AllocationStart uint64
-	ProtectedIDs    []uint64
-	ForkFloor       uint64
 	LastClosedRaw   *int64
 	Basis           uint64
 	OwnershipRanges []Run9OwnedEpochRange
+	// Protection supplies what existing Forks retain. Initialization calls it
+	// in the background, after writers are admitted; nil protects nothing.
+	Protection func(context.Context) (Run9ForkProtection, error)
+}
+
+// Run9ForkProtection is checkpoint GC's evidence of what existing Forks
+// retain: the exact slices of their fork checkpoints, and a conservative
+// allocation floor for Forks without a usable one.
+type Run9ForkProtection struct {
+	IDs   []uint64
+	Floor uint64
 }
 
 type run9OwnedSliceReference struct {
@@ -74,20 +90,24 @@ type run9OwnedBytes struct {
 	forkFloor       uint64
 	current         atomic.Bool
 
-	// forkSnapshot is held while a pinned Fork snapshot may read the database:
-	// by a capture until it pins or fails, then by that Fork's record until it
-	// is applied. Closing the database waits for it. forkPending withholds
-	// samples until the record is applied.
+	// forkSnapshot is held while a pinned snapshot may read the database and
+	// until what it records is applied: by initialization, by a capture until
+	// it pins or fails, then by that Fork's record. Closing the database waits
+	// for it. forkPending withholds samples until a Fork record is applied;
+	// before initialization is applied, current is still false.
 	forkSnapshot chan struct{}
 	forkPending  atomic.Bool
 
-	// records is cancelled when the mount stops counting, ending Fork records.
+	// records is cancelled when the mount stops counting, ending
+	// initialization and Fork records.
 	records       context.Context
 	cancelRecords context.CancelFunc
 
-	stop     chan struct{}
-	stopped  chan struct{}
-	stopOnce sync.Once
+	// initialized is closed once initialization has succeeded or failed.
+	initialized chan struct{}
+	stop        chan struct{}
+	stopped     chan struct{}
+	stopOnce    sync.Once
 }
 
 func run9OwnedBucket(key []byte) uint16 {
@@ -98,12 +118,6 @@ func run9OwnedBucket(key []byte) uint16 {
 func (o *run9OwnedBytes) changed(buckets []uint16) {
 	for _, b := range buckets {
 		o.marked[b/64].Or(1 << (b % 64))
-	}
-}
-
-func (o *run9OwnedBytes) markAll() {
-	for i := range o.marked {
-		o.marked[i].Store(^uint64(0))
 	}
 }
 
@@ -151,11 +165,15 @@ func (o *run9OwnedBytes) sampleCurrent() bool {
 	return o.current.Load() && !o.forkPending.Load()
 }
 
-// Run9TrackOwnedBytes initializes the live count before writers are exposed.
-// protected and forkFloor use the same child-checkpoint evidence as GC. The
-// signed baseline preserves the previous close's raw count when that evidence
-// changes; Portal's later physical measurement corrects the absolute baseline.
-func (m *kvMeta) Run9TrackOwnedBytes(ctx context.Context, cfg Run9OwnedBytesConfig) error {
+// Run9TrackOwnedBytes starts the live count before writers are admitted, but
+// does no I/O on the mount's path. It pins the stopped metadata and installs
+// the change marks in the same commit gate, so every later commit marks the
+// ranges it writes. Initialization then runs in the background: it waits for
+// Fork protection, counts the snapshot as the baseline V0 and applies it,
+// after which the next recount adds exactly the changes made since the
+// snapshot. Until then samples are not current. A failed initialization
+// turns this mount's optional count off; it never affects the mount.
+func (m *kvMeta) Run9TrackOwnedBytes(cfg Run9OwnedBytesConfig) error {
 	epoch, allocationStart := cfg.Epoch, cfg.AllocationStart
 	client, ok := m.client.(*badgerClient)
 	if !ok || epoch == 0 {
@@ -167,8 +185,6 @@ func (m *kvMeta) Run9TrackOwnedBytes(ctx context.Context, cfg Run9OwnedBytesConf
 		// Exhausted baseline identities permanently disable the optional count.
 		return nil
 	}
-	o.buckets = make([]map[uint64]uint32, run9OwnedBuckets)
-	o.references = make(map[uint64]run9OwnedSliceReference)
 	o.ownershipRanges = cfg.OwnershipRanges
 	if len(o.ownershipRanges) == 0 {
 		o.ownershipRanges = []Run9OwnedEpochRange{{StartEpoch: epoch, EndEpoch: epoch}}
@@ -183,47 +199,96 @@ func (m *kvMeta) Run9TrackOwnedBytes(ctx context.Context, cfg Run9OwnedBytesConf
 	if !o.owns(epoch << 32) {
 		return fmt.Errorf("writable epoch is outside ownership ranges")
 	}
-	o.protected = make(map[uint64]struct{}, len(cfg.ProtectedIDs))
-	for _, id := range cfg.ProtectedIDs {
+	o.buckets = make([]map[uint64]uint32, run9OwnedBuckets)
+	o.references = make(map[uint64]run9OwnedSliceReference)
+	o.protected = make(map[uint64]struct{})
+	o.epoch.Store(epoch)
+	o.recount = make(chan struct{}, 1)
+	// Initialization holds the slot: a capture can neither close the database
+	// under its snapshot nor record a Fork before the baseline exists.
+	o.forkSnapshot = make(chan struct{}, 1)
+	o.forkSnapshot <- struct{}{}
+	o.initialized, o.stop, o.stopped = make(chan struct{}), make(chan struct{}), make(chan struct{})
+	o.records, o.cancelRecords = context.WithCancel(context.Background())
+	var stopped *badgerSnapshot
+	client.dbMu.Lock()
+	client.run9Owned.Store(o)
+	// Before this epoch allocates, only historical ranges can hold own slices.
+	if historical || allocationStart > epoch<<32 {
+		stopped = client.pinSnapshot()
+	}
+	client.dbMu.Unlock()
+	go m.run9OwnedWorker(cfg, stopped)
+	return nil
+}
+
+func (m *kvMeta) run9OwnedWorker(cfg Run9OwnedBytesConfig, stopped *badgerSnapshot) {
+	o := &m.run9Owned
+	defer close(o.stopped)
+	started := time.Now()
+	err := m.run9InitOwnedBytes(cfg, stopped)
+	close(o.initialized)
+	if err != nil {
+		logger.Warnf("owned bytes initialization unavailable: dur_ms=%d budget_ms=%d error=%s", time.Since(started).Milliseconds(), Run9OwnedInitBudget.Milliseconds(), err)
+		return
+	}
+	logger.Infof("owned bytes initialization finished: dur_ms=%d budget_ms=%d", time.Since(started).Milliseconds(), Run9OwnedInitBudget.Milliseconds())
+	for {
+		_ = m.Run9RecountOwnedBytes(context.Background())
+		select {
+		case <-o.stop:
+			return
+		case <-time.After(Run9OwnedRecountInterval):
+		}
+	}
+}
+
+// run9InitOwnedBytes applies the baseline: the stopped metadata's slice sets,
+// V0 under the Fork protection, and the signed offset that keeps the previous
+// close's raw count. Each range's set is then exact as of the snapshot, and
+// every range changed since is marked, which is what a recount requires. A
+// baseline cannot be reconstructed after writers changed the metadata, so a
+// failure, the budget, or a stop leaves the count off until remount.
+func (m *kvMeta) run9InitOwnedBytes(cfg Run9OwnedBytesConfig, stopped *badgerSnapshot) error {
+	o := &m.run9Owned
+	defer func() { <-o.forkSnapshot }()
+	ctx, cancel := context.WithTimeout(o.records, Run9OwnedInitBudget)
+	defer cancel()
+	// The snapshot count does not depend on the protection; run9rt may still
+	// be reading the lineage while the snapshot is scanned.
+	counted := make(map[uint16]map[uint64]uint32)
+	var protection Run9ForkProtection
+	group, ctx := errgroup.WithContext(ctx)
+	if stopped != nil {
+		group.Go(func() error {
+			defer stopped.release()
+			return m.run9CountOwned(ctx, stopped.scan, []byte{'A'}, counted)
+		})
+	}
+	if cfg.Protection != nil {
+		group.Go(func() (err error) {
+			protection, err = cfg.Protection(ctx)
+			return err
+		})
+	}
+	if err := group.Wait(); err != nil {
+		o.disable()
+		return err
+	}
+	o.recount <- struct{}{}
+	for _, id := range protection.IDs {
 		if o.owns(id) {
 			o.protected[id] = struct{}{}
 		}
 	}
 	// Legacy unknown bounds protect existing allocations, never future writes.
-	o.forkFloor = min(cfg.ForkFloor, allocationStart)
-	o.epoch.Store(epoch)
-	o.recount = make(chan struct{}, 1)
-	if historical || allocationStart > epoch<<32 {
-		o.markAll()
-	}
-	if err := m.Run9RecountOwnedBytes(ctx); err != nil {
-		// A baseline cannot be reconstructed after exposing writers. Omit this
-		// mount's optional count; the next mount can initialize it again.
-		o.disable()
-		return err
-	}
+	o.forkFloor = min(protection.Floor, cfg.AllocationStart)
+	o.replace(slices.Collect(maps.Keys(counted)), counted)
 	if cfg.LastClosedRaw != nil {
 		o.offset.Store(*cfg.LastClosedRaw - int64(o.visible.Load()))
 	}
-	o.stop, o.stopped = make(chan struct{}), make(chan struct{})
-	o.records, o.cancelRecords = context.WithCancel(context.Background())
-	o.forkSnapshot = make(chan struct{}, 1)
-	client.run9Owned.Store(o)
-	go m.run9OwnedWorker()
+	<-o.recount
 	return nil
-}
-
-func (m *kvMeta) run9OwnedWorker() {
-	o := &m.run9Owned
-	defer close(o.stopped)
-	for {
-		select {
-		case <-o.stop:
-			return
-		case <-time.After(Run9OwnedRecountInterval):
-			_ = m.Run9RecountOwnedBytes(context.Background())
-		}
-	}
 }
 
 func (m *kvMeta) run9OwnedCount(ctx context.Context, buckets []uint16) (map[uint16]map[uint64]uint32, error) {
@@ -240,7 +305,7 @@ func (m *kvMeta) run9OwnedCount(ctx context.Context, buckets []uint16) (map[uint
 }
 
 // Run9RecountOwnedBytes refreshes marked ranges. Concurrent writes mark them
-// again; initialization and finalize call it before and after exposed writers.
+// again. The worker calls it after initialization; finalize after writers.
 func (m *kvMeta) Run9RecountOwnedBytes(ctx context.Context) error {
 	o := &m.run9Owned
 	if o.epoch.Load() == 0 {
@@ -265,6 +330,14 @@ func (m *kvMeta) Run9RecountOwnedBytes(ctx context.Context) error {
 		o.current.Store(false)
 		return err
 	}
+	o.replace(buckets, counted)
+	o.current.Store(true)
+	return nil
+}
+
+// replace swaps the slice sets of buckets for their new counts and adjusts the
+// visible bytes. The caller holds recount.
+func (o *run9OwnedBytes) replace(buckets []uint16, counted map[uint16]map[uint64]uint32) {
 	visible := o.visible.Load()
 	for _, b := range buckets {
 		for id := range o.buckets[b] {
@@ -293,8 +366,6 @@ func (m *kvMeta) Run9RecountOwnedBytes(ctx context.Context) error {
 		o.buckets[b] = counted[b]
 	}
 	o.visible.Store(visible)
-	o.current.Store(true)
-	return nil
 }
 
 // run9CountOwned collects unique own slices read by linked regular files.
@@ -396,7 +467,7 @@ func (o *run9OwnedBytes) owns(id uint64) bool {
 	return false
 }
 
-// keptForFork must be called while holding recount or before starting writers.
+// keptForFork must be called while holding recount.
 func (o *run9OwnedBytes) keptForFork(id uint64) bool {
 	_, protected := o.protected[id]
 	return protected || id < o.forkFloor
@@ -501,10 +572,11 @@ func (o *run9OwnedBytes) waitForkRecords(ctx context.Context) error {
 	return err
 }
 
-// Run9WaitForkRecord waits for the previous Fork's record before a capture
-// seals writes. Compaction keeps committing while a capture waits, so waiting
-// after CaptureUploads could capture metadata that references uploads it never
-// waits for. Captures are serialized, so no other record starts meanwhile.
+// Run9WaitForkRecord waits for initialization and the previous Fork's record
+// before a capture seals writes. Compaction keeps committing while a capture
+// waits, so waiting after CaptureUploads could capture metadata that references
+// uploads it never waits for. Captures are serialized, so no other record
+// starts meanwhile.
 func (m *kvMeta) Run9WaitForkRecord(ctx context.Context) error {
 	return m.run9Owned.waitForkRecords(ctx)
 }
@@ -518,14 +590,15 @@ func (o *run9OwnedBytes) stopWorker() {
 	<-o.stopped
 }
 
-// stopCounting stops the worker and cancels running Fork records, which then
-// turn the count off. It returns once no record reads the database.
+// stopCounting cancels an unfinished initialization and running Fork
+// records, which then turn the count off, and stops the worker. It returns
+// once neither reads the database.
 func (o *run9OwnedBytes) stopCounting() {
 	if o.stop == nil {
 		return
 	}
-	o.stopWorker()
 	o.cancelRecords()
+	o.stopWorker()
 	_ = o.waitForkRecords(context.Background())
 }
 
@@ -540,12 +613,19 @@ type Run9OwnedBytes struct {
 
 // Run9SettleOwnedBytes stops the worker and counts what is still marked. The
 // worker keeps that little; right after a change of most files it is one pass
-// over the inode keys. A Fork record still scanning is cancelled rather than
-// extending finalize. It reports nothing when the count fails.
-func (m *kvMeta) Run9SettleOwnedBytes() *Run9OwnedBytes {
+// over the inode keys. A short mount's unfinished initialization is awaited
+// until ctx ends, so its close keeps Portal's correction; its own budget bounds
+// that wait. Then initialization, or a Fork record still scanning, is
+// cancelled rather than extending finalize. It reports nothing when the count
+// fails or was cancelled.
+func (m *kvMeta) Run9SettleOwnedBytes(ctx context.Context) *Run9OwnedBytes {
 	o := &m.run9Owned
 	if o.epoch.Load() == 0 {
 		return nil
+	}
+	select {
+	case <-o.initialized:
+	case <-ctx.Done():
 	}
 	o.stopCounting()
 	if o.epoch.Load() == 0 {

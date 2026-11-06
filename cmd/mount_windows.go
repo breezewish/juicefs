@@ -190,3 +190,8 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 func tryToInstallMountExec() error { return nil }
 
 func updateFstab(c *cli.Context) error { return nil }
+
+// adoptInheritedFile takes over a descriptor inherited from the launcher.
+func adoptInheritedFile(fd int, name string) *os.File {
+	return os.NewFile(uintptr(fd), name)
+}

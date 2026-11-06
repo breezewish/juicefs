@@ -324,14 +324,16 @@ func runForkFinalizeOnMain(metaCli sessionShutdowner, v *vfs.VFS, blob object.Ob
 	}
 
 	// Counted from metadata while it is still open; the close changes none of it.
-	if counter, ok := metaCli.(interface{ Run9SettleOwnedBytes() *meta.Run9OwnedBytes }); ok {
+	if counter, ok := metaCli.(interface {
+		Run9SettleOwnedBytes(context.Context) *meta.Run9OwnedBytes
+	}); ok {
 		writePendingAck("count_owned_bytes")
 		// A timed-out scan may still hold the database. Return its terminal ack
 		// without closing metadata, just as for the other blocking phases. Keep
 		// the result off shared state so a late return cannot race the ack.
 		counted := make(chan *meta.Run9OwnedBytes, 1)
 		err := runForkFinalizeBlockingPhase(finalizeCtx, finalizeTimeout, requestedTimeout, diagnostics, func() error {
-			counted <- counter.Run9SettleOwnedBytes()
+			counted <- counter.Run9SettleOwnedBytes(finalizeCtx)
 			return nil
 		})
 		recordErr("count_owned_bytes", err)

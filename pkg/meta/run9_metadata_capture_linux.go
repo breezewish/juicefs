@@ -45,8 +45,8 @@ func (m *kvMeta) Run9CaptureMetadata(ctx context.Context, directory string) (out
 	if _, err := os.Lstat(directory); !os.IsNotExist(err) {
 		return out, nil, fmt.Errorf("metadata capture destination must not exist: %s (%v)", directory, err)
 	}
-	// The previous Fork's record may still read the database this closes.
-	// Callers already waited for it with Run9WaitForkRecord before sealing.
+	// Initialization or the previous Fork's record may still read the database
+	// this closes. Callers already waited with Run9WaitForkRecord before sealing.
 	o := &m.run9Owned
 	held, waitErr := o.acquireForkSnapshot(ctx)
 	if waitErr != nil {

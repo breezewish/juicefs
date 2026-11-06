@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -140,7 +141,7 @@ func TestMetadataCaptureCopyFailureReopensSource(t *testing.T) {
 
 func TestMetadataCaptureRecordsTheForkInTheBackground(t *testing.T) {
 	ctx := Background()
-	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	m := newRun9OwnedTestMeta(t, t.TempDir())
 	var attr Attr
 	var inode Ino
 	require.Zero(t, m.Create(ctx, RootInode, "file", 0644, 0, 0, &inode, &attr))
@@ -164,7 +165,7 @@ func TestMetadataCaptureRecordsTheForkInTheBackground(t *testing.T) {
 
 func TestMetadataCaptureDiscardedForkProtectsNothing(t *testing.T) {
 	ctx := Background()
-	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	m := newRun9OwnedTestMeta(t, t.TempDir())
 	var attr Attr
 	var inode Ino
 	require.Zero(t, m.Create(ctx, RootInode, "file", 0644, 0, 0, &inode, &attr))
@@ -184,7 +185,7 @@ func TestMetadataCaptureDiscardedForkProtectsNothing(t *testing.T) {
 }
 
 func TestMetadataCaptureWaitsForAnEarlierForkRecordOutsideTheDatabaseLock(t *testing.T) {
-	m := newRun9OwnedTestMeta(t, t.TempDir(), 0)
+	m := newRun9OwnedTestMeta(t, t.TempDir())
 	record := pinRun9TestFork(t, m)
 	deadline, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -210,7 +211,34 @@ func TestMetadataCaptureWaitsForAnEarlierForkRecordOutsideTheDatabaseLock(t *tes
 	record()
 	require.NoError(t, <-captured)
 	require.NoError(t, m.Run9WaitForkRecord(context.Background()))
-	require.NotNil(t, m.Run9SettleOwnedBytes())
+	require.NotNil(t, m.Run9SettleOwnedBytes(context.Background()))
+}
+
+// A capture during initialization waits for the baseline, then proceeds; its
+// record moves bytes out of that baseline instead of being overwritten by it.
+func TestMetadataCaptureWaitsForInitializationAndRecordsAfterTheBaseline(t *testing.T) {
+	m, start := newRun9StoppedTestMeta(t)
+	last := int64(1000)
+	release := make(chan struct{})
+	require.NoError(t, m.Run9TrackOwnedBytes(Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, LastClosedRaw: &last, Protection: blockedRun9Protection(release)}))
+	captured := make(chan *Run9ForkRecord, 1)
+	go func() {
+		_, record, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "copy"))
+		assert.NoError(t, err)
+		captured <- record
+	}()
+	select {
+	case <-captured:
+		t.Fatal("capture proceeded before the baseline existed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	record := <-captured
+	require.NotNil(t, record)
+	record.Start()
+	require.NoError(t, m.Run9WaitForkRecord(context.Background()))
+	// Baseline: V0 = 100, offset = 1000 - 100. The Fork then keeps those 100.
+	require.Equal(t, &Run9OwnedBytes{KeptForForksBytes: 1000}, m.Run9SettleOwnedBytes(context.Background()))
 }
 
 func TestBadgerScanCallbacksReleaseDatabaseBeforeMaintenance(t *testing.T) {
