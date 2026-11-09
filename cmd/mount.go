@@ -591,6 +591,13 @@ func mount(c *cli.Context) error {
 			return nil
 		}
 	}
+	if stage == 3 {
+		// Fork divergence: run9rt starts per-Box mounts directly in stage 3,
+		// bypassing the supervisor whose prepareMountRuntime keeps upstream
+		// mount daemons out of the OOM killer's reach. Every serving process
+		// claims that protection itself, so a Box's storage is never the victim.
+		utils.AdjustOOMKiller(-1000)
+	}
 
 	var err error
 	if stage == 0 || supervisor == "test" {

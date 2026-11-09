@@ -29,7 +29,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -41,7 +40,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -77,67 +75,6 @@ func nextMountpointCheckInterval(interval time.Duration) time.Duration {
 	return interval
 }
 
-func showThreadStack(agentAddr string) {
-	if agentAddr == "" {
-		return
-	}
-	client := http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := client.Get(fmt.Sprintf("http://%s/debug/pprof/goroutine?debug=2", agentAddr))
-	if err != nil {
-		logger.Warnf("list goroutine from %s: %s", agentAddr, err)
-	} else {
-		grs, _ := io.ReadAll(resp.Body)
-		logger.Infof("list goroutines from %s:\n%s", agentAddr, string(grs))
-		_ = resp.Body.Close()
-	}
-}
-
-// devMinor returns the minor component of a Linux device number.
-func devMinor(dev uint64) uint32 {
-	minor := dev & 0xff
-	minor |= (dev >> 12) & 0xffffff00
-	return uint32(minor)
-}
-
-func killMountProcess(pid int, dev uint64, lastActive *int64) {
-	if pid > 0 {
-		logger.Infof("watchdog: kill %d", pid)
-		err := syscall.Kill(pid, syscall.SIGABRT)
-		if err != nil {
-			logger.Warnf("kill %d: %s", pid, err)
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-		}
-		// double check
-		time.Sleep(time.Second * 10)
-		if atomic.LoadInt64(lastActive)+30 > time.Now().Unix() {
-			return
-		}
-	}
-	if runtime.GOOS == "linux" && dev > 0 {
-		tids, _ := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
-		for _, tid := range tids {
-			stack, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/stack", pid, tid))
-			if err == nil && bytes.Contains(stack, []byte("fuse_simple_request")) {
-				logger.Errorf("find deadlock in mount process, abort it: %s", string(stack))
-				if fuseFd > 0 {
-					_ = syscall.Close(fuseFd)
-					fuseFd = 0
-				}
-				f, err := os.OpenFile(fmt.Sprintf("/sys/fs/fuse/connections/%d/abort", devMinor(dev)), os.O_WRONLY, 0777)
-				if err != nil {
-					logger.Warn(err)
-				} else {
-					_, _ = f.WriteString("1")
-					_ = f.Close()
-				}
-				break
-			}
-		}
-	}
-}
-
 func loadConfig(path string) (string, *vfs.Config, error) {
 	for d := path; d != "/"; d = filepath.Dir(d) {
 		data, err := readConfig(d)
@@ -151,64 +88,6 @@ func loadConfig(path string) (string, *vfs.Config, error) {
 		}
 	}
 	return "", nil, fmt.Errorf("%s is not inside JuiceFS", path)
-}
-
-func watchdog(ctx context.Context, mp string) {
-	var lastActive int64
-	var pid int
-	var agentAddr string
-	var dev uint64
-	go func() {
-		time.Sleep(time.Millisecond * 100) // wait for child process
-		atomic.StoreInt64(&lastActive, time.Now().Unix())
-		for ctx.Err() == nil {
-			var confName = ".config"
-			if !vfs.IsSpecialName(confName) {
-				confName = ".jfs" + confName
-			}
-			var confStat syscall.Stat_t
-			err := syscall.Stat(filepath.Join(mp, confName), &confStat)
-			ino, _ := vfs.GetInternalNodeByName(confName)
-			if err == nil && confStat.Ino == uint64(ino) {
-				if dev == 0 && runtime.GOOS == "linux" {
-					var st syscall.Stat_t
-					if err := syscall.Stat(mp, &st); err == nil && st.Ino == 1 {
-						dev = uint64(st.Dev)
-					}
-				}
-				if pid == 0 {
-					_, conf, err := loadConfig(mp)
-					if err == nil {
-						logger.Infof("watching %s, pid %d", mp, conf.Pid)
-						pid = conf.Pid
-						agentAddr = conf.Port.DebugAgent
-					} else {
-						logger.Warnf("load config: %s", err)
-						continue
-					}
-				}
-			}
-			atomic.StoreInt64(&lastActive, time.Now().Unix())
-			time.Sleep(time.Second * 5)
-		}
-	}()
-	for ctx.Err() == nil {
-		now := time.Now().Unix()
-		if atomic.LoadInt64(&lastActive)+30 < now {
-			showThreadStack(agentAddr)
-			time.Sleep(time.Second * 30)
-			// double check
-			if atomic.LoadInt64(&lastActive)+60 < time.Now().Unix() && ctx.Err() == nil {
-				logger.Infof("mount point %s is not active for %s", mp, time.Since(time.Unix(atomic.LoadInt64(&lastActive), 0)))
-				showThreadStack(agentAddr)
-				killMountProcess(pid, dev, &lastActive)
-				atomic.StoreInt64(&lastActive, time.Now().Unix())
-				pid = 0
-				dev = 0
-			}
-		}
-		time.Sleep(time.Second * 10)
-	}
 }
 
 // parseFuseFd checks if `mountPoint` is the special form /dev/fd/N (with N >= 0),
@@ -1027,10 +906,15 @@ func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 			}()
 		}
 
-		ctx, cancel := context.WithCancel(context.TODO())
-		go watchdog(ctx, mp)
+		// Fork divergence: upstream also starts a watchdog here that kills the
+		// child when stat on the mount point has not completed for about 60s.
+		// Every run9 mount that reaches this supervisor is a shared metadata
+		// mount whose consumers keep files open. A killed child leaves no handle
+		// state, so the restarted child answers those open files with EBADF, and
+		// the deadlock branch aborts the FUSE connection outright. Under memory
+		// pressure a slow but healthy mount was killed this way, breaking every
+		// Box on the host. Waiting is never worse, so run9 has no watchdog.
 		err = cmd.Wait()
-		cancel()
 		if notInCSI {
 			signal.Stop(signalChan)
 		}

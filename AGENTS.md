@@ -228,6 +228,32 @@ Related files:
 - `cmd/mount_run9_mount_record_fork.go`
 - `cmd/mount_run9_mount_record_fork_test.go`
 
+### Mount Daemons Survive Memory Pressure
+
+- The mount supervisor never kills its child for inactivity. Upstream kills it
+  after about 60s without a completed stat of the mount point. In run9 only the
+  shared metadata mounts use the supervisor, and their consumers keep Badger
+  files open. A killed child dumps no handle state, so the restarted child
+  answers every open file with EBADF; the deadlock branch aborts the FUSE
+  connection. Production memory pressure (2026-11-09) made a healthy mount slow,
+  the watchdog killed it and every Box on the host lost its metadata files.
+- Verified on a real host by stalling the child longer than the old timeout;
+  there is no unit test because the divergence removes code.
+- Every stage-3 mount process sets its own `oom_score_adj` to -1000. Upstream
+  sets it only in the supervisor and lets the child inherit it; run9rt starts
+  per-Box mounts directly in stage 3, which left them as ordinary OOM victims
+  next to the Box VMs that overcommit host memory. Trade-off: a mount that leaks
+  memory is never OOM-killed either (`GOMEMLIMIT` is soft); killing it would
+  break its Box just the same, so the host is replaced instead. The data-plane
+  shared metadata mount also runs in stage 3 (`JFS_SUPERVISOR=systemd`).
+- `PR_SET_IO_FLUSHER` is not set in stage 3: the prctl marks only the calling
+  OS thread, so it would not cover the threads a Go process serves FUSE from.
+
+Related files:
+
+- `cmd/mount.go`
+- `cmd/mount_unix.go`
+
 ### Umount with Finalize Semantics
 
 - Mount config discovery and finalization share the requested finalize deadline.
