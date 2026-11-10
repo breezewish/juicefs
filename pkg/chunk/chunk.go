@@ -40,7 +40,8 @@ type ChunkStore interface {
 	NewWriter(id uint64) Writer
 	Remove(id uint64, length int) error
 	FillCache(id uint64, length uint32) error
-	PrefetchBlock(ctx context.Context, id uint64, length uint32, indx int) (fetched bool, err error)
+	PrefetchBlock(ctx context.Context, id uint64, length uint32, indx int, admit PrefetchAdmit) (fetched int, err error)
+	SettlePrefetch() (unreadBlocks int, unreadBytes int64)
 	EvictCache(id uint64, length uint32) error
 	CheckCache(id uint64, length uint32, handler func(exists bool, loc string, size int)) error
 	UsedMemory() int64

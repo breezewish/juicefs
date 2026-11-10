@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"syscall"
 	"testing"
@@ -53,7 +54,7 @@ func TestStartReadsListsFilesReadDuringTheWindow(t *testing.T) {
 	v.readTrace.until = time.Now() // the start window ends
 	readStartReadsTestFile(t, v, ctx, late, 0, 4096)
 
-	files, err := v.StartReads(ctx, StartReadLimits{MaxFiles: 100, MaxBytes: 1 << 30, MaxListBytes: 1 << 20})
+	files, err := v.StartReads(ctx, StartReadLimits{MaxFiles: 100, MaxRangeBytes: 1 << 30, MaxListBytes: 1 << 20})
 	require.NoError(t, err)
 	require.Equal(t, []StartRead{
 		{Inode: second, Ranges: [][2]uint64{{0, 4096}}},
@@ -61,7 +62,7 @@ func TestStartReadsListsFilesReadDuringTheWindow(t *testing.T) {
 		{Inode: created, Ranges: [][2]uint64{{0, 4096}}},
 	}, files)
 
-	files, err = v.StartReads(ctx, StartReadLimits{MaxFiles: 100, MaxBytes: 8192, MaxListBytes: 1 << 20})
+	files, err = v.StartReads(ctx, StartReadLimits{MaxFiles: 100, MaxRangeBytes: 8192, MaxListBytes: 1 << 20})
 	require.NoError(t, err)
 	require.Equal(t, []StartRead{
 		{Inode: second, Ranges: [][2]uint64{{0, 4096}}},
@@ -71,7 +72,7 @@ func TestStartReadsListsFilesReadDuringTheWindow(t *testing.T) {
 	// The list ends before the entry that would make its encoding too large.
 	firstEntry, err := json.Marshal(StartRead{Inode: second, Ranges: [][2]uint64{{0, 4096}}})
 	require.NoError(t, err)
-	files, err = v.StartReads(ctx, StartReadLimits{MaxFiles: 100, MaxBytes: 1 << 30, MaxListBytes: len("[") + len(firstEntry) + len("]")})
+	files, err = v.StartReads(ctx, StartReadLimits{MaxFiles: 100, MaxRangeBytes: 1 << 30, MaxListBytes: len("[") + len(firstEntry) + len("]")})
 	require.NoError(t, err)
 	require.Equal(t, []StartRead{{Inode: second, Ranges: [][2]uint64{{0, 4096}}}}, files)
 
@@ -80,19 +81,28 @@ func TestStartReadsListsFilesReadDuringTheWindow(t *testing.T) {
 	require.Error(t, err)
 }
 
-// prefetchRecorder records PrefetchStartReads' block requests in order.
+// prefetchRecorder records PrefetchStartReads' block requests in order and
+// fetches each one admitted, as if no local cache held it.
 type prefetchRecorder struct {
 	chunk.ChunkStore
 	sync.Mutex
 	blocks []prefetchBlock
 }
 
-func (r *prefetchRecorder) PrefetchBlock(_ context.Context, id uint64, length uint32, indx int) (bool, error) {
+func (r *prefetchRecorder) PrefetchBlock(ctx context.Context, id uint64, length uint32, indx int, admit chunk.PrefetchAdmit) (int, error) {
+	size := min(4<<20, int(length)-indx*(4<<20))
+	done, err := admit(ctx, size)
+	if err != nil {
+		return 0, err
+	}
+	defer done(true)
 	r.Lock()
 	defer r.Unlock()
 	r.blocks = append(r.blocks, prefetchBlock{slice: id, sliceSize: length, indx: indx})
-	return true, nil
+	return size, nil
 }
+
+func admitAll(context.Context, int) (func(bool), error) { return func(bool) {}, nil }
 
 func TestPrefetchStartReadsRequestsTheBlocksBehindListedRanges(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
@@ -142,9 +152,9 @@ func TestPrefetchStartReadsRequestsTheBlocksBehindListedRanges(t *testing.T) {
 		// Nothing for the hole; one block on each side of the chunk boundary.
 		{Inode: sparse, Ranges: [][2]uint64{{0, 4096}, {meta.ChunkSize - 4096, 8192}}},
 		{Inode: 999999, Ranges: [][2]uint64{{0, 4096}}},
-	}, 1)
+	}, StartReadsPrefetchLimits{Concurrency: 1, MaxBytes: 1 << 30, Admit: admitAll})
 
-	require.Equal(t, StartReadsPrefetchResult{Files: 4, Skipped: 1, Blocks: 7}, result)
+	require.Equal(t, StartReadsPrefetchResult{Files: 4, Skipped: 1, Blocks: 7, Bytes: 4096 + 4<<20 + 4<<20 + 4096 + 4<<20 + 4096 + 4096}, result)
 	require.Equal(t, []prefetchBlock{
 		{slice: smallSlices[0].Id, sliceSize: 4096, indx: 0},
 		{slice: bigSlices[0].Id, sliceSize: 10 << 20, indx: 0},
@@ -154,4 +164,129 @@ func TestPrefetchStartReadsRequestsTheBlocksBehindListedRanges(t *testing.T) {
 		{slice: sparseFirst[1].Id, sliceSize: 4096, indx: 0},
 		{slice: sparseSecond[0].Id, sliceSize: 4096, indx: 0},
 	}, recorder.blocks)
+}
+
+func TestPrefetchStartReadsBudgetsTheBytesItFetches(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.NewContext(10, 0, []uint32{0}))
+	big := writeStartReadsTestFile(t, v, ctx, "big", 12<<20)
+	var slices []meta.Slice
+	require.Zero(t, v.Meta.Read(ctx, big, 0, &slices))
+	require.Len(t, slices, 1)
+	recorder := &prefetchRecorder{ChunkStore: v.Store}
+	v.Store = recorder
+
+	// One page in each of three 4 MiB blocks lists 12 KiB but costs 12 MiB.
+	// A budget of 9 MiB fetches the first two blocks and stops at the third.
+	result := v.PrefetchStartReads(context.Background(), []StartRead{
+		{Inode: big, Ranges: [][2]uint64{{0, 4096}, {4 << 20, 4096}, {8 << 20, 4096}}},
+	}, StartReadsPrefetchLimits{Concurrency: 1, MaxBytes: 9 << 20, Admit: admitAll})
+
+	require.Equal(t, StartReadsPrefetchResult{Files: 1, Blocks: 2, Bytes: 8 << 20, Stopped: ErrStartReadsBudgetSpent.Error()}, result)
+	require.Equal(t, []prefetchBlock{
+		{slice: slices[0].Id, sliceSize: 12 << 20, indx: 0},
+		{slice: slices[0].Id, sliceSize: 12 << 20, indx: 1},
+	}, recorder.blocks)
+}
+
+func TestPrefetchStartReadsDoesNotSpendBudgetOnRefusedAdmission(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.NewContext(10, 0, []uint32{0}))
+	big := writeStartReadsTestFile(t, v, ctx, "big", 8<<20)
+	recorder := &prefetchRecorder{ChunkStore: v.Store}
+	v.Store = recorder
+	refused := errors.New("no host slot")
+	calls := 0
+	admitSecond := func(context.Context, int) (func(bool), error) {
+		calls++
+		if calls == 1 {
+			return nil, refused
+		}
+		return func(bool) {}, nil
+	}
+
+	// The first block is refused and not fetched; the budget of one block
+	// still admits the second.
+	result := v.PrefetchStartReads(context.Background(), []StartRead{
+		{Inode: big, Ranges: [][2]uint64{{0, 4096}, {4 << 20, 4096}}},
+	}, StartReadsPrefetchLimits{Concurrency: 1, MaxBytes: 4 << 20, Admit: admitSecond})
+
+	require.Equal(t, StartReadsPrefetchResult{Files: 1, Blocks: 1, Bytes: 4 << 20, Failed: 1}, result)
+	require.Len(t, recorder.blocks, 1)
+}
+
+// downloadRecorder reports each admitted block as downloaded unless a
+// workload read served it, as PrefetchBlock does.
+type downloadRecorder struct {
+	chunk.ChunkStore
+	servedByWorkload map[int]bool
+}
+
+func (r *downloadRecorder) PrefetchBlock(ctx context.Context, _ uint64, length uint32, indx int, admit chunk.PrefetchAdmit) (int, error) {
+	size := min(4<<20, int(length)-indx*(4<<20))
+	done, err := admit(ctx, size)
+	if err != nil {
+		return 0, err
+	}
+	downloaded := !r.servedByWorkload[indx]
+	done(downloaded)
+	if !downloaded {
+		return 0, nil
+	}
+	return size, nil
+}
+
+func TestPrefetchStartReadsRefundsBlocksAWorkloadReadServed(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.NewContext(10, 0, []uint32{0}))
+	big := writeStartReadsTestFile(t, v, ctx, "big", 12<<20)
+	v.Store = &downloadRecorder{ChunkStore: v.Store, servedByWorkload: map[int]bool{0: true}}
+
+	// The workload's own read downloaded the first block, so the budget of two
+	// blocks still covers the second and the third.
+	result := v.PrefetchStartReads(context.Background(), []StartRead{
+		{Inode: big, Ranges: [][2]uint64{{0, 4096}, {4 << 20, 4096}, {8 << 20, 4096}}},
+	}, StartReadsPrefetchLimits{Concurrency: 1, MaxBytes: 8 << 20, Admit: admitAll})
+
+	require.Equal(t, StartReadsPrefetchResult{Files: 1, Blocks: 2, Bytes: 8 << 20}, result)
+}
+
+// inFlightRecorder holds block 0's fetch open until another fetch is refused
+// for budget, and records whether block 0's context was still live then.
+type inFlightRecorder struct {
+	chunk.ChunkStore
+	refused    chan struct{}
+	refuseOnce sync.Once
+	stillLive  bool
+}
+
+func (r *inFlightRecorder) PrefetchBlock(ctx context.Context, _ uint64, length uint32, indx int, admit chunk.PrefetchAdmit) (int, error) {
+	size := min(4<<20, int(length)-indx*(4<<20))
+	done, err := admit(ctx, size)
+	if err != nil {
+		r.refuseOnce.Do(func() { close(r.refused) })
+		return 0, err
+	}
+	defer done(true)
+	if indx == 0 {
+		<-r.refused
+		r.stillLive = ctx.Err() == nil
+	}
+	return size, nil
+}
+
+func TestPrefetchStartReadsSpentBudgetLetsAdmittedFetchesFinish(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.NewContext(10, 0, []uint32{0}))
+	big := writeStartReadsTestFile(t, v, ctx, "big", 12<<20)
+	recorder := &inFlightRecorder{ChunkStore: v.Store, refused: make(chan struct{})}
+	v.Store = recorder
+
+	// Block 0 is in flight when block 2 exceeds the two-block budget.
+	result := v.PrefetchStartReads(context.Background(), []StartRead{
+		{Inode: big, Ranges: [][2]uint64{{0, 4096}, {4 << 20, 4096}, {8 << 20, 4096}}},
+	}, StartReadsPrefetchLimits{Concurrency: 2, MaxBytes: 8 << 20, Admit: admitAll})
+
+	require.True(t, recorder.stillLive, "a spent budget must not cancel a fetch it admitted")
+	require.Equal(t, StartReadsPrefetchResult{Files: 1, Blocks: 2, Bytes: 8 << 20, Stopped: ErrStartReadsBudgetSpent.Error()}, result)
 }
