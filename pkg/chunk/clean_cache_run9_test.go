@@ -301,6 +301,37 @@ func TestCleanCachePruneEvictsColdBlocksAcrossVolumes(t *testing.T) {
 	require.Equal(t, "cold", string(data))
 }
 
+func TestCleanCachePruneKeepsRecentlyHitBlocks(t *testing.T) {
+	root := t.TempDir()
+	cache := &cleanDiskCache{dir: filepath.Join(root, "volume"), mode: 0600, metrics: newCacheManagerMetrics(nil)}
+	hitKey := FormatObjectBlockKey(701, 0, 3, false)
+	olderKey := FormatObjectBlockKey(702, 0, 5, false)
+	newerKey := FormatObjectBlockKey(703, 0, 5, false)
+	require.NoError(t, cache.publish(hitKey, []byte("hit"), false))
+	require.NoError(t, cache.publish(olderKey, []byte("older"), false))
+	require.NoError(t, cache.publish(newerKey, []byte("newer"), false))
+	hitPath := filepath.Join(cache.dir, cacheDir, hitKey)
+	olderPath := filepath.Join(cache.dir, cacheDir, olderKey)
+	newerPath := filepath.Join(cache.dir, cacheDir, newerKey)
+	// A busy host turns its cache over within minutes: the hit block was
+	// fetched first, 30 minutes ago, and is read again now.
+	now := time.Now()
+	require.NoError(t, os.Chtimes(hitPath, now.Add(-30*time.Minute), now.Add(-30*time.Minute)))
+	require.NoError(t, os.Chtimes(olderPath, now.Add(-20*time.Minute), now.Add(-20*time.Minute)))
+	require.NoError(t, os.Chtimes(newerPath, now.Add(-10*time.Minute), now.Add(-10*time.Minute)))
+	r, err := cache.load(hitKey)
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+
+	// Two items allowed: pruning keeps 90%, one block.
+	usage, err := PruneCleanCache(context.Background(), root, 1<<30, 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), usage.RemovedBlocks)
+	require.FileExists(t, hitPath)
+	require.NoFileExists(t, olderPath)
+	require.NoFileExists(t, newerPath)
+}
+
 func TestCleanCacheAdmissionFailureDoesNotFailUpload(t *testing.T) {
 	mem, err := object.CreateStorage("mem", "", "", "", "")
 	require.NoError(t, err)

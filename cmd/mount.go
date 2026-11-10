@@ -759,6 +759,10 @@ func mount(c *cli.Context) error {
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
 	})
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
+	startReads := os.Getenv(run9StartReadsEnv)
+	if c.Bool("trace-reads") && startReads != "" {
+		return errors.Join(errors.New("--trace-reads and "+run9StartReadsEnv+" are exclusive"), shutdownSessionAndResources(metaCli, blob))
+	}
 	if c.Bool("trace-reads") {
 		v.TraceReads()
 	}
@@ -773,6 +777,9 @@ func mount(c *cli.Context) error {
 	}
 	defer stopCapture()
 	defer stopControl()
+	if startReads != "" {
+		startRun9StartReads(v, startReads)
+	}
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
@@ -783,6 +790,11 @@ func mount(c *cli.Context) error {
 	// the handler and leave a late pending ack over the terminal result.
 	forkMountLifecycle.Lock()
 	defer forkMountLifecycle.Unlock()
+	// A start reads prefetch uses metadata and the store directly, not the
+	// mountpoint: it must end before they close. Then keep this mount's start
+	// reads while the metadata is still open.
+	stopForkPageCacheWarms()
+	finishRun9StartReads()
 	if forkFinalizeInProgress {
 		return runForkFinalizeOnMain(metaCli, v, blob, sliceAllocationStart)
 	}

@@ -35,6 +35,7 @@ type PageCacheFile struct {
 type readTrace struct {
 	sync.Mutex
 	start time.Time
+	until time.Time // reads after it are not recorded; zero records all
 	order []Ino
 	files map[Ino][][2]uint64 // [start, end) intervals, ascending and disjoint
 }
@@ -46,6 +47,9 @@ func (v *VFS) TraceReads() {
 }
 
 func (t *readTrace) record(ino Ino, off uint64, n int) {
+	if !t.until.IsZero() && time.Now().After(t.until) {
+		return
+	}
 	start := off &^ (tracePageSize - 1)
 	end := (off + uint64(n) + tracePageSize - 1) &^ (tracePageSize - 1)
 	t.Lock()
@@ -55,6 +59,18 @@ func (t *readTrace) record(ino Ino, off uint64, n int) {
 		t.order = append(t.order, ino)
 	}
 	t.files[ino] = addTraceInterval(intervals, start, end)
+}
+
+// snapshot copies the files read so far, in order of first read.
+func (t *readTrace) snapshot() ([]Ino, map[Ino][][2]uint64) {
+	t.Lock()
+	defer t.Unlock()
+	order := append([]Ino(nil), t.order...)
+	traced := make(map[Ino][][2]uint64, len(t.files))
+	for ino, intervals := range t.files {
+		traced[ino] = append([][2]uint64(nil), intervals...)
+	}
+	return order, traced
 }
 
 // addTraceInterval inserts [start, end), merging it with every interval it
@@ -94,17 +110,10 @@ type ReadTraceLimits struct {
 // filesystem the mount started from.
 func (v *VFS) ReadTrace(ctx meta.Context, limits ReadTraceLimits) ([]PageCacheFile, error) {
 	t := v.readTrace
-	if t == nil {
+	if t == nil || !t.until.IsZero() {
 		return nil, errors.New("this mount does not trace reads")
 	}
-	t.Lock()
-	order := append([]Ino(nil), t.order...)
-	traced := make(map[Ino][][2]uint64, len(t.files))
-	for ino, intervals := range t.files {
-		traced[ino] = append([][2]uint64(nil), intervals...)
-	}
-	t.Unlock()
-
+	order, traced := t.snapshot()
 	paths := tracePaths{ctx: ctx, m: v.Meta, dirs: make(map[Ino]*traceDir)}
 	var files []PageCacheFile
 	var bytes uint64

@@ -98,6 +98,10 @@ func (b *blockingFinalizeChunkStore) Remove(uint64, int) error { return nil }
 
 func (b *blockingFinalizeChunkStore) FillCache(uint64, uint32) error { return nil }
 
+func (b *blockingFinalizeChunkStore) PrefetchBlock(context.Context, uint64, uint32, int) (bool, error) {
+	return false, nil
+}
+
 func (b *blockingFinalizeChunkStore) EvictCache(uint64, uint32) error { return nil }
 
 func (b *blockingFinalizeChunkStore) CheckCache(uint64, uint32, func(bool, string, int)) error {
@@ -115,6 +119,10 @@ func (f *fakeFinalizeChunkStore) NewWriter(uint64) chunk.Writer { return &fakeFi
 func (f *fakeFinalizeChunkStore) Remove(uint64, int) error { return nil }
 
 func (f *fakeFinalizeChunkStore) FillCache(uint64, uint32) error { return nil }
+
+func (f *fakeFinalizeChunkStore) PrefetchBlock(context.Context, uint64, uint32, int) (bool, error) {
+	return false, nil
+}
 
 func (f *fakeFinalizeChunkStore) EvictCache(uint64, uint32) error { return nil }
 

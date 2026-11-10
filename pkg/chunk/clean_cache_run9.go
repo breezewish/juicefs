@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// cleanCacheRecencyGranularity bounds how often a hit rewrites a block's mtime.
+// Hosts prune once a minute, so a finer order changes no eviction, while each
+// block costs at most one inode update per minute however often it is read.
+const cleanCacheRecencyGranularity = time.Minute
+
 // cleanDiskCache stores only remote-backed immutable blocks. It has no private
 // key index, staging scanner, uploader, or eviction worker: every process sees
 // publications immediately, and a host-level maintenance command owns eviction.
@@ -30,9 +35,11 @@ func (cache *cleanDiskCache) load(key string) (ReadCloser, error) {
 		_ = r.Close()
 		return nil, fmt.Errorf("clean cache block %s has no checksum", key)
 	}
-	// Coarse recency is shared through the inode, without per-hit bookkeeping or
-	// reliance on the host's atime mount option. Content remains immutable.
-	if fi, statErr := r.Stat(); statErr == nil && time.Since(fi.ModTime()) > time.Hour {
+	// Recency is shared through the inode's mtime, without per-hit bookkeeping
+	// or reliance on the host's atime mount option; content remains immutable.
+	// Pruning evicts the oldest mtimes first, so a hit must refresh it, or a
+	// block read on every Box start ages out like one never read again.
+	if fi, statErr := r.Stat(); statErr == nil && time.Since(fi.ModTime()) > cleanCacheRecencyGranularity {
 		now := time.Now()
 		_ = os.Chtimes(path, now, now)
 	}

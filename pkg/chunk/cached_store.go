@@ -125,9 +125,10 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	}
 
 	key := s.key(indx)
-	// A cache-only read warms a page cache ahead of a workload; its hits and
-	// misses are not that workload's.
+	// Cache-only and prefetch reads load data ahead of a workload; their hits
+	// and misses are not that workload's.
 	cacheOnly := isCacheOnly(ctx)
+	counted := isWorkloadRead(ctx)
 	readCachedBlock := func(r ReadCloser) (int, error) {
 		n, readErr := r.ReadAt(p, int64(boff))
 		if !s.store.conf.OSCache {
@@ -142,7 +143,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		if err == nil {
 			n, err = readCachedBlock(r)
 			if err == nil {
-				if !cacheOnly {
+				if counted {
 					s.store.cacheHits.Add(1)
 					s.store.cacheHitBytes.Add(float64(n))
 					s.store.cacheReadHist.Observe(time.Since(start).Seconds())
@@ -159,7 +160,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		if sharedErr == nil {
 			n, sharedErr = readCachedBlock(r)
 			if sharedErr == nil {
-				if !cacheOnly {
+				if counted {
 					s.store.cacheHits.Add(1)
 					s.store.cacheHitBytes.Add(float64(n))
 					s.store.sharedCacheHits.Add(1)
@@ -170,7 +171,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 			}
 		}
 		if os.IsNotExist(sharedErr) {
-			if !cacheOnly {
+			if counted {
 				s.store.sharedCacheMisses.Add(1)
 			}
 		} else {
@@ -184,7 +185,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		if cacheErr == nil {
 			n, cacheErr = readCachedBlock(r)
 			if cacheErr == nil {
-				if !cacheOnly {
+				if counted {
 					s.store.cacheHits.Inc()
 					s.store.cacheHitBytes.Add(float64(n))
 					s.store.cleanCacheHits.Inc()
@@ -204,8 +205,10 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	if cacheOnly {
 		return 0, ErrNotCached
 	}
-	s.store.cacheMiss.Add(1)
-	s.store.cacheMissBytes.Add(float64(len(p)))
+	if counted {
+		s.store.cacheMiss.Add(1)
+		s.store.cacheMissBytes.Add(float64(len(p)))
+	}
 
 	if s.store.seekable &&
 		(!s.store.conf.CacheEnabled() || (boff > 0 && len(p) <= blockSize/4)) {
