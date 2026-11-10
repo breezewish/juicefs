@@ -75,6 +75,13 @@ Related files:
 
 ### Run9 Fork Checkpoint GC
 
+- Before object deletion, checkpoint GC logs its checkpoint file hashes, exact
+  effective ranges and complete checksummed retained-slice set. Bounded parts
+  go directly to the existing runtime CloudWatch log file when `RUN9_LOG_DIR`
+  is configured; missing audit output fails before deletion. This retains the
+  authorization evidence after newer checkpoints prune the original metadata.
+  Implementation: `cmd/run9_checkpoint_audit.go`.
+
 - Badger mounts with online deletion disabled mask a bounded compaction prefix
   with the untouched tail before reading objects. Checkpoint GC may already
   have collected overwritten prefix references; tail-covered bytes become holes

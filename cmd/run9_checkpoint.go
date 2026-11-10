@@ -158,6 +158,9 @@ func run9GCCheckpoint(ctx context.Context, req run9GCCheckpointRequest) (run9GCC
 			ranges = append(ranges, r)
 		}
 	}
+	if err := writeRun9CheckpointAudit(req, directory, retained, ranges); err != nil {
+		return out, err
+	}
 	// Give object deletion its full budget after strict scanning succeeds.
 	deadline := time.Now().Add(2 * time.Minute)
 	ctx, cancel := context.WithDeadline(ctx, deadline.Add(15*time.Second))

@@ -69,6 +69,14 @@ func TestRun9GCCheckpointCorruptionDeletesNothingAndHonorsBounds(t *testing.T) {
 		require.FileExists(t, p)
 	}
 	req.DryRun = false
+	// Losing the audit sink must fail before any destructive work.
+	logDir := t.TempDir()
+	t.Setenv("RUN9_LOG_DIR", filepath.Join(logDir, "missing"))
+	_, err = run9GCCheckpoint(context.Background(), req)
+	require.ErrorContains(t, err, "open checkpoint audit log")
+	require.FileExists(t, paths[10])
+	require.FileExists(t, paths[19])
+	t.Setenv("RUN9_LOG_DIR", logDir)
 	out, err = run9GCCheckpoint(context.Background(), req)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), out.DeletedObjects)
@@ -76,6 +84,10 @@ func TestRun9GCCheckpointCorruptionDeletesNothingAndHonorsBounds(t *testing.T) {
 	require.NoFileExists(t, paths[10])
 	require.NoFileExists(t, paths[19])
 	require.FileExists(t, paths[20])
+	audit, err := os.ReadFile(filepath.Join(logDir, "run9rt.json.log"))
+	require.NoError(t, err)
+	require.Contains(t, string(audit), `"event":"checkpoint_gc_authorized"`)
+	require.Contains(t, string(audit), `"event":"checkpoint_gc_retained_slices"`)
 	out, err = run9GCCheckpoint(context.Background(), req)
 	require.NoError(t, err)
 	require.Zero(t, out.DeletedObjects)
