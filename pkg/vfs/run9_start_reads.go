@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 )
 
@@ -30,12 +31,15 @@ type StartRead struct {
 	Ranges [][2]uint64 `json:"ranges"`
 }
 
-// StartReadLimits bounds a StartReads result.
+// StartReadLimits bounds a StartReads result. What a list costs to prefetch
+// is the blocks behind its ranges, which only the prefetch knows
+// (StartReadsPrefetchLimits.MaxBytes).
 type StartReadLimits struct {
 	MaxFiles int
-	// MaxBytes bounds the total length of the listed ranges; a file whose
-	// ranges would exceed it is left out.
-	MaxBytes uint64
+	// MaxRangeBytes bounds the total length of the listed ranges; a file whose
+	// ranges would exceed it is left out. Readers older than the fetched-byte
+	// budget reject a list past it.
+	MaxRangeBytes uint64
 	// MaxListBytes bounds the JSON encoding of the list.
 	MaxListBytes int
 }
@@ -59,7 +63,7 @@ func (v *VFS) StartReads(ctx meta.Context, limits StartReadLimits) ([]StartRead,
 	}
 	order, traced := t.snapshot()
 	var files []StartRead
-	var bytes uint64
+	var rangeBytes uint64
 	listBytes := len("[")
 	for _, ino := range order {
 		if len(files) == limits.MaxFiles {
@@ -74,7 +78,7 @@ func (v *VFS) StartReads(ctx meta.Context, limits StartReadLimits) ([]StartRead,
 			ranges = append(ranges, [2]uint64{interval[0], interval[1] - interval[0]})
 			size += interval[1] - interval[0]
 		}
-		if bytes+size > limits.MaxBytes {
+		if rangeBytes+size > limits.MaxRangeBytes {
 			continue
 		}
 		var attr Attr
@@ -96,10 +100,22 @@ func (v *VFS) StartReads(ctx meta.Context, limits StartReadLimits) ([]StartRead,
 			break
 		}
 		listBytes += len(encoded) + 1
-		bytes += size
+		rangeBytes += size
 		files = append(files, file)
 	}
 	return files, nil
+}
+
+// StartReadsPrefetchLimits bounds one PrefetchStartReads call.
+type StartReadsPrefetchLimits struct {
+	// Concurrency bounds the blocks this mount fetches at once.
+	Concurrency int
+	// MaxBytes bounds the bytes fetched from object storage. A block a local
+	// cache holds costs one stat and no fetch, so it does not count.
+	MaxBytes int64
+	// Admit is asked before each fetch, after MaxBytes admits it, for limits
+	// this mount shares with others.
+	Admit chunk.PrefetchAdmit
 }
 
 // StartReadsPrefetchResult summarizes one PrefetchStartReads call.
@@ -108,14 +124,23 @@ type StartReadsPrefetchResult struct {
 	Files int
 	// Skipped counts listed files that are gone or no longer regular files.
 	Skipped int
-	// Blocks counts the blocks fetched from object storage; blocks a local
-	// cache already held are neither fetched nor counted.
+	// Blocks and Bytes count the blocks fetched from object storage,
+	// including failed fetches; blocks a local cache already held are
+	// neither fetched nor counted.
 	Blocks int64
+	Bytes  int64
 	// Failed counts blocks whose fetch failed; the workload reads them as usual.
 	Failed int64
-	// Stopped explains an early stop: the context's cause.
+	// Stopped explains an early stop: the context's cause, or
+	// ErrStartReadsBudgetSpent.
 	Stopped string
 }
+
+// ErrStartReadsBudgetSpent stops a prefetch whose next block would fetch
+// more than StartReadsPrefetchLimits.MaxBytes: no further block is produced,
+// and fetches already admitted complete. The list is in order of first read,
+// so the blocks left out are the ones the start needed last.
+var ErrStartReadsBudgetSpent = errors.New("start reads prefetch spent its byte budget")
 
 // prefetchBlock is block indx of a slice of sliceSize bytes.
 type prefetchBlock struct {
@@ -125,23 +150,47 @@ type prefetchBlock struct {
 }
 
 // PrefetchStartReads loads the blocks behind the listed ranges into the local
-// caches with up to concurrency fetches at once, in list order. Every fetch
-// reads the current metadata and immutable blocks, so a stale list costs only
-// wasted fetches: ranges past a file's end are clipped and changed files load
-// their current blocks.
-func (v *VFS) PrefetchStartReads(ctx context.Context, files []StartRead, concurrency int) StartReadsPrefetchResult {
+// caches within limits, in list order. Every fetch reads the current metadata
+// and immutable blocks, so a stale list costs only wasted fetches: ranges past
+// a file's end are clipped and changed files load their current blocks.
+func (v *VFS) PrefetchStartReads(ctx context.Context, files []StartRead, limits StartReadsPrefetchLimits) StartReadsPrefetchResult {
 	var result StartReadsPrefetchResult
-	var fetched, failed atomic.Int64
+	var spent, fetched, failed atomic.Int64
+	// A spent budget stops the producer, not the context: fetches already
+	// admitted within the budget complete.
+	budgetSpent := make(chan struct{})
+	var spendOnce sync.Once
+	admit := func(ctx context.Context, size int) (func(bool), error) {
+		if spent.Add(int64(size)) > limits.MaxBytes {
+			spent.Add(-int64(size))
+			spendOnce.Do(func() { close(budgetSpent) })
+			return nil, ErrStartReadsBudgetSpent
+		}
+		done, err := limits.Admit(ctx, size)
+		if err != nil {
+			spent.Add(-int64(size))
+			return nil, err
+		}
+		return func(downloaded bool) {
+			if !downloaded {
+				// A workload read loaded or downloaded the block meanwhile.
+				spent.Add(-int64(size))
+			}
+			done(downloaded)
+		}, nil
+	}
 	work := make(chan prefetchBlock)
 	var workers sync.WaitGroup
-	for range concurrency {
+	var bytes atomic.Int64
+	for range limits.Concurrency {
 		workers.Go(func() {
 			for b := range work {
-				ok, err := v.Store.PrefetchBlock(ctx, b.slice, b.sliceSize, b.indx)
-				if ok {
+				n, err := v.Store.PrefetchBlock(ctx, b.slice, b.sliceSize, b.indx, admit)
+				if n > 0 {
 					fetched.Add(1)
+					bytes.Add(int64(n))
 				}
-				if err != nil && ctx.Err() == nil {
+				if err != nil && ctx.Err() == nil && !errors.Is(err, ErrStartReadsBudgetSpent) {
 					failed.Add(1)
 					logger.Warnf("prefetch start read block %d of slice %d: %s", b.indx, b.slice, err)
 				}
@@ -196,6 +245,8 @@ produce:
 						seen[b] = struct{}{}
 						select {
 						case work <- b:
+						case <-budgetSpent:
+							break produce
 						case <-ctx.Done():
 							break produce
 						}
@@ -207,9 +258,14 @@ produce:
 	}
 	close(work)
 	workers.Wait()
-	result.Blocks, result.Failed = fetched.Load(), failed.Load()
-	if err := ctx.Err(); err != nil {
-		result.Stopped = context.Cause(ctx).Error()
+	result.Blocks, result.Bytes, result.Failed = fetched.Load(), bytes.Load(), failed.Load()
+	select {
+	case <-budgetSpent:
+		result.Stopped = ErrStartReadsBudgetSpent.Error()
+	default:
+		if err := ctx.Err(); err != nil {
+			result.Stopped = context.Cause(ctx).Error()
+		}
 	}
 	return result
 }

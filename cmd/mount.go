@@ -778,7 +778,7 @@ func mount(c *cli.Context) error {
 	defer stopCapture()
 	defer stopControl()
 	if startReads != "" {
-		startRun9StartReads(v, startReads)
+		startRun9StartReads(v, startReads, os.Getenv(run9PrefetchHostDirEnv))
 	}
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)

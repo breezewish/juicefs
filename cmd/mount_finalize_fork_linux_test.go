@@ -98,9 +98,11 @@ func (b *blockingFinalizeChunkStore) Remove(uint64, int) error { return nil }
 
 func (b *blockingFinalizeChunkStore) FillCache(uint64, uint32) error { return nil }
 
-func (b *blockingFinalizeChunkStore) PrefetchBlock(context.Context, uint64, uint32, int) (bool, error) {
-	return false, nil
+func (b *blockingFinalizeChunkStore) PrefetchBlock(context.Context, uint64, uint32, int, chunk.PrefetchAdmit) (int, error) {
+	return 0, nil
 }
+
+func (b *blockingFinalizeChunkStore) SettlePrefetch() (int, int64) { return 0, 0 }
 
 func (b *blockingFinalizeChunkStore) EvictCache(uint64, uint32) error { return nil }
 
@@ -120,9 +122,11 @@ func (f *fakeFinalizeChunkStore) Remove(uint64, int) error { return nil }
 
 func (f *fakeFinalizeChunkStore) FillCache(uint64, uint32) error { return nil }
 
-func (f *fakeFinalizeChunkStore) PrefetchBlock(context.Context, uint64, uint32, int) (bool, error) {
-	return false, nil
+func (f *fakeFinalizeChunkStore) PrefetchBlock(context.Context, uint64, uint32, int, chunk.PrefetchAdmit) (int, error) {
+	return 0, nil
 }
+
+func (f *fakeFinalizeChunkStore) SettlePrefetch() (int, int64) { return 0, 0 }
 
 func (f *fakeFinalizeChunkStore) EvictCache(uint64, uint32) error { return nil }
 

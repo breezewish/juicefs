@@ -129,6 +129,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	// and misses are not that workload's.
 	cacheOnly := isCacheOnly(ctx)
 	counted := isWorkloadRead(ctx)
+	if counted {
+		s.store.prefetched.read(key)
+	}
 	readCachedBlock := func(r ReadCloser) (int, error) {
 		n, readErr := r.ReadAt(p, int64(boff))
 		if !s.store.conf.OSCache {
@@ -222,6 +225,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		loaded := false
 		block, err := s.store.group.Execute(key, func() (*Page, error) {
 			loaded = true
+			if downloaded, ok := ctx.Value(prefetchDownloadKey{}).(*bool); ok {
+				*downloaded = true
+			}
 			tmp := page
 			if boff > 0 || len(p) < blockSize {
 				tmp = NewOffPage(blockSize)
@@ -798,6 +804,13 @@ type cachedStore struct {
 	objectDataBytes     *prometheus.CounterVec
 	stageBlockDelay     prometheus.Counter
 	stageBlockErrors    prometheus.Counter
+
+	prefetched           prefetchTracker
+	prefetchBlocks       prometheus.Counter
+	prefetchBytes        prometheus.Counter
+	prefetchUnreadBlocks prometheus.Counter
+	prefetchUnreadBytes  prometheus.Counter
+	prefetchSettled      prometheus.Gauge
 }
 
 func logRequest(typeStr, key, param, reqID string, err error, used time.Duration) {
@@ -1053,6 +1066,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 }
 
 func (store *cachedStore) initMetrics() {
+	store.initPrefetchMetrics()
 	store.cleanCacheHits = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "clean_blockcache_hits", Help: "reads served by the host's dynamic clean cache",
 	})
@@ -1138,6 +1152,7 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.cleanCacheHits)
 	reg.MustRegister(store.cleanCacheHitBytes)
 	reg.MustRegister(store.cleanCacheErrors)
+	store.regPrefetchMetrics(reg)
 	reg.MustRegister(store.objectReqsHistogram)
 	reg.MustRegister(store.objectReqErrors)
 	reg.MustRegister(store.objectDataBytes)
