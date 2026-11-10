@@ -391,7 +391,7 @@ For non-divergent code, we should keep as it is in upstream as much as possible,
 - Managed writable mounts expose an owner-local capture socket. A VFS write barrier seals writes and captures a fixed set of staged uploads; PUT completion, rather than staging, makes an object durable.
 - Badger access participates in a lifecycle gate. Capture uses native Close, complete-file COW, and Open with the original options, preserving the mount session and allocator. Paged scans release the gate before invoking callbacks to avoid nested database-access deadlocks.
 - The captured `CnextChunk` advances the current mount's retired-slice GC floor. It includes cached allocation reservations and never rolls back; finalize serializes with captures and pending upload waits.
-- The hidden `prepare-fork` command removes inherited session-owned state only from a private candidate. It runs outside the source mount process, isolating candidate Badger failures from the running parent.
+- The hidden `prepare-fork` command removes inherited session-owned state only from a private candidate. It runs outside the source mount process, isolating candidate Badger failures from the running parent. It then prints the candidate's usage (`used_space`, `used_inodes`, as `juicefs status` computes them) as one JSON object, so run9rt does not reopen the candidate to size it (`pkg/meta/run9_metadata_prepare_test.go`).
 - Sources: `cmd/run9_capture_linux.go`, `cmd/run9_prepare_fork.go`, `pkg/meta/run9_metadata_capture_linux.go`, `pkg/meta/run9_metadata_prepare.go`, `pkg/chunk/pending_uploads_run9.go`; coverage includes metadata reopen/copy failures, fixed upload sets and real VM online Fork tests in run9.
 
 ## OverlayFS whiteouts
