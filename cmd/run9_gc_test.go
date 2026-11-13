@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -281,6 +282,8 @@ func TestRun9GCSliceRangesDoesNotReportMoreWhenBudgetEqualsEOF(t *testing.T) {
 }
 
 func TestRun9CountSliceRangesCountsOnlyMatchingObjects(t *testing.T) {
+	logDir := t.TempDir()
+	t.Setenv("RUN9_LOG_DIR", logDir)
 	bucket := t.TempDir()
 	matchingKey := "chunks/0/0/51_0_3"
 	otherKey := "chunks/0/0/52_0_5"
@@ -314,6 +317,25 @@ func TestRun9CountSliceRangesCountsOnlyMatchingObjects(t *testing.T) {
 	}}, out.Ranges)
 	require.FileExists(t, matchingPath)
 	require.FileExists(t, otherPath)
+	logFile, err := os.Open(filepath.Join(logDir, "run9rt.json.log"))
+	require.NoError(t, err)
+	defer logFile.Close()
+	decoder := json.NewDecoder(logFile)
+	var begin, partitions, progress, end map[string]any
+	require.NoError(t, decoder.Decode(&begin))
+	require.NoError(t, decoder.Decode(&partitions))
+	require.NoError(t, decoder.Decode(&progress))
+	require.NoError(t, decoder.Decode(&end))
+	require.Equal(t, "accounting_scan_begin", begin["event"])
+	require.Equal(t, "accounting_scan_partitions", partitions["event"])
+	require.Equal(t, "accounting_scan_progress", progress["event"])
+	require.EqualValues(t, 1, progress["partition_index"])
+	require.EqualValues(t, out.ScanListedObjects, progress["partition_listed_objects"])
+	require.Equal(t, "accounting_scan_finished", end["event"])
+	require.Equal(t, true, end["ok"])
+	require.EqualValues(t, out.ScanListRequests, end["scan_list_requests"])
+	require.EqualValues(t, out.ScanListedObjects, end["scan_listed_objects"])
+
 }
 
 func TestRun9CountSliceRangesUsesHashPrefixLayout(t *testing.T) {

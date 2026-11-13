@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +21,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sync/errgroup"
 )
@@ -612,7 +616,7 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 	}, nil
 }
 
-func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) (run9CountSliceRangesOutput, error) {
+func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) (result run9CountSliceRangesOutput, resultErr error) {
 	if strings.TrimSpace(req.JuiceFSFormatName) == "" {
 		return run9CountSliceRangesOutput{}, fmt.Errorf("missing juicefs_format_name")
 	}
@@ -624,6 +628,36 @@ func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) 
 	if len(req.Ranges) == 0 {
 		return run9CountSliceRangesOutput{OK: true}, nil
 	}
+
+	// Runtime wrappers capture helper stderr. Preserve scan progress in the
+	// collected log even when the parent is killed before returning a result.
+	var writer io.Writer = os.Stderr
+	if logDir := os.Getenv("RUN9_LOG_DIR"); logDir != "" {
+		f, err := os.OpenFile(filepath.Join(logDir, "run9rt.json.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return result, fmt.Errorf("open accounting progress log: %w", err)
+		}
+		defer f.Close()
+		writer = f
+	}
+	log := slog.New(slog.NewJSONHandler(writer, &slog.HandlerOptions{ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.TimeKey {
+			a.Key = "ts"
+		}
+		return a
+	}})).With("service", "juicefs", "format", req.JuiceFSFormatName, "juicefs_version", version.Version(),
+		"host_instance_id", os.Getenv("RUN9_INSTANCE_ID"), "pid", os.Getpid())
+	started := time.Now()
+	log.Info("accounting_scan_begin", "event", "accounting_scan_begin", "range_count", len(req.Ranges))
+	defer func() {
+		attrs := []any{"event", "accounting_scan_finished", "dur_ms", time.Since(started).Milliseconds()}
+		if resultErr != nil {
+			log.Error("accounting_scan_finished", append(attrs, "ok", false, "error", resultErr.Error())...)
+		} else {
+			log.Info("accounting_scan_finished", append(attrs, "ok", result.OK,
+				"scan_list_requests", result.ScanListRequests, "scan_listed_objects", result.ScanListedObjects)...)
+		}
+	}()
 
 	blob, err := run9SliceRangeObjectStorage(req.JuiceFSFormatName, req.ObjectLayout, req.ObjectStorage)
 	if err != nil {
@@ -646,17 +680,28 @@ func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) 
 		return run9CountSliceRangesOutput{}, err
 	}
 	out.ScanListRequests = listRequests
+	log.Info("accounting_scan_partitions", "event", "accounting_scan_partitions", "partition_count", len(prefixes))
 	parts := make([]run9CountSliceRangesOutput, len(prefixes))
 	group, scanCtx := errgroup.WithContext(ctx)
-	// Four listing streams exhausted the caller's ten-minute budget on a
-	// 20-million-object lineage. Eight bounded streams overlap more S3 waits
-	// while leaving CPU and memory headroom on the two-core maintenance worker.
-	group.SetLimit(8)
+	// Keep listing concurrency bounded while overlapping S3 waits on large
+	// lineages. The count-only path does not change GC deletion concurrency.
+	group.SetLimit(16)
 	for i, prefix := range prefixes {
 		group.Go(func() error {
 			var err error
 			parts[i], err = countRun9SliceRangePrefix(scanCtx, blob, prefix, req.ObjectLayout.HashPrefix, req.Ranges)
-			return err
+			if err != nil {
+				return fmt.Errorf("count accounting partition %q: %w", prefix, err)
+			}
+			if i%32 == 0 || i == len(prefixes)-1 {
+				// Sample completed partitions without serializing the scan.
+				// Indices may finish out of order; these are not global totals.
+				log.Info("accounting_scan_progress", "event", "accounting_scan_progress",
+					"partition_index", i+1, "partition_count", len(prefixes), "partition_prefix", prefix,
+					"partition_list_requests", parts[i].ScanListRequests, "partition_listed_objects", parts[i].ScanListedObjects,
+					"dur_ms", time.Since(started).Milliseconds())
+			}
+			return nil
 		})
 	}
 	if err := group.Wait(); err != nil {
