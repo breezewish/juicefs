@@ -68,17 +68,9 @@ func listRun9GCOwnedObjects(ctx context.Context, store object.ObjectStorage, req
 					}
 					continue
 				}
-				million, err := strconv.ParseUint(name, 10, 64)
-				if err != nil || name != strconv.FormatUint(million, 10) {
-					continue
-				}
-				for _, r := range req.Ranges {
-					// Divide bounds instead of multiplying directory IDs to avoid overflow.
-					if r.Start/1000000 <= million && million <= r.EndInclusive/1000000 {
-						if err := forward(key); err != nil {
-							return err
-						}
-						break
+				if run9OwnedDirectory(name, req.Ranges) {
+					if err := forward(key); err != nil {
+						return err
 					}
 				}
 			}
@@ -96,4 +88,18 @@ func listRun9GCOwnedObjects(ctx context.Context, store object.ObjectStorage, req
 		}
 	}()
 	return out, stats
+}
+
+// run9OwnedDirectory matches a canonical million-ID directory against owners.
+func run9OwnedDirectory(name string, ranges []run9GCSliceRange) bool {
+	million, err := strconv.ParseUint(name, 10, 64)
+	if err != nil || name != strconv.FormatUint(million, 10) {
+		return false
+	}
+	for _, r := range ranges {
+		if r.Start/1000000 <= million && million <= r.EndInclusive/1000000 {
+			return true
+		}
+	}
+	return false
 }

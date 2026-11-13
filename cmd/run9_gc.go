@@ -675,7 +675,7 @@ func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) 
 	out := run9CountSliceRangesOutput{OK: true, Ranges: accounts}
 	// Real chunk directories keep epochs with the same leading digits in
 	// separate jobs. Fixed decimal prefixes leave large lineages mostly serial.
-	prefixes, listRequests, err := listRun9AccountingPartitions(ctx, blob)
+	prefixes, listRequests, err := listRun9AccountingPartitions(ctx, blob, req.ObjectLayout.HashPrefix, req.Ranges)
 	if err != nil {
 		return run9CountSliceRangesOutput{}, err
 	}
@@ -721,30 +721,51 @@ func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) 
 	return out, nil
 }
 
-// listRun9AccountingPartitions lists actual first-level chunk directories. Both
-// decimal and hash layouts partition every valid block key exactly once.
-func listRun9AccountingPartitions(ctx context.Context, blob object.ObjectStorage) ([]string, uint64, error) {
+// listRun9AccountingPartitions discovers only actual million-ID directories
+// intersecting the requested ownership. Hash layouts have one extra level.
+// Dividing range bounds avoids overflow at the largest valid slice ID.
+func listRun9AccountingPartitions(ctx context.Context, blob object.ObjectStorage, hashPrefix bool, ranges []run9GCSliceRange) ([]string, uint64, error) {
 	var prefixes []string
 	var requests uint64
-	marker, token := "", ""
-	for {
-		objects, more, nextToken, err := blob.List(ctx, "chunks/", marker, token, "/", run9GCSliceRangesListPageSize, true)
-		requests++
-		if err != nil {
-			return nil, requests, fmt.Errorf("list accounting partitions: %w", err)
-		}
-		for _, obj := range objects {
-			marker = obj.Key()
-			// File storage includes the directory itself in its first page.
-			if obj.IsDir() && obj.Key() != "chunks/" {
-				prefixes = append(prefixes, obj.Key())
+	var walk func(string, bool) error
+	walk = func(prefix string, hashes bool) error {
+		marker, token := "", ""
+		for {
+			objects, more, nextToken, err := blob.List(ctx, prefix, marker, token, "/", run9GCSliceRangesListPageSize, true)
+			requests++
+			if err != nil {
+				return fmt.Errorf("list accounting partitions: %w", err)
 			}
+			for _, obj := range objects {
+				if obj == nil {
+					return fmt.Errorf("invalid accounting directory listing")
+				}
+				marker = obj.Key()
+				if !obj.IsDir() || obj.Key() == prefix {
+					continue
+				}
+				name := strings.TrimSuffix(strings.TrimPrefix(obj.Key(), prefix), "/")
+				if hashes {
+					hash, err := strconv.ParseUint(name, 16, 8)
+					if err == nil && name == fmt.Sprintf("%02X", hash) {
+						if err := walk(obj.Key(), false); err != nil {
+							return err
+						}
+					}
+				} else if run9OwnedDirectory(name, ranges) {
+					prefixes = append(prefixes, obj.Key())
+				}
+			}
+			if !more {
+				return nil
+			}
+			token = nextToken
 		}
-		if !more {
-			return prefixes, requests, nil
-		}
-		token = nextToken
 	}
+	if err := walk("chunks/", hashPrefix); err != nil {
+		return nil, requests, err
+	}
+	return prefixes, requests, nil
 }
 
 func countRun9SliceRangePrefix(ctx context.Context, blob object.ObjectStorage, prefix string, hashPrefix bool, requested []run9GCSliceRange) (run9CountSliceRangesOutput, error) {

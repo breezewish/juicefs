@@ -753,6 +753,17 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	defer func() {
 		readSizeHistogram.Observe(float64(n))
 		logit(ctx, "read", err, "(%d,%d,%d,%d): (%d)", ino, size, off, fh, n)
+		if err == syscall.EIO {
+			// A speculative slice read can fail without failing a caller's
+			// read. Retain the actual returned outcome without issuing more
+			// metadata I/O on an already failing path. Cache-only warmup
+			// intentionally returns EIO for misses; those are not read faults.
+			_, cacheOnly := v.cacheOnlyThreads.Load(ctx.Pid())
+			if !cacheOnly {
+				logger.Errorf("read_request_failed format=%q inode=%d pid=%d uid=%d offset=%d requested_bytes=%d returned_bytes=%d errno=%d",
+					v.Conf.Format.Name, ino, ctx.Pid(), ctx.Uid(), off, size, n, err)
+			}
+		}
 	}()
 	h := v.findHandle(ino, fh)
 	if h == nil {

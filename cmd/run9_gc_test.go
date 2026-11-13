@@ -777,7 +777,7 @@ func TestRun9CountSliceRangesSeparatesDirectoriesWithSameLeadingDigits(t *testin
 	require.NoError(t, os.WriteFile(secondPath, []byte("abcde"), 0o644))
 	blob, err := object.CreateStorage("file", filepath.Join(bucket, "fmtroot")+"/", "", "", "")
 	require.NoError(t, err)
-	partitions, requests, err := listRun9AccountingPartitions(t.Context(), blob)
+	partitions, requests, err := listRun9AccountingPartitions(t.Context(), blob, false, []run9GCSliceRange{{EndInclusive: ^uint64(0)}})
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), requests)
 	require.Equal(t, []string{"chunks/10000000000/", "chunks/10000000001/"}, partitions)
@@ -817,7 +817,7 @@ func TestListRun9AccountingPartitionsRejectsIncompleteDiscovery(t *testing.T) {
 		errAt: 1,
 		err:   failure,
 	}
-	partitions, requests, err := listRun9AccountingPartitions(t.Context(), store)
+	partitions, requests, err := listRun9AccountingPartitions(t.Context(), store, false, []run9GCSliceRange{{EndInclusive: ^uint64(0)}})
 	require.ErrorIs(t, err, failure)
 	require.Equal(t, uint64(2), requests)
 	require.Nil(t, partitions)
@@ -924,4 +924,39 @@ func TestDeleteRun9SliceRangeMatchesKeepsCursorBeforeUnadmittedPartialBatch(t *t
 	require.Equal(t, chunk.FormatObjectBlockKey(1999, 0, 1, false), next)
 	require.Len(t, store.bulkCalls, 1)
 	require.Len(t, store.bulkCalls[0], 1000)
+}
+
+func TestAccountingScansOnlyOwnedDirectories(t *testing.T) {
+	for _, hashed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hash=%t", hashed), func(t *testing.T) {
+			bucket := t.TempDir()
+			ownedKey := chunk.FormatObjectBlockKey(1_000_000, 0, 3, hashed)
+			unrelatedKey := chunk.FormatObjectBlockKey(2_000_000, 0, 5, hashed)
+			maximumKey := chunk.FormatObjectBlockKey(^uint64(0), 0, 7, hashed)
+			for key, data := range map[string]string{ownedKey: "abc", unrelatedKey: "12345", maximumKey: "1234567"} {
+				path := filepath.Join(bucket, "fmtroot", key)
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
+				require.NoError(t, os.WriteFile(path, []byte(data), 0600))
+			}
+			req := run9CountSliceRangesRequest{JuiceFSFormatName: "fmtroot", ObjectStorage: run9ObjectStorageDescriptor{Storage: "file", Bucket: bucket + string(os.PathSeparator)}, ObjectLayout: run9ObjectLayout{BlockSizeBytes: 4096, HashPrefix: hashed}, Ranges: []run9GCSliceRange{{SnapID: "owner", Start: 999_999, EndInclusive: 1_000_000}, {SnapID: "max", Start: ^uint64(0), EndInclusive: ^uint64(0)}}}
+			blob, err := run9SliceRangeObjectStorage(req.JuiceFSFormatName, req.ObjectLayout, req.ObjectStorage)
+			require.NoError(t, err)
+			defer object.Shutdown(blob)
+			partitions, _, err := listRun9AccountingPartitions(t.Context(), blob, hashed, req.Ranges)
+			require.NoError(t, err)
+			require.Len(t, partitions, 2)
+			out, err := run9CountSliceRanges(t.Context(), req)
+			require.NoError(t, err)
+			require.True(t, out.OK)
+			require.EqualValues(t, 2, out.Objects)
+			require.EqualValues(t, 10, out.Bytes)
+			require.EqualValues(t, 1, out.Ranges[0].Objects)
+			require.EqualValues(t, 7, out.Ranges[1].Bytes)
+			if hashed {
+				require.ElementsMatch(t, []string{filepath.Dir(ownedKey) + "/", filepath.Dir(maximumKey) + "/"}, partitions)
+			} else {
+				require.ElementsMatch(t, []string{filepath.Dir(filepath.Dir(ownedKey)) + "/", filepath.Dir(filepath.Dir(maximumKey)) + "/"}, partitions)
+			}
+		})
+	}
 }

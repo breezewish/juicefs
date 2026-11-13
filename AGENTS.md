@@ -151,6 +151,16 @@ Related files:
 
 - A live block reader retries a shared download cancelled by another reader, without consuming its VFS storage-error retry budget. Its own cancellation and actual download errors still propagate; shared page references are released before retrying. This prevents cancelled readahead from turning unrelated reads into EIO under concurrent file access. Covered by `pkg/chunk/cached_store_cancel_test.go`.
 
+### Returned read failures
+
+- VFS reads returning EIO log `read_request_failed` with format, inode, caller
+  PID/UID, offset and requested/returned byte counts. This distinguishes a
+  returned FUSE error from an internal speculative slice-read warning, without
+  extra metadata I/O on the failure path. Intentional cache-only warmup misses
+  are excluded. Kernel readahead or application retries still require separate
+  outcome evidence; the event alone does not prove data loss.
+- Sources: `pkg/vfs/vfs.go`, `pkg/vfs/run9_read_error_test.go`.
+
 ### Usage reporting disabled by default
 
 - Usage reporting is always disabled by default.
@@ -347,7 +357,7 @@ Related files:
 - `gc-slice-ranges` lists only the loaded format prefix, parses `slice_id` from object keys, and deletes only keys whose `slice_id` falls within the requested ranges. It may stop early at `max_delete_objects` and return `has_more=true`.
 - S3 listing and bulk deletion allow at most four provider SDK attempts with its standard backoff for transient failures; caller cancellation and permanent errors still propagate. Foreground object reads and writes retain their existing retry policy.
 - Range GC and accounting propagate object listing failures after provider SDK retries, rather than retrying forever until the worker deadline. Partial scans never produce successful accounting or GC completion. Alternative listing is used only when paged listing is unsupported.
-- Accounting discovers actual first-level chunk directories through delimited listing and scans those disjoint partitions with at most sixteen concurrent listings. This leaves deadline headroom for large lineages and worker startup without extending the request budget. Fixed leading-digit partitions can serialize large epoch lineages; directory partitions bound worker load while sharing that work. It publishes totals only after discovery and every partition succeed, including zero accounts for empty storage.
+- Accounting discovers actual million-ID chunk directories through delimited listing, including the extra hash-layout level, and scans only directories intersecting requested ownership with at most sixteen concurrent listings. This leaves deadline headroom for large lineages and worker startup without extending the request budget. Fixed leading-digit partitions can serialize large epoch lineages; directory partitions bound worker load while sharing that work. It publishes totals only after discovery and every partition succeed, including zero accounts for empty storage.
 - When the loaded storage is sharded, range deletion reuses bulk delete and fans out independent shard groups in parallel so GC does not serialize shard-local deletes.
 - Delimited listing workers observe a cancellable context instead of racing on
   the recursive walker's error variable; coarse-GC race tests cover this path.
