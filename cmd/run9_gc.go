@@ -648,10 +648,10 @@ func run9CountSliceRanges(ctx context.Context, req run9CountSliceRangesRequest) 
 	out.ScanListRequests = listRequests
 	parts := make([]run9CountSliceRangesOutput, len(prefixes))
 	group, scanCtx := errgroup.WithContext(ctx)
-	// Four listing streams exhausted the caller's ten-minute budget on a
-	// 20-million-object lineage. Eight bounded streams overlap more S3 waits
-	// while leaving CPU and memory headroom on the two-core maintenance worker.
-	group.SetLimit(8)
+	// Overlap paginated S3 waits within the caller's ten-minute budget.
+	// Eight streams left the growing production lineage at its deadline;
+	// sixteen remain bounded on the two-core maintenance worker.
+	group.SetLimit(16)
 	for i, prefix := range prefixes {
 		group.Go(func() error {
 			var err error
