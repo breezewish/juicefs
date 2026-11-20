@@ -33,6 +33,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -48,11 +49,14 @@ const awsDefaultRegion = "us-east-1"
 const s3RequestIDKey = "X-Amz-Request-Id"
 
 // Listing and bulk deletion are idempotent operations used by run9 maintenance.
-// Let the SDK absorb short SlowDown bursts within the caller's context deadline.
+// Let the SDK absorb short failures within the caller's context deadline.
 const s3ListDeleteRetryMaxAttempts = 4
 
 type s3client struct {
-	s3              *s3.Client
+	s3 *s3.Client
+	// Bulk deletion shares throttle feedback across workers and successive batches.
+	// Keep its limiter separate from foreground reads, writes, and listing.
+	deleteRetryer   aws.Retryer
 	bucket          string
 	region          string
 	sc              string
@@ -245,6 +249,7 @@ func (s *s3client) DeleteObjects(ctx context.Context, keys []string, getters ...
 			Quiet:   aws.Bool(true),
 		},
 	}, func(options *s3.Options) {
+		options.Retryer = s.deleteRetryer
 		options.RetryMaxAttempts = s3ListDeleteRetryMaxAttempts
 	})
 	attrs := ApplyGetters(getters...)
@@ -620,7 +625,9 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 
 	cfg.HTTPClient = httpClient
 	client := s3.NewFromConfig(cfg, optFns...)
-	return &s3client{bucket: bucketName, s3: client, disableChecksum: disableChecksum, region: region}, nil
+	return &s3client{bucket: bucketName, s3: client, disableChecksum: disableChecksum, region: region,
+		deleteRetryer: retry.NewAdaptiveMode(),
+	}, nil
 }
 
 func init() {

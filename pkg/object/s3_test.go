@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -122,4 +123,38 @@ func TestS3ClientListDoesNotRetryAccessDenied(t *testing.T) {
 	require.False(t, more)
 	require.Empty(t, token)
 	require.Equal(t, int32(1), calls.Load())
+}
+
+// Separate batches must retain throttling feedback; foreground reads must not
+// wait behind the maintenance limiter. Neither canceled batch may report success.
+func TestS3BulkDeleteSharesThrottlingWithoutDelayingReads(t *testing.T) {
+	var deletes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("Last-Modified", "Fri, 20 Nov 2026 00:00:00 GMT")
+			return
+		}
+		deletes.Add(1)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>`))
+	}))
+	t.Cleanup(server.Close)
+	storage, err := newS3(server.URL+"/bucket", "access-key", "secret-key", "")
+	require.NoError(t, err)
+	client := storage.(*s3client)
+	first, cancelFirst := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancelFirst()
+	require.ErrorIs(t, client.DeleteObjects(first, []string{"first"}), context.DeadlineExceeded)
+	require.EqualValues(t, 1, deletes.Load())
+	second, cancelSecond := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancelSecond()
+	require.ErrorIs(t, client.DeleteObjects(second, []string{"second"}), context.DeadlineExceeded)
+	require.EqualValues(t, 1, deletes.Load(), "another batch must wait for the same throttle limiter")
+	read, cancelRead := context.WithTimeout(t.Context(), time.Second)
+	defer cancelRead()
+	obj, err := client.Head(read, "retained")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, obj.Size())
 }
