@@ -97,7 +97,10 @@ Related files:
 - The object work deadline interrupts waiting for listing results and deletion admission.
   Deletion workers have no pending backlog; unadmitted matches roll the cursor
   back to the start of their batch, while admitted batches retain IO grace.
-  Caller cancellation and delete failures still fail the round.
+  A batch still deleting when the IO grace ends makes the round partial: the
+  cursor precedes the earliest interrupted batch and `unconfirmed_objects`
+  counts its objects. Caller cancellation and other delete failures still fail
+  the round.
 
 - `gc-checkpoint` retains every slice in each direct child's immutable fork
   checkpoint. The first strict scan stores a checksummed slice list; unreadable

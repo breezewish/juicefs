@@ -119,7 +119,10 @@ type run9GCSliceRangesOutput struct {
 	ScanListedObjects uint64 `json:"scan_listed_objects"`
 	DeletedObjects    uint64 `json:"deleted_objects"`
 	DeletedBytes      uint64 `json:"deleted_bytes"`
-	HasMore           bool   `json:"has_more"`
+	// UnconfirmedObjects were in delete batches that the IO deadline
+	// interrupted. Any of them may already be gone; the rest lie after Next.
+	UnconfirmedObjects uint64 `json:"unconfirmed_objects,omitempty"`
+	HasMore            bool   `json:"has_more"`
 }
 
 type run9CountSliceRangesRequest struct {
@@ -592,7 +595,7 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 	defer cancel()
 	objs, scanStats := listRun9GCOwnedObjects(listCtx, blob, req)
 
-	deletedObjects, deletedBytes, hasMore, next, err := deleteRun9SliceRangeMatches(ctx, cancel, blob, objs, req)
+	deleted, err := deleteRun9SliceRangeMatches(ctx, cancel, blob, objs, req)
 	<-scanStats.done
 	if scanStats.err != nil {
 		return run9GCSliceRangesOutput{}, fmt.Errorf("list range objects: %w", scanStats.err)
@@ -600,19 +603,20 @@ func run9GCSliceRanges(ctx context.Context, req run9GCSliceRangesRequest) (run9G
 	if err != nil {
 		return run9GCSliceRangesOutput{}, fmt.Errorf("delete range objects: %w", err)
 	}
-	candidateObjects, candidateBytes := deletedObjects, deletedBytes
+	deletedObjects, deletedBytes := deleted.objects, deleted.bytes
 	if req.DryRun {
 		deletedObjects, deletedBytes = 0, 0
 	}
 	scanListRequests, scanListedObjects := scanStats.snapshot()
 	return run9GCSliceRangesOutput{
-		Next: next, CandidateObjects: candidateObjects, CandidateBytes: candidateBytes,
-		OK:                true,
-		ScanListRequests:  scanListRequests,
-		ScanListedObjects: scanListedObjects,
-		DeletedObjects:    deletedObjects,
-		DeletedBytes:      deletedBytes,
-		HasMore:           hasMore,
+		Next: deleted.next, CandidateObjects: deleted.objects, CandidateBytes: deleted.bytes,
+		OK:                 true,
+		ScanListRequests:   scanListRequests,
+		ScanListedObjects:  scanListedObjects,
+		DeletedObjects:     deletedObjects,
+		DeletedBytes:       deletedBytes,
+		UnconfirmedObjects: deleted.unconfirmed,
+		HasMore:            deleted.hasMore,
 	}, nil
 }
 
@@ -971,15 +975,31 @@ func listRun9GCSliceRangeObjectsFallback(ctx context.Context, scanStats *run9GCS
 	return out, scanStats, nil
 }
 
+// run9SliceRangeDeletion is the settled outcome of one range deletion round.
+type run9SliceRangeDeletion struct {
+	objects, bytes uint64
+	// unconfirmed counts objects of batches interrupted by the IO deadline.
+	unconfirmed uint64
+	hasMore     bool
+	next        string
+}
+
+// run9SliceRangeDeleteJob is an admitted batch with the cursor that precedes
+// it, so an interrupted batch can be revisited from there.
+type run9SliceRangeDeleteJob struct {
+	after   string
+	objects []run9GCExactObject
+}
+
 func deleteRun9SliceRangeMatches(
 	ctx context.Context,
 	stopScan context.CancelFunc,
 	store object.ObjectStorage,
 	objs <-chan object.Object,
 	req run9GCSliceRangesRequest,
-) (uint64, uint64, bool, string, error) {
+) (run9SliceRangeDeletion, error) {
 	if req.MaxDeleteObjects == 0 {
-		return 0, 0, false, "", fmt.Errorf("max_delete_objects must be greater than 0")
+		return run9SliceRangeDeletion{}, fmt.Errorf("max_delete_objects must be greater than 0")
 	}
 	threads := max(1, req.Threads)
 	var stopOnce sync.Once
@@ -993,23 +1013,35 @@ func deleteRun9SliceRangeMatches(
 	deleteCtx, cancelDelete := context.WithCancel(ctx)
 	defer cancelDelete()
 
+	// The caller's deadline after the work budget is the IO grace. A batch it
+	// interrupts is unsettled, not failed: some of its objects may be gone, so
+	// the round ends early and the next one resumes before that batch. Caller
+	// cancellation and provider failures stay errors.
+	ioGraceExpired := func() bool {
+		return !req.WorkDeadline.IsZero() && time.Now().After(req.WorkDeadline) &&
+			errors.Is(ctx.Err(), context.DeadlineExceeded)
+	}
+
 	// Admit work only to an available worker. A queued backlog cannot be
 	// guaranteed to drain inside the caller's IO grace after the work budget.
-	deleteJobs := make(chan []run9GCExactObject)
+	deleteJobs := make(chan run9SliceRangeDeleteJob)
 	supportsBulkDelete := object.SupportsBulkDelete(store)
 	var deletedObjects atomic.Uint64
 	var deletedBytes atomic.Uint64
+	var mu sync.Mutex
 	var firstDeleteErr error
-	var firstDeleteErrMu sync.Mutex
+	var interrupted bool
+	var unconfirmed uint64
+	var resumeAfter string
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for batch := range deleteJobs {
-				firstDeleteErrMu.Lock()
+			for job := range deleteJobs {
+				mu.Lock()
 				hasDeleteErr := firstDeleteErr != nil
-				firstDeleteErrMu.Unlock()
+				mu.Unlock()
 				if hasDeleteErr {
 					continue
 				}
@@ -1017,21 +1049,30 @@ func deleteRun9SliceRangeMatches(
 				var batchDeletedObjects, batchDeletedBytes uint64
 				var err error
 				if req.DryRun {
-					batchDeletedObjects = uint64(len(batch))
-					for _, obj := range batch {
+					batchDeletedObjects = uint64(len(job.objects))
+					for _, obj := range job.objects {
 						batchDeletedBytes += obj.Size
 					}
 				} else {
-					batchDeletedObjects, batchDeletedBytes, err = deleteRun9SliceRangeDeleteBatch(deleteCtx, store, batch, supportsBulkDelete)
+					batchDeletedObjects, batchDeletedBytes, err = deleteRun9SliceRangeDeleteBatch(deleteCtx, store, job.objects, supportsBulkDelete)
 				}
 				if err != nil {
-					firstDeleteErrMu.Lock()
-					if firstDeleteErr == nil {
+					mu.Lock()
+					switch {
+					case ioGraceExpired():
+						// Listing order is key order, so the smallest cursor
+						// precedes every interrupted batch.
+						if !interrupted || job.after < resumeAfter {
+							resumeAfter = job.after
+						}
+						interrupted = true
+						unconfirmed += uint64(len(job.objects))
+					case firstDeleteErr == nil:
 						firstDeleteErr = err
 						cancelDelete()
 						stopListing()
 					}
-					firstDeleteErrMu.Unlock()
+					mu.Unlock()
 					continue
 				}
 				deletedObjects.Add(batchDeletedObjects)
@@ -1046,8 +1087,8 @@ func deleteRun9SliceRangeMatches(
 		defer cancelWork()
 		workDone = workCtx.Done()
 	}
-	sendBatch := func(batch []run9GCExactObject) (bool, error) {
-		if len(batch) == 0 {
+	sendBatch := func(job run9SliceRangeDeleteJob) (bool, error) {
+		if len(job.objects) == 0 {
 			return true, nil
 		}
 		if !req.WorkDeadline.IsZero() && !time.Now().Before(req.WorkDeadline) {
@@ -1058,7 +1099,7 @@ func deleteRun9SliceRangeMatches(
 			return false, deleteCtx.Err()
 		case <-workDone:
 			return false, nil
-		case deleteJobs <- batch:
+		case deleteJobs <- job:
 			return true, nil
 		}
 	}
@@ -1073,6 +1114,8 @@ scan:
 		var obj object.Object
 		select {
 		case <-ctx.Done():
+			// The work budget expires first, but select may pick either.
+			hasMore = true
 			break scan
 		case <-workDone:
 			hasMore = true
@@ -1119,20 +1162,16 @@ scan:
 		if len(matches) >= batchSize || matchedForDelete == req.MaxDeleteObjects {
 			batch := matches
 			matches = make([]run9GCExactObject, 0, batchSize)
-			sent, err := sendBatch(batch)
-			if err != nil {
-				scanErr = err
-				break
-			}
+			sent, err := sendBatch(run9SliceRangeDeleteJob{after: batchAfter, objects: batch})
 			if !sent {
-				last, hasMore = batchAfter, true
+				last, hasMore, scanErr = batchAfter, true, err
 				stopListing()
 				break
 			}
 		}
 	}
 	if scanErr == nil {
-		sent, err := sendBatch(matches)
+		sent, err := sendBatch(run9SliceRangeDeleteJob{after: batchAfter, objects: matches})
 		scanErr = err
 		if !sent {
 			// Unadmitted matches must be revisited, even if later retained
@@ -1144,22 +1183,32 @@ scan:
 	close(deleteJobs)
 	wg.Wait()
 
-	firstDeleteErrMu.Lock()
-	err := firstDeleteErr
-	firstDeleteErrMu.Unlock()
-	if err != nil {
-		return 0, 0, false, "", err
+	if firstDeleteErr != nil {
+		return run9SliceRangeDeletion{}, firstDeleteErr
 	}
-	if scanErr != nil {
-		return 0, 0, false, "", scanErr
+	// Admission stops when the IO grace cancels deletion; the unadmitted batch
+	// is already before the cursor. Any other scan failure stays an error.
+	if scanErr != nil && !(ioGraceExpired() && errors.Is(scanErr, context.DeadlineExceeded)) {
+		return run9SliceRangeDeletion{}, scanErr
 	}
 	if ctx.Err() != nil {
-		return 0, 0, false, "", ctx.Err()
+		if !ioGraceExpired() {
+			return run9SliceRangeDeletion{}, ctx.Err()
+		}
+		// Listing ends silently at the deadline; it may not have finished.
+		hasMore = true
+	}
+	if interrupted {
+		// Every admitted batch precedes the scan cursor.
+		last, hasMore = resumeAfter, true
 	}
 	if !hasMore {
 		last = ""
 	}
-	return deletedObjects.Load(), deletedBytes.Load(), hasMore, last, nil
+	return run9SliceRangeDeletion{
+		objects: deletedObjects.Load(), bytes: deletedBytes.Load(), unconfirmed: unconfirmed,
+		hasMore: hasMore, next: last,
+	}, nil
 }
 
 func run9GCDeleteBatchSizeForSliceRanges(store object.ObjectStorage, maxDeleteObjects uint64, threads int) int {
