@@ -1194,7 +1194,7 @@ func deleteRun9SliceRangeDeleteBatch(ctx context.Context, store object.ObjectSto
 			keys = append(keys, obj.Key)
 			deletedBytes += obj.Size
 		}
-		if err := deleteRun9ExactObjectBatch(ctx, bulk, keys); err != nil {
+		if err := retryRun9ObjectDelete(ctx, func() error { return bulk.DeleteObjects(ctx, keys) }); err != nil {
 			return 0, 0, err
 		}
 		return uint64(len(objects)), deletedBytes, nil
@@ -1202,7 +1202,7 @@ func deleteRun9SliceRangeDeleteBatch(ctx context.Context, store object.ObjectSto
 
 	var deletedBytes uint64
 	for _, obj := range objects {
-		if err := deleteRun9ExactObjectWithRetry(ctx, store, obj.Key); err != nil {
+		if err := retryRun9ObjectDelete(ctx, func() error { return store.Delete(ctx, obj.Key) }); err != nil {
 			return 0, 0, err
 		}
 		deletedBytes += obj.Size
@@ -1269,7 +1269,7 @@ func deleteRun9ExactObjectsBulk(ctx context.Context, store run9GCExactObjectsBul
 					keys = append(keys, obj.Key)
 					batchBytes += obj.Size
 				}
-				if err := deleteRun9ExactObjectBatch(ctx, store, keys); err != nil {
+				if err := retryRun9ObjectDelete(ctx, func() error { return store.DeleteObjects(ctx, keys) }); err != nil {
 					firstDeleteErrMu.Lock()
 					if firstDeleteErr == nil {
 						firstDeleteErr = err
@@ -1313,30 +1313,34 @@ func deleteRun9ExactObjectsBulk(ctx context.Context, store run9GCExactObjectsBul
 	return deletedObjects.Load(), deletedBytes.Load(), nil
 }
 
-func deleteRun9ExactObjectBatch(ctx context.Context, store run9GCExactObjectsBulkDeleteStorage, keys []string) error {
+// retryRun9ObjectDelete bounds provider retries without hiding the failure that
+// caused them when the caller's IO deadline expires. Partial deletes never count
+// as a completed batch or advance the GC cursor.
+func retryRun9ObjectDelete(ctx context.Context, deleteObjects func() error) error {
 	delay := run9GCExactObjectsInitialRetryDelay
-	var err error
+	var lastErr error
 	for attempt := 1; attempt <= run9GCExactObjectsDeleteAttempts; attempt++ {
-		err = store.DeleteObjects(ctx, keys)
+		err := deleteObjects()
 		if err == nil {
 			return nil
 		}
-		if !isRun9GCExactObjectsRetryableDeleteError(err) {
-			break
+		if ctx.Err() != nil && lastErr != nil {
+			return fmt.Errorf("delete retry interrupted: %w; previous failure: %w", err, lastErr)
 		}
-		if attempt == run9GCExactObjectsDeleteAttempts {
+		lastErr = err
+		if !isRun9GCExactObjectsRetryableDeleteError(err) || attempt == run9GCExactObjectsDeleteAttempts {
 			break
 		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			return fmt.Errorf("delete retry interrupted: %w; previous failure: %w", ctx.Err(), lastErr)
 		case <-timer.C:
 		}
 		delay = nextRun9GCExactObjectsRetryDelay(delay)
 	}
-	return err
+	return lastErr
 }
 
 func nextRun9GCExactObjectsRetryDelay(delay time.Duration) time.Duration {
@@ -1381,7 +1385,7 @@ func deleteRun9ExactObjectsSequential(ctx context.Context, store object.ObjectSt
 				if hasDeleteErr {
 					continue
 				}
-				if err := deleteRun9ExactObjectWithRetry(ctx, store, obj.Key); err != nil {
+				if err := retryRun9ObjectDelete(ctx, func() error { return store.Delete(ctx, obj.Key) }); err != nil {
 					firstDeleteErrMu.Lock()
 					if firstDeleteErr == nil {
 						firstDeleteErr = err
@@ -1415,32 +1419,6 @@ func deleteRun9ExactObjectsSequential(ctx context.Context, store object.ObjectSt
 		return deletedObjects.Load(), deletedBytes.Load(), firstDeleteErr
 	}
 	return deletedObjects.Load(), deletedBytes.Load(), nil
-}
-
-func deleteRun9ExactObjectWithRetry(ctx context.Context, store object.ObjectStorage, key string) error {
-	delay := run9GCExactObjectsInitialRetryDelay
-	var err error
-	for attempt := 1; attempt <= run9GCExactObjectsDeleteAttempts; attempt++ {
-		err = store.Delete(ctx, key)
-		if err == nil {
-			return nil
-		}
-		if !isRun9GCExactObjectsRetryableDeleteError(err) {
-			break
-		}
-		if attempt == run9GCExactObjectsDeleteAttempts {
-			break
-		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-		delay = nextRun9GCExactObjectsRetryDelay(delay)
-	}
-	return err
 }
 
 func (l run9ObjectLayout) validate() error {

@@ -960,3 +960,26 @@ func TestAccountingScansOnlyOwnedDirectories(t *testing.T) {
 		})
 	}
 }
+
+func TestObjectDeleteCancellationRetainsThrottleCause(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	throttle := fmt.Errorf("SlowDown: request rate exceeded")
+	calls := 0
+	err := retryRun9ObjectDelete(ctx, func() error {
+		calls++
+		cancel()
+		return throttle
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, throttle)
+	require.Equal(t, 1, calls)
+}
+
+func TestObjectDeleteDoesNotRetryPermanentFailure(t *testing.T) {
+	denied := fmt.Errorf("AccessDenied")
+	calls := 0
+	err := retryRun9ObjectDelete(t.Context(), func() error { calls++; return denied })
+	require.ErrorIs(t, err, denied)
+	require.Equal(t, 1, calls)
+}
