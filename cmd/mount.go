@@ -734,12 +734,33 @@ func mount(c *cli.Context) error {
 
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(metaCli, store, chunkConf)
-	sliceAllocationStart, err := beginRun9SliceAllocation(metaCli)
-	if err != nil {
+	// Before this mount has a session, failing releases the metadata client
+	// and the object storage only.
+	abort := func(err error) error {
 		_ = metaCli.Shutdown()
+		object.Shutdown(blob)
 		return err
 	}
+	sliceAllocationStart, err := beginRun9SliceAllocation(metaCli)
+	if err != nil {
+		return abort(err)
+	}
 
+	if sliceAllocationStart != nil {
+		// An online Fork's copy still records its source mount's session.
+		// This mount is the copy's only client, so it releases that session's
+		// locks and held-open deleted files before serving anything.
+		cleanStart := time.Now()
+		cleaner, ok := metaCli.(interface{ Run9CleanInheritedSessions() (int, error) })
+		if !ok {
+			return abort(fmt.Errorf("run9 mount requires inherited session cleanup"))
+		}
+		cleaned, err := cleaner.Run9CleanInheritedSessions()
+		if err != nil {
+			return abort(fmt.Errorf("clean inherited sessions: %w", err))
+		}
+		emitRun9StageTrace("mount_stage3_clean_inherited_sessions_end", cleanStart, map[string]any{"sessions": cleaned})
+	}
 	newSessionStart := time.Now()
 	err = metaCli.NewSession(true)
 	if err != nil {

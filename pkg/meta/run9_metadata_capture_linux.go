@@ -29,21 +29,38 @@ type Run9MetadataCapture struct {
 	OpenMS        int64  `json:"open_ms"`
 }
 
+// Run9CaptureOptions extends a capture beyond the child's own copy.
+type Run9CaptureOptions struct {
+	// Copies receive further clones of the same closed file set, made
+	// concurrently with the first: other children of the same capture
+	// instant, and Fork checkpoints, exactly the metadata a child received.
+	Copies []string
+	// Cloned, when set, runs once every clone has succeeded and before the
+	// source database reopens. The copies are complete then, so the caller
+	// may report capture and let the VM resume; source I/O keeps waiting on
+	// the suspended writes and the database lock until the reopen finishes.
+	// It receives the capture without OpenMS, which is not known yet.
+	Cloned func(Run9MetadataCapture)
+}
+
 // Run9CaptureMetadata closes only Badger, clones its complete stable file set,
 // and reopens the same options. The caller must seal VFS writes first and keep
 // the mount alive. No session, allocator, or chunk-store state is recreated.
 // With a live owned-bytes count, it also returns the Fork's record; the caller
 // starts it when the Fork proceeds, or discards it.
-func (m *kvMeta) Run9CaptureMetadata(ctx context.Context, directory string) (out Run9MetadataCapture, record *Run9ForkRecord, resultErr error) {
+func (m *kvMeta) Run9CaptureMetadata(ctx context.Context, directory string, opts Run9CaptureOptions) (out Run9MetadataCapture, record *Run9ForkRecord, resultErr error) {
 	c, ok := m.client.(*badgerClient)
 	if !ok || c.readOnly {
 		return out, nil, fmt.Errorf("metadata capture requires writable Badger")
 	}
-	if !filepath.IsAbs(directory) {
-		return out, nil, fmt.Errorf("metadata capture requires an absolute destination")
-	}
-	if _, err := os.Lstat(directory); !os.IsNotExist(err) {
-		return out, nil, fmt.Errorf("metadata capture destination must not exist: %s (%v)", directory, err)
+	destinations := append([]string{directory}, opts.Copies...)
+	for _, destination := range destinations {
+		if !filepath.IsAbs(destination) {
+			return out, nil, fmt.Errorf("metadata capture requires an absolute destination")
+		}
+		if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+			return out, nil, fmt.Errorf("metadata capture destination must not exist: %s (%v)", destination, err)
+		}
 	}
 	// Initialization or the previous Fork's record may still read the database
 	// this closes. Callers already waited with Run9WaitForkRecord before sealing.
@@ -113,8 +130,15 @@ func (m *kvMeta) Run9CaptureMetadata(ctx context.Context, directory string) (out
 		}
 	}()
 	start = time.Now()
-	err = cloneRun9Metadata(ctx, options.Dir, directory)
+	clones, cloneCtx := errgroup.WithContext(ctx)
+	for _, destination := range destinations {
+		clones.Go(func() error { return cloneRun9Metadata(cloneCtx, options.Dir, destination) })
+	}
+	err = clones.Wait()
 	out.CloneMS = time.Since(start).Milliseconds()
+	if err == nil && opts.Cloned != nil {
+		opts.Cloned(out)
+	}
 	return out, nil, err
 }
 

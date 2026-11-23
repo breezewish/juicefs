@@ -50,7 +50,7 @@ func TestMetadataCapturePreservesVersionsAndAllocation(t *testing.T) {
 			return nil
 		}, 0))
 		previous := c.client
-		out, _, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(root, fmt.Sprint(generation)))
+		out, _, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(root, fmt.Sprint(generation)), Run9CaptureOptions{})
 		require.Equal(t, uint64(4294967396+generation), out.AllocationEnd)
 		require.NoError(t, err)
 		require.True(t, previous.IsClosed())
@@ -96,12 +96,12 @@ func TestMetadataCaptureCloseFailurePoisonsSource(t *testing.T) {
 	require.NoError(t, err)
 	m := client.(*kvMeta)
 	require.NoError(t, m.Init(testFormat(), false))
-	_, _, err = m.Run9CaptureMetadata(context.Background(), filepath.Join(root, "first"))
+	_, _, err = m.Run9CaptureMetadata(context.Background(), filepath.Join(root, "first"), Run9CaptureOptions{})
 	require.NoError(t, err)
 	// Empty memtable: moving the path keeps open descriptors valid but makes
 	// Badger Close's final directory sync fail with a real filesystem error.
 	require.NoError(t, os.Rename(source, filepath.Join(root, "moved")))
-	_, _, err = m.Run9CaptureMetadata(context.Background(), filepath.Join(root, "failed"))
+	_, _, err = m.Run9CaptureMetadata(context.Background(), filepath.Join(root, "failed"), Run9CaptureOptions{})
 	require.ErrorIs(t, err, ErrRun9MetadataUnavailable)
 	require.ErrorContains(t, err, "close failed")
 	require.NoDirExists(t, filepath.Join(root, "failed"))
@@ -129,7 +129,7 @@ func TestMetadataCaptureCopyFailureReopensSource(t *testing.T) {
 	c := m.client.(*badgerClient)
 	previous := c.client
 	// The destination's missing parent fails mkdir after Close has succeeded.
-	_, _, err = m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "missing", "copy"))
+	_, _, err = m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "missing", "copy"), Run9CaptureOptions{})
 	require.Error(t, err)
 	require.True(t, previous.IsClosed())
 	require.NotSame(t, previous, c.client)
@@ -150,7 +150,7 @@ func TestMetadataCaptureRecordsTheForkInTheBackground(t *testing.T) {
 	require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: id, Size: 100, Len: 100}, time.Now()))
 	// Hold the count so that the record cannot be applied yet.
 	m.run9Owned.recount <- struct{}{}
-	_, record, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "copy"))
+	_, record, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "copy"), Run9CaptureOptions{})
 	require.NoError(t, err)
 	record.Start()
 	require.False(t, m.run9Owned.sampleCurrent())
@@ -172,14 +172,14 @@ func TestMetadataCaptureDiscardedForkProtectsNothing(t *testing.T) {
 	var id uint64
 	require.Zero(t, m.NewSlice(ctx, &id))
 	require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: id, Size: 100, Len: 100}, time.Now()))
-	_, record, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "copy"))
+	_, record, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "copy"), Run9CaptureOptions{})
 	require.NoError(t, err)
 	record.Discard()
 	require.EqualValues(t, 100, run9OwnedVisible(t, m))
 	require.Zero(t, m.run9Owned.offset.Load())
 	require.True(t, m.run9Owned.sampleCurrent())
 	// The slot is free for the next capture.
-	_, record, err = m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "next"))
+	_, record, err = m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "next"), Run9CaptureOptions{})
 	require.NoError(t, err)
 	record.Discard()
 }
@@ -190,11 +190,11 @@ func TestMetadataCaptureWaitsForAnEarlierForkRecordOutsideTheDatabaseLock(t *tes
 	deadline, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	require.ErrorIs(t, m.Run9WaitForkRecord(deadline), context.DeadlineExceeded)
-	_, _, err := m.Run9CaptureMetadata(deadline, filepath.Join(t.TempDir(), "expired"))
+	_, _, err := m.Run9CaptureMetadata(deadline, filepath.Join(t.TempDir(), "expired"), Run9CaptureOptions{})
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	captured := make(chan error, 1)
 	go func() {
-		_, next, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "copy"))
+		_, next, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "copy"), Run9CaptureOptions{})
 		next.Discard()
 		captured <- err
 	}()
@@ -223,7 +223,7 @@ func TestMetadataCaptureWaitsForInitializationAndRecordsAfterTheBaseline(t *test
 	require.NoError(t, m.Run9TrackOwnedBytes(Run9OwnedBytesConfig{Epoch: run9OwnedTestEpoch, AllocationStart: start, LastClosedRaw: &last, Protection: blockedRun9Protection(release)}))
 	captured := make(chan *Run9ForkRecord, 1)
 	go func() {
-		_, record, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "copy"))
+		_, record, err := m.Run9CaptureMetadata(context.Background(), filepath.Join(t.TempDir(), "copy"), Run9CaptureOptions{})
 		assert.NoError(t, err)
 		captured <- record
 	}()
@@ -268,4 +268,91 @@ func TestBadgerScanCallbacksReleaseDatabaseBeforeMaintenance(t *testing.T) {
 		return true
 	}))
 	require.Equal(t, 1100, seen, "resume after a deleted cursor without skipping the next page")
+}
+
+// One capture clones every copy, children and checkpoints alike, from the same
+// closed file set before the source reopens.
+func TestMetadataCaptureClonesEveryCopyBeforeReopen(t *testing.T) {
+	conf := testConfig()
+	conf.NoBGJob, conf.MaxDeletes = true, 0
+	client, err := newKVMeta("badger", t.TempDir()+"?nextchunk=4294967296", conf)
+	require.NoError(t, err)
+	m := client.(*kvMeta)
+	defer func() { require.NoError(t, m.Shutdown()) }()
+	require.NoError(t, m.Init(testFormat(), false))
+	c := m.client.(*badgerClient)
+	require.NoError(t, c.txn(context.Background(), func(tx *kvTxn) error {
+		tx.set([]byte("research-key"), []byte("captured"))
+		return nil
+	}, 0))
+	root := t.TempDir()
+	child, sibling, checkpoint := filepath.Join(root, "child"), filepath.Join(root, "sibling"), filepath.Join(root, "checkpoint")
+	previous := c.client
+	var clonedWhileClosed bool
+	_, _, err = m.Run9CaptureMetadata(context.Background(), child, Run9CaptureOptions{
+		Copies: []string{sibling, checkpoint},
+		Cloned: func(Run9MetadataCapture) {
+			// The callback runs with the source still closed: the copies are
+			// complete, the reopen has not started.
+			clonedWhileClosed = previous.IsClosed() && c.client == previous
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, clonedWhileClosed)
+	require.False(t, c.client.IsClosed())
+	for _, directory := range []string{child, sibling, checkpoint} {
+		db, err := badger.Open(badger.DefaultOptions(directory).WithReadOnly(true).WithLogger(nil))
+		require.NoError(t, err)
+		require.NoError(t, db.View(func(txn *badger.Txn) error {
+			item, err := txn.Get([]byte("research-key"))
+			require.NoError(t, err)
+			value, err := item.ValueCopy(nil)
+			require.Equal(t, "captured", string(value))
+			return err
+		}))
+		require.NoError(t, db.Close())
+	}
+}
+
+// Once the copies exist, a source that cannot reopen is the source's failure
+// alone: the copies stay complete and the source refuses further access.
+func TestMetadataCaptureReopenFailureAfterClonesKeepsTheCopies(t *testing.T) {
+	conf := testConfig()
+	conf.NoBGJob = true
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	client, err := newKVMeta("badger", source, conf)
+	require.NoError(t, err)
+	m := client.(*kvMeta)
+	require.NoError(t, m.Init(testFormat(), false))
+	c := m.client.(*badgerClient)
+	require.NoError(t, c.txn(context.Background(), func(tx *kvTxn) error {
+		tx.set([]byte("research-key"), []byte("captured"))
+		return nil
+	}, 0))
+	child, checkpoint := filepath.Join(root, "child"), filepath.Join(root, "checkpoint")
+	_, _, err = m.Run9CaptureMetadata(context.Background(), child, Run9CaptureOptions{
+		Copies: []string{checkpoint},
+		Cloned: func(Run9MetadataCapture) {
+			require.NoError(t, os.WriteFile(filepath.Join(source, "MANIFEST"), []byte("corrupt"), 0600))
+		},
+	})
+	require.ErrorIs(t, err, ErrRun9MetadataUnavailable)
+	require.ErrorContains(t, err, "reopen failed")
+	require.ErrorIs(t, c.txn(context.Background(), func(*kvTxn) error {
+		t.Fatal("unavailable source must not enter a transaction")
+		return nil
+	}, 0), ErrRun9MetadataUnavailable)
+	for _, directory := range []string{child, checkpoint} {
+		db, err := badger.Open(badger.DefaultOptions(directory).WithReadOnly(true).WithLogger(nil))
+		require.NoError(t, err)
+		require.NoError(t, db.View(func(txn *badger.Txn) error {
+			item, err := txn.Get([]byte("research-key"))
+			require.NoError(t, err)
+			value, err := item.ValueCopy(nil)
+			require.Equal(t, "captured", string(value))
+			return err
+		}))
+		require.NoError(t, db.Close())
+	}
 }
