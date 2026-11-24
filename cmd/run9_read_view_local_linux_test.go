@@ -45,3 +45,19 @@ func TestLocalReadViewUsesLinuxNamesAndStablePages(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("yload"), buf)
 }
+
+func TestLocalReadViewModeComesFromExt4(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "private")
+	require.NoError(t, os.WriteFile(file, nil, 0600))
+	require.NoError(t, syscall.Setxattr(file, run9OverrideStatXattr, []byte("0:0:0777"), 0))
+	view, closeView, err := openRun9LocalReader(dir)
+	require.NoError(t, err)
+	defer closeView()
+	ctx := run9ReadViewContext(t.Context())
+	stat, errno := view.Lstat(ctx, "/rootfs/private")
+	require.Zero(t, errno)
+	mode, err := run9ReadViewGuestMode(view, ctx, "/rootfs/private", stat)
+	require.NoError(t, err)
+	require.Equal(t, uint32(0600), mode)
+}
