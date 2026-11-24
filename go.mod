@@ -1,6 +1,7 @@
 module github.com/juicedata/juicefs
 
-go 1.25
+// Match the Run9 online reader's net/http multipart range defaults.
+go 1.26
 
 require (
 	cloud.google.com/go/compute/metadata v0.5.2
