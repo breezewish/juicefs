@@ -159,10 +159,19 @@ func (h *run9ReadViewHandler) fileETag(name string, stat *fs.FileStat) string {
 	etag := run9ReadViewETag(h.generation, stat)
 	// Inode numbers are only unique inside one filesystem. Preserve the
 	// existing Root-only ETag and add a partition for composed views.
-	for i, mount := range h.dataMounts {
-		if name == mount || strings.HasPrefix(name, mount+"/") {
-			return strings.TrimSuffix(etag, "\"") + fmt.Sprintf("-data%d\"", i)
-		}
+	if i := h.dataMountIndex(name); i >= 0 {
+		return strings.TrimSuffix(etag, "\"") + fmt.Sprintf("-data%d\"", i)
 	}
 	return etag
+}
+
+// dataMountIndex returns which Volume of a composed view holds the resolved
+// name, or -1 for Root. Together with the inode it identifies one file.
+func (h *run9ReadViewHandler) dataMountIndex(name string) int {
+	for i, mount := range h.dataMounts {
+		if name == mount || strings.HasPrefix(name, mount+"/") {
+			return i
+		}
+	}
+	return -1
 }
