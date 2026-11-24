@@ -18,6 +18,7 @@ type run9ReadFilesystem interface {
 	Readlink(meta.Context, string) ([]byte, syscall.Errno)
 	Open(meta.Context, string, uint32) (*fs.File, syscall.Errno)
 	ReadDirPage(meta.Context, string, int, string) ([]*fs.FileStat, string, syscall.Errno)
+	GetXattr(meta.Context, string, string) ([]byte, syscall.Errno)
 }
 
 // run9MountedReadFilesystem composes immutable read views without FUSE.
@@ -81,6 +82,19 @@ func (m *run9MountedReadFilesystem) Lstat(ctx meta.Context, name string) (*fs.Fi
 		}
 	}
 	return stat, errno
+}
+
+// GetXattr reads the same inode Lstat reports, including a virtual mount
+// ancestor that stands for its Volume's root.
+func (m *run9MountedReadFilesystem) GetXattr(ctx meta.Context, name string, key string) ([]byte, syscall.Errno) {
+	backing, physical := m.backing(name)
+	value, errno := backing.GetXattr(ctx, physical, key)
+	for _, volume := range m.volumes {
+		if errno == syscall.ENOENT && strings.HasPrefix(volume.mount, name+"/") {
+			return volume.data.GetXattr(ctx, run9ReadViewRoot, key)
+		}
+	}
+	return value, errno
 }
 
 func (m *run9MountedReadFilesystem) Readlink(ctx meta.Context, name string) ([]byte, syscall.Errno) {

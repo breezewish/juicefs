@@ -124,6 +124,8 @@ Related files:
 
 - The hidden `serve-read-view` command holds one immutable Badger generation and its object storage client open, and serves GET, HEAD, Range, conditional requests, bounded directory listings, and bounded doublestar globs over regular files through a mode-0600 Unix socket. Requests may select a filesystem root; absolute and relative symlinks remain confined to that root. Glob traversal stays inside the reader so remote callers need only one request. A Glob may apply root and nested `.gitignore` files before matching and limiting, with semantics and resource bounds kept identical to run9's online reader.
 
+- Listings and file/directory responses report the guest-visible permission bits, identical to run9's online reader: the BoxLite override-stat mode when present, otherwise the inode mode. A guest `chmod` may exist only in the override, so the inode mode alone would drop executable bits.
+
 - `pkg/fs.FileSystem.ReadDirPage` provides bounded, name-cursor directory reads for the immutable reader. It uses a Badger key scan directly instead of materializing the complete directory; other metadata backends keep their upstream contract unchanged.
 
 Related files:

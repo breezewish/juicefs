@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"syscall"
@@ -62,6 +63,36 @@ func TestRun9MountedReadViewResolvesBothFilesystemsAndSelectedRoot(t *testing.T)
 	require.Contains(t, response.Body.String(), "root.txt")
 	_, errno := root.Lstat(ctx, "/rootfs/state")
 	require.Equal(t, syscall.ENOENT, errno, "read views must not create physical placeholders")
+}
+
+func TestRun9MountedReadViewReportsVolumeRootGuestMode(t *testing.T) {
+	root, data := newRun9ReadViewTestFS(t), newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	require.Zero(t, root.Mkdir(ctx, "/rootfs", 0755, 0))
+	require.Zero(t, data.Mkdir(ctx, "/rootfs", 0700, 0))
+	require.Zero(t, data.SetXattr(ctx, "/rootfs", run9OverrideStatXattr, []byte("1000:1000:0750"), 0))
+	mounted, err := newRun9MountedReadFilesystem(ctx, root, []run9ReadMount{{data: data, mount: "/state/data"}})
+	require.NoError(t, err)
+	handler := &run9ReadViewHandler{fs: mounted, generation: 7, dataMounts: []string{mounted.volumes[0].mount}}
+
+	// Both the virtual ancestor and the mount stand for the Volume root.
+	ancestor := httptest.NewRecorder()
+	handler.ServeHTTP(ancestor, httptest.NewRequest(http.MethodGet, "/?list=1", nil))
+	require.Equal(t, http.StatusOK, ancestor.Code, ancestor.Body.String())
+	var ancestorPage run9ReadViewListResponse
+	require.NoError(t, json.Unmarshal(ancestor.Body.Bytes(), &ancestorPage))
+	require.Len(t, ancestorPage.Entries, 1)
+	require.Equal(t, "state", ancestorPage.Entries[0].Name)
+	require.Equal(t, uint32(0o750), ancestorPage.Entries[0].Mode)
+
+	mount := httptest.NewRecorder()
+	handler.ServeHTTP(mount, httptest.NewRequest(http.MethodGet, "/state?list=1", nil))
+	require.Equal(t, http.StatusOK, mount.Code, mount.Body.String())
+	var mountPage run9ReadViewListResponse
+	require.NoError(t, json.Unmarshal(mount.Body.Bytes(), &mountPage))
+	require.Len(t, mountPage.Entries, 1)
+	require.Equal(t, "data", mountPage.Entries[0].Name)
+	require.Equal(t, uint32(0o750), mountPage.Entries[0].Mode)
 }
 
 func TestRun9MountedReadViewPaginatesVirtualMountAncestors(t *testing.T) {
