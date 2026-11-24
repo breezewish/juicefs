@@ -76,20 +76,8 @@ func (v *run9LocalReader) Lstat(_ meta.Context, path string) (*fs.FileStat, sysc
 	default:
 		return nil, syscall.EIO
 	}
-	attr := meta.Attr{Typ: typ, Mode: uint16(stat.Mode & 07777), Uid: stat.Uid, Gid: stat.Gid, Length: uint64(stat.Size), Nlink: uint32(stat.Nlink), Mtime: stat.Mtim.Sec, Mtimensec: uint32(stat.Mtim.Nsec), Ctime: stat.Ctim.Sec, Ctimensec: uint32(stat.Ctim.Nsec), Atime: stat.Atim.Sec, Atimensec: uint32(stat.Atim.Nsec), Full: true}
+	attr := meta.Attr{Typ: typ, Mode: uint16(stat.Mode & 07777), Uid: stat.Uid, Gid: stat.Gid, Length: uint64(stat.Size), Nlink: uint32(stat.Nlink), Rdev: uint32(stat.Rdev), Mtime: stat.Mtim.Sec, Mtimensec: uint32(stat.Mtim.Nsec), Ctime: stat.Ctim.Sec, Ctimensec: uint32(stat.Ctim.Nsec), Atime: stat.Atim.Sec, Atimensec: uint32(stat.Atim.Nsec), Full: true}
 	return fs.AttrToFileInfo(meta.Ino(stat.Ino), &attr).WithName(info.Name()), 0
-}
-
-// Virtiofs mode overrides are private to directory-backed volumes. On ext4
-// the inode carries the guest permissions, even if a guest creates an xattr
-// with the same name.
-func (*run9LocalReader) GetXattr(_ meta.Context, _ string, key string) ([]byte, syscall.Errno) {
-	switch key {
-	case run9OverrideStatXattr, run9SpecialOverrideStatXattr:
-		return nil, meta.ENOATTR
-	default:
-		return nil, syscall.ENOTSUP
-	}
 }
 
 func (v *run9LocalReader) Readlink(_ meta.Context, path string) ([]byte, syscall.Errno) {

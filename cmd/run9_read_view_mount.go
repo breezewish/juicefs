@@ -19,7 +19,6 @@ type run9ReadFilesystem interface {
 	Readlink(meta.Context, string) ([]byte, syscall.Errno)
 	OpenRead(meta.Context, string) (io.ReadSeekCloser, syscall.Errno)
 	ReadDirPage(meta.Context, string, int, string) ([]*fs.FileStat, string, syscall.Errno)
-	GetXattr(meta.Context, string, string) ([]byte, syscall.Errno)
 }
 
 // run9MountedReadFilesystem composes immutable read views without FUSE.
@@ -85,17 +84,15 @@ func (m *run9MountedReadFilesystem) Lstat(ctx meta.Context, name string) (*fs.Fi
 	return stat, errno
 }
 
-// GetXattr reads the same inode Lstat reports, including a virtual mount
-// ancestor that stands for its Volume's root.
-func (m *run9MountedReadFilesystem) GetXattr(ctx meta.Context, name string, key string) ([]byte, syscall.Errno) {
-	backing, physical := m.backing(name)
-	value, errno := backing.GetXattr(ctx, physical, key)
+// metadataBacking returns the inode's reader and physical path. A synthetic
+// mount ancestor is a renamed copy of the exact Volume root stat from Lstat.
+func (m *run9MountedReadFilesystem) metadataBacking(name string, stat *fs.FileStat) (run9ReadFilesystem, string) {
 	for _, volume := range m.volumes {
-		if errno == syscall.ENOENT && strings.HasPrefix(volume.mount, name+"/") {
-			return volume.data.GetXattr(ctx, run9ReadViewRoot, key)
+		if stat.Attr() == volume.dataRoot.Attr() {
+			return volume.data, run9ReadViewRoot
 		}
 	}
-	return value, errno
+	return m.backing(name)
 }
 
 func (m *run9MountedReadFilesystem) Readlink(ctx meta.Context, name string) ([]byte, syscall.Errno) {
@@ -160,10 +157,8 @@ func (h *run9ReadViewHandler) fileETag(name string, stat *fs.FileStat) string {
 	etag := run9ReadViewETag(h.generation, stat)
 	// Inode numbers are only unique inside one filesystem. Preserve the
 	// existing Root-only ETag and add a partition for composed views.
-	for i, mount := range h.dataMounts {
-		if name == mount || strings.HasPrefix(name, mount+"/") {
-			return strings.TrimSuffix(etag, "\"") + fmt.Sprintf("-data%d\"", i)
-		}
+	if i := h.dataMountIndex(name); i >= 0 {
+		return strings.TrimSuffix(etag, "\"") + fmt.Sprintf("-data%d\"", i)
 	}
 	return etag
 }
@@ -198,4 +193,15 @@ func checkReadViewMountTarget(ctx meta.Context, root run9ReadFilesystem, target 
 		return fmt.Errorf("mount path %q is not empty", target)
 	}
 	return nil
+}
+
+// dataMountIndex returns which Volume of a composed view holds the resolved
+// name, or -1 for Root. Together with the inode it identifies one file.
+func (h *run9ReadViewHandler) dataMountIndex(name string) int {
+	for i, mount := range h.dataMounts {
+		if name == mount || strings.HasPrefix(name, mount+"/") {
+			return i
+		}
+	}
+	return -1
 }

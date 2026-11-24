@@ -58,7 +58,7 @@ type run9ReadViewListEntry struct {
 	Size    int64  `json:"size"`
 	ModTime string `json:"mod_time"`
 	ETag    string `json:"etag"`
-	Mode    uint32 `json:"mode"` // Guest permission bits, see run9ReadViewGuestMode.
+	Mode    uint32 `json:"mode"` // Guest permission bits, see run9ReadViewGuest.
 }
 
 type run9ReadViewListResponse struct {
@@ -103,6 +103,24 @@ func (h *run9ReadViewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "file glob and directory list cannot be combined", http.StatusBadRequest)
 		return
 	}
+	archiveRequested, err := run9ReadViewArchiveRequested(query)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if archiveRequested {
+		if globRequested || listRequested {
+			http.Error(w, "file archive cannot be combined with glob or directory list", http.StatusBadRequest)
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "file archive requires GET", http.StatusMethodNotAllowed)
+			return
+		}
+		h.serveArchive(w, r, filesystemRoot, requestPath)
+		return
+	}
 	if globRequested {
 		h.serveGlob(w, r, filesystemRoot, root, requestPath)
 		return
@@ -122,12 +140,12 @@ func (h *run9ReadViewHandler) serveFile(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	if stat.IsDir() || stat.Attr().Typ == meta.TypeFile {
-		mode, err := run9ReadViewGuestMode(h.fs, ctx, fsPath, stat)
+		guest, err := run9ReadViewGuest(h.fs, ctx, fsPath, stat)
 		if err != nil {
 			writeRun9ReadViewError(w, err)
 			return
 		}
-		w.Header().Set(run9ReadViewModeHeader, fmt.Sprintf("%04o", mode))
+		w.Header().Set(run9ReadViewModeHeader, fmt.Sprintf("%04o", guest.mode))
 	}
 	etag := h.fileETag(fsPath, stat)
 	w.Header().Set("ETag", etag)
@@ -190,7 +208,7 @@ func (h *run9ReadViewHandler) serveList(w http.ResponseWriter, r *http.Request, 
 	response := run9ReadViewListResponse{Entries: make([]run9ReadViewListEntry, 0, len(entries))}
 	for _, entry := range entries {
 		entryPath := path.Join(fsPath, entry.Name())
-		mode, err := run9ReadViewGuestMode(h.fs, ctx, entryPath, entry)
+		guest, err := run9ReadViewGuest(h.fs, ctx, entryPath, entry)
 		if err != nil {
 			writeRun9ReadViewError(w, err)
 			return
@@ -201,7 +219,7 @@ func (h *run9ReadViewHandler) serveList(w http.ResponseWriter, r *http.Request, 
 			Size:    entry.Size(),
 			ModTime: entry.ModTime().UTC().Format(time.RFC3339Nano),
 			ETag:    h.fileETag(entryPath, entry),
-			Mode:    mode,
+			Mode:    guest.mode,
 		})
 	}
 	if next != "" {
@@ -323,41 +341,78 @@ func run9ReadViewETag(generation uint64, stat *fs.FileStat) string {
 	return fmt.Sprintf("\"g%x-i%x-s%x-m%x\"", generation, uint64(stat.Inode()), uint64(stat.Size()), uint64(stat.ModTime().UnixNano()))
 }
 
-// run9ReadViewGuestMode returns the permission bits (rwx plus setuid, setgid
-// and sticky) the guest sees, matching run9 guest tar archives: the BoxLite
-// override-stat mode when present, otherwise the inode mode. A chmod inside the
-// guest may be recorded only in the override, never on the inode. Symlinks
-// carry no override. Virtiofs may store file type bits in the override, so
-// only the low 12 bits are reported. The read stays inside this process's
-// metadata engine; name must already be resolved, with no symlink components.
-func run9ReadViewGuestMode(jfs run9ReadFilesystem, ctx meta.Context, name string, stat *fs.FileStat) (uint32, error) {
-	inodeMode := uint32(stat.Attr().Mode) & 0o7777
+// run9ReadViewGuestStat is the ownership and permission bits the guest sees.
+type run9ReadViewGuestStat struct {
+	uid, gid uint32
+	mode     uint32 // rwx plus setuid, setgid and sticky; never file type bits.
+}
+
+// The reader's own identity stands for guest root, as in run9 guest tar
+// archives; any other inode owner is reported unchanged.
+var run9ReadViewRuntimeUID, run9ReadViewRuntimeGID = uint32(os.Getuid()), uint32(os.Getgid())
+
+// run9ReadViewGuest returns what the guest sees for one inode, the same rule
+// run9 guest tar archives use: each BoxLite override-stat field when present,
+// otherwise the inode's. A chown or chmod inside the guest may be recorded only
+// in the override, never on the inode. Symlinks carry no override. Virtiofs
+// may store file type bits in the override mode, so only its low 12 bits are
+// kept. A corrupt override is an error, never a fallback. The read stays inside
+// this process's metadata engine; name must already be resolved, with no
+// symlink components.
+func run9ReadViewGuest(jfs run9ReadFilesystem, ctx meta.Context, name string, stat *fs.FileStat) (run9ReadViewGuestStat, error) {
+	attr := stat.Attr()
+	guest := run9ReadViewGuestStat{uid: attr.Uid, gid: attr.Gid, mode: uint32(attr.Mode) & 0o7777}
+	if mounted, ok := jfs.(*run9MountedReadFilesystem); ok {
+		jfs, name = mounted.metadataBacking(name, stat)
+	}
+	// Only JuiceFS directories use BoxLite's host ownership and overrides.
+	// Projected ext4 inodes already contain the exact guest UID, GID and mode.
+	legacy, ok := jfs.(*fs.FileSystem)
+	if !ok {
+		return guest, nil
+	}
+	if guest.uid == run9ReadViewRuntimeUID {
+		guest.uid = 0
+	}
+	if guest.gid == run9ReadViewRuntimeGID {
+		guest.gid = 0
+	}
 	key := run9OverrideStatXattr
 	switch {
 	case stat.IsSymlink():
-		return inodeMode, nil
-	case !stat.IsDir() && stat.Attr().Typ != meta.TypeFile:
+		return guest, nil
+	case !stat.IsDir() && attr.Typ != meta.TypeFile:
 		key = run9SpecialOverrideStatXattr
 	}
-	value, errno := jfs.GetXattr(ctx, name, key)
+	value, errno := legacy.GetXattr(ctx, name, key)
 	if errno == meta.ENOATTR {
-		return inodeMode, nil
+		return guest, nil
 	}
 	if errno != 0 {
-		return 0, errno
+		return run9ReadViewGuestStat{}, errno
 	}
 	fields := strings.Split(string(value), ":")
 	if len(fields) != 3 {
-		return 0, fmt.Errorf("override stat on %q must be uid:gid:mode, got %q", name, value)
+		return run9ReadViewGuestStat{}, fmt.Errorf("override stat on %q must be uid:gid:mode, got %q", name, value)
 	}
-	if fields[2] == "x" {
-		return inodeMode, nil
+	for i, target := range []*uint32{&guest.uid, &guest.gid} {
+		if fields[i] == "x" {
+			continue
+		}
+		id, err := strconv.ParseUint(fields[i], 10, 32)
+		if err != nil {
+			return run9ReadViewGuestStat{}, fmt.Errorf("parse override stat owner on %q: %w", name, err)
+		}
+		*target = uint32(id)
 	}
-	mode, err := strconv.ParseUint(fields[2], 8, 32)
-	if err != nil {
-		return 0, fmt.Errorf("parse override stat mode on %q: %w", name, err)
+	if fields[2] != "x" {
+		mode, err := strconv.ParseUint(fields[2], 8, 32)
+		if err != nil {
+			return run9ReadViewGuestStat{}, fmt.Errorf("parse override stat mode on %q: %w", name, err)
+		}
+		guest.mode = uint32(mode) & 0o7777
 	}
-	return uint32(mode) & 0o7777, nil
+	return guest, nil
 }
 
 func run9ReadViewFileType(stat *fs.FileStat) string {
