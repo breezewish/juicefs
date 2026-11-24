@@ -126,6 +126,8 @@ Related files:
 - On Linux the same reader can open a caller-owned local projection of an immutable ext4 Snap. The caller mounts it inside an isolated appliance. Mixed local and JuiceFS sources use the same HTTP, symlink, Range, listing and glob rules. Directory pages retain only the requested number of names while sorting.
 - Online capture accepts a bounded 1 MiB command frame for a batch of independent descendants. This includes 64 forks of a Root and a Volume without truncating their paths.
 
+- Listings and file/directory responses report the guest-visible permission bits, identical to run9's online reader: the BoxLite override-stat mode when present, otherwise the inode mode. A guest `chmod` may exist only in the override, so the inode mode alone would drop executable bits.
+
 - `pkg/fs.FileSystem.ReadDirPage` provides bounded, name-cursor directory reads for the immutable reader. It uses a Badger key scan directly instead of materializing the complete directory; other metadata backends keep their upstream contract unchanged.
 
 Related files:

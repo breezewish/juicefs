@@ -20,6 +20,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRun9ReadViewHandlerSupportsHeadRangeAndCacheValidation(t *testing.T) {
@@ -201,6 +202,49 @@ func writeRun9ReadViewTestFile(t *testing.T, jfs *juicefs.FileSystem, ctx meta.C
 	if errno := file.Close(ctx); errno != 0 {
 		t.Fatalf("close %s: %s", name, errno)
 	}
+}
+
+func TestRun9ReadViewHandlerReportsGuestMode(t *testing.T) {
+	jfs := newRun9ReadViewTestFS(t)
+	ctx := meta.NewContext(1, 0, []uint32{0})
+	require.Zero(t, jfs.Mkdir(ctx, "/rootfs", 0o755, 0))
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/built", "#!/bin/sh\n")
+	writeRun9ReadViewTestFile(t, jfs, ctx, "/rootfs/plain", "plain")
+	require.Zero(t, jfs.Mkdir(ctx, "/rootfs/shared", 0o700, 0))
+	require.Zero(t, jfs.Symlink(ctx, "plain", "/rootfs/link"))
+	// Virtiofs records a guest chmod +x only here, with the file type bits.
+	require.Zero(t, jfs.SetXattr(ctx, "/rootfs/built", run9OverrideStatXattr, []byte("1000:1000:0100755"), 0))
+	require.Zero(t, jfs.SetXattr(ctx, "/rootfs/shared", run9OverrideStatXattr, []byte("0:0:01777"), 0))
+	handler := &run9ReadViewHandler{fs: jfs, generation: 9}
+
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/?list=1", nil))
+	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
+	var page run9ReadViewListResponse
+	require.NoError(t, json.Unmarshal(list.Body.Bytes(), &page))
+	modes := map[string]uint32{}
+	for _, entry := range page.Entries {
+		modes[entry.Name] = entry.Mode
+	}
+	require.Equal(t, map[string]uint32{"built": 0o755, "link": 0o777, "plain": 0o644, "shared": 0o1777}, modes)
+
+	built := httptest.NewRecorder()
+	handler.ServeHTTP(built, httptest.NewRequest(http.MethodGet, "/built", nil))
+	require.Equal(t, http.StatusOK, built.Code)
+	require.Equal(t, "0755", built.Header().Get(run9ReadViewModeHeader))
+	plain := httptest.NewRecorder()
+	handler.ServeHTTP(plain, httptest.NewRequest(http.MethodHead, "/plain", nil))
+	require.Equal(t, http.StatusOK, plain.Code)
+	require.Equal(t, "0644", plain.Header().Get(run9ReadViewModeHeader))
+	shared := httptest.NewRecorder()
+	handler.ServeHTTP(shared, httptest.NewRequest(http.MethodHead, "/shared", nil))
+	require.Equal(t, http.StatusOK, shared.Code)
+	require.Equal(t, "1777", shared.Header().Get(run9ReadViewModeHeader))
+
+	require.Zero(t, jfs.SetXattr(ctx, "/rootfs/plain", run9OverrideStatXattr, []byte("invalid"), 0))
+	corrupt := httptest.NewRecorder()
+	handler.ServeHTTP(corrupt, httptest.NewRequest(http.MethodHead, "/plain", nil))
+	require.Equal(t, http.StatusInternalServerError, corrupt.Code)
 }
 
 func TestRemoveRun9ReadViewSocketPreservesNonSocket(t *testing.T) {
