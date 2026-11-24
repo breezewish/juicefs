@@ -161,7 +161,9 @@ func serveRun9Capture(parent context.Context, conn net.Conn, encoder *json.Encod
 	// Bound idle clients, including one that connects but never sends a request.
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	var request run9CaptureRequest
-	if err := json.NewDecoder(io.LimitReader(conn, 16<<10)).Decode(&request); err != nil {
+	// Each child names two absolute host paths. A 64-way capture can
+	// exceed 16 KiB even with ordinary system temporary directories.
+	if err := json.NewDecoder(io.LimitReader(conn, 1<<20)).Decode(&request); err != nil {
 		return err
 	}
 	var directory string

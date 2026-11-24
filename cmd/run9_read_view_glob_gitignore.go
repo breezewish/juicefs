@@ -11,7 +11,6 @@ import (
 
 	ignore "github.com/Sriram-PR/go-ignore"
 	"github.com/juicedata/juicefs/pkg/meta"
-	"github.com/juicedata/juicefs/pkg/vfs"
 )
 
 const (
@@ -121,11 +120,10 @@ func loadRun9ReadViewGlobIgnore(jfs run9ReadFilesystem, ctx meta.Context, fsDire
 	if stat.Attr().Typ != meta.TypeFile || stat.IsSymlink() {
 		return rules, nil
 	}
-	file, errno := jfs.Open(ctx, fsIgnorePath, vfs.MODE_MASK_R)
+	reader, errno := jfs.OpenRead(ctx, fsIgnorePath)
 	if errno != 0 {
 		return nil, fmt.Errorf("open %s: %w", ignorePath, errno)
 	}
-	reader := &run9ReadViewFile{file: file, ctx: ctx}
 	content, err := io.ReadAll(io.LimitReader(reader, run9ReadViewGlobMaximumGitIgnoreFileBytes+1))
 	closeErr := reader.Close()
 	if err != nil {

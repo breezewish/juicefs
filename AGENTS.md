@@ -123,6 +123,8 @@ Related files:
 ### Immutable Read View Server
 
 - The hidden `serve-read-view` command holds one immutable Badger generation and its object storage client open, and serves GET, HEAD, Range, conditional requests, bounded directory listings, and bounded doublestar globs over regular files through a mode-0600 Unix socket. Requests may select a filesystem root; absolute and relative symlinks remain confined to that root. Glob traversal stays inside the reader so remote callers need only one request. A Glob may apply root and nested `.gitignore` files before matching and limiting, with semantics and resource bounds kept identical to run9's online reader.
+- On Linux the same reader can open a caller-owned local projection of an immutable ext4 Snap. The caller mounts it inside an isolated appliance. Mixed local and JuiceFS sources use the same HTTP, symlink, Range, listing and glob rules. Directory pages retain only the requested number of names while sorting.
+- Online capture accepts a bounded 1 MiB command frame for a batch of independent descendants. This includes 64 forks of a Root and a Volume without truncating their paths.
 
 - `pkg/fs.FileSystem.ReadDirPage` provides bounded, name-cursor directory reads for the immutable reader. It uses a Badger key scan directly instead of materializing the complete directory; other metadata backends keep their upstream contract unchanged.
 
