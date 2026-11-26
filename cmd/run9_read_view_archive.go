@@ -14,7 +14,7 @@ import (
 
 	"github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/meta"
-	"github.com/juicedata/juicefs/pkg/vfs"
+
 	"golang.org/x/sync/semaphore"
 )
 
@@ -333,29 +333,25 @@ func acquireRun9ReadViewArchive(ctx context.Context, n int64, semaphores ...*sem
 }
 
 func readRun9ReadViewArchiveRange(jfs run9ReadFilesystem, ctx meta.Context, fsPath string, offset int64, size int64) ([]byte, error) {
-	file, errno := jfs.Open(ctx, fsPath, vfs.MODE_MASK_R)
+	file, errno := jfs.OpenRead(ctx, fsPath)
 	if errno != 0 {
 		return nil, errno
 	}
-	defer file.Close(ctx)
+	defer file.Close()
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return nil, err
+	}
 	var data []byte
 	if size == run9ReadViewArchiveRangeBytes {
 		data = *run9ReadViewArchiveRanges.Get().(*[]byte)
 	} else {
 		data = make([]byte, size)
 	}
-	for read := 0; read < len(data); {
-		n, err := file.Pread(ctx, data[read:], offset+int64(read))
-		read += n
-		if (err == io.EOF || n == 0 && err == nil) && read < len(data) {
-			err = fmt.Errorf("file %q is shorter than its metadata", fsPath)
+	if _, err := io.ReadFull(file, data); err != nil {
+		if len(data) == run9ReadViewArchiveRangeBytes {
+			run9ReadViewArchiveRanges.Put(&data)
 		}
-		if err != nil && read < len(data) {
-			if len(data) == run9ReadViewArchiveRangeBytes {
-				run9ReadViewArchiveRanges.Put(&data)
-			}
-			return nil, err
-		}
+		return nil, fmt.Errorf("read range of %q: %w", fsPath, err)
 	}
 	return data, nil
 }

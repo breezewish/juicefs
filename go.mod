@@ -1,14 +1,7 @@
 module github.com/juicedata/juicefs
 
-go 1.25
-
-// Go 1.26.9 added a limit on the ranges http.ServeContent serves, defaulting to
-// one range for modules declaring go 1.25, which drops the multi-range reads
-// the Run9 read view serves. Restore the current default of 200 ranges. Only
-// toolchains from 1.26.9 accept the setting, hence the toolchain line.
-godebug httpservecontentmaxranges=200
-
-toolchain go1.26.11
+// Match the Run9 online reader's net/http multipart range defaults.
+go 1.26
 
 require (
 	cloud.google.com/go/compute/metadata v0.5.2

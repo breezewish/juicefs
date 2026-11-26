@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -51,26 +50,6 @@ type run9ReadViewHandler struct {
 	globMu     sync.Mutex
 	glob       run9ReadViewGlobCache
 	globFlight chan struct{}
-}
-
-type run9ReadViewFile struct {
-	file *fs.File
-	ctx  meta.Context
-}
-
-func (f *run9ReadViewFile) Read(p []byte) (int, error) {
-	return f.file.Read(f.ctx, p)
-}
-
-func (f *run9ReadViewFile) Seek(offset int64, whence int) (int64, error) {
-	return f.file.Seek(f.ctx, offset, whence)
-}
-
-func (f *run9ReadViewFile) Close() error {
-	if errno := f.file.Close(f.ctx); errno != 0 {
-		return errno
-	}
-	return nil
 }
 
 type run9ReadViewListEntry struct {
@@ -186,12 +165,11 @@ func (h *run9ReadViewHandler) serveFile(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	file, errno := h.fs.Open(ctx, fsPath, vfs.MODE_MASK_R)
+	reader, errno := h.fs.OpenRead(ctx, fsPath)
 	if errno != 0 {
 		writeRun9ReadViewError(w, errno)
 		return
 	}
-	reader := &run9ReadViewFile{file: file, ctx: ctx}
 	defer reader.Close()
 	http.ServeContent(w, r, path.Base(requestPath), stat.ModTime(), reader)
 }
@@ -384,6 +362,15 @@ var run9ReadViewRuntimeUID, run9ReadViewRuntimeGID = uint32(os.Getuid()), uint32
 func run9ReadViewGuest(jfs run9ReadFilesystem, ctx meta.Context, name string, stat *fs.FileStat) (run9ReadViewGuestStat, error) {
 	attr := stat.Attr()
 	guest := run9ReadViewGuestStat{uid: attr.Uid, gid: attr.Gid, mode: uint32(attr.Mode) & 0o7777}
+	if mounted, ok := jfs.(*run9MountedReadFilesystem); ok {
+		jfs, name = mounted.metadataBacking(name, stat)
+	}
+	// Only JuiceFS directories use BoxLite's host ownership and overrides.
+	// Projected ext4 inodes already contain the exact guest UID, GID and mode.
+	legacy, ok := jfs.(*fs.FileSystem)
+	if !ok {
+		return guest, nil
+	}
 	if guest.uid == run9ReadViewRuntimeUID {
 		guest.uid = 0
 	}
@@ -397,7 +384,7 @@ func run9ReadViewGuest(jfs run9ReadFilesystem, ctx meta.Context, name string, st
 	case !stat.IsDir() && attr.Typ != meta.TypeFile:
 		key = run9SpecialOverrideStatXattr
 	}
-	value, errno := jfs.GetXattr(ctx, name, key)
+	value, errno := legacy.GetXattr(ctx, name, key)
 	if errno == meta.ENOATTR {
 		return guest, nil
 	}
@@ -465,6 +452,7 @@ func cmdRun9ServeReadView() *cli.Command {
 			&cli.StringFlag{Name: "listen", Required: true},
 			&cli.StringFlag{Name: "cache-dir", Required: true},
 			&cli.StringFlag{Name: "clean-cache-dir"},
+			&cli.StringFlag{Name: "local-root"},
 			&cli.Uint64Flag{Name: "generation", Required: true},
 			&cli.StringFlag{Name: "data-volumes", Value: "[]"},
 		},
@@ -484,7 +472,7 @@ func serveRun9ReadView(c *cli.Context) error {
 	if listenPath == "" {
 		return fmt.Errorf("listen path is required")
 	}
-	jfs, closeRoot, err := openRun9ReadFilesystem(metaURL, c.String("cache-dir"), c.String("clean-cache-dir"))
+	jfs, closeRoot, err := openRun9Reader(c.String("local-root"), metaURL, c.String("cache-dir"), c.String("clean-cache-dir"))
 	if err != nil {
 		return err
 	}
@@ -498,6 +486,7 @@ func serveRun9ReadView(c *cli.Context) error {
 		MountPath     string `json:"mount_path"`
 		Generation    uint64 `json:"generation"`
 		CleanCacheDir string `json:"clean_cache_dir"`
+		LocalRoot     string `json:"local_root,omitempty"`
 	}
 	// Use one JSON array, not a CSV-aware slice flag: metadata URLs and
 	// legitimate mount paths may themselves contain commas.
@@ -508,7 +497,7 @@ func serveRun9ReadView(c *cli.Context) error {
 		if config.MetaURL == "" || config.MountPath == "" || config.Generation == 0 {
 			return fmt.Errorf("data metadata URL, generation and mount path must be supplied together")
 		}
-		data, closeData, err := openRun9ReadFilesystem(config.MetaURL, filepath.Join(c.String("cache-dir"), fmt.Sprintf("data-%d", i)), config.CleanCacheDir)
+		data, closeData, err := openRun9Reader(config.LocalRoot, config.MetaURL, filepath.Join(c.String("cache-dir"), fmt.Sprintf("data-%d", i)), config.CleanCacheDir)
 		if err != nil {
 			return fmt.Errorf("open data read view: %w", err)
 		}
@@ -569,6 +558,14 @@ func serveRun9ReadView(c *cli.Context) error {
 		return err
 	}
 	return nil
+}
+
+// A native Volume reader supplies an already isolated, immutable POSIX root.
+func openRun9Reader(local, metaURL, cache, clean string) (run9ReadFilesystem, func(), error) {
+	if local != "" {
+		return openRun9LocalReader(local)
+	}
+	return openRun9ReadFilesystem(metaURL, cache, clean)
 }
 
 func openRun9ReadFilesystem(metaURL, cacheDir, cleanCacheDir string) (jfs *fs.FileSystem, closeView func(), err error) {
@@ -657,5 +654,3 @@ func removeRun9ReadViewSocket(socketPath string) error {
 	}
 	return nil
 }
-
-var _ io.ReadSeekCloser = (*run9ReadViewFile)(nil)

@@ -18,9 +18,26 @@ func cmdRun9CheckEmptyDirectory() *cli.Command {
 		Name:      "check-empty-dir",
 		Hidden:    true,
 		Usage:     "run9 internal: check an absent or empty directory without following symlinks",
+		Flags:     []cli.Flag{&cli.StringFlag{Name: "local-root", Hidden: true}},
 		ArgsUsage: "READONLY-META-URL ABSOLUTE-PATH [ABSOLUTE-PATH...]",
 		Action: func(c *cli.Context) error {
 			setup0(c, 2, 0)
+			if dir := c.String("local-root"); dir != "" {
+				local, close, err := openRun9LocalReader(dir)
+				if err != nil {
+					return err
+				}
+				defer close()
+				for _, pathValue := range c.Args().Slice()[1:] {
+					if pathValue == "/" || !path.IsAbs(pathValue) || path.Clean(pathValue) != pathValue || strings.ContainsRune(pathValue, 0) {
+						return fmt.Errorf("directory must be a canonical absolute path other than root")
+					}
+					if err := checkReadViewMountTarget(run9ReadViewContext(c.Context), local, pathValue); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
 			return checkRun9EmptyDirectory(c.Context, c.Args().Get(0), c.Args().Slice()[1:]...)
 		},
 	}

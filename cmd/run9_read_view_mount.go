@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"path"
 	"sort"
 	"strings"
@@ -16,26 +17,25 @@ import (
 type run9ReadFilesystem interface {
 	Lstat(meta.Context, string) (*fs.FileStat, syscall.Errno)
 	Readlink(meta.Context, string) ([]byte, syscall.Errno)
-	Open(meta.Context, string, uint32) (*fs.File, syscall.Errno)
+	OpenRead(meta.Context, string) (io.ReadSeekCloser, syscall.Errno)
 	ReadDirPage(meta.Context, string, int, string) ([]*fs.FileStat, string, syscall.Errno)
-	GetXattr(meta.Context, string, string) ([]byte, syscall.Errno)
 }
 
 // run9MountedReadFilesystem composes immutable read views without FUSE.
 // Missing mount ancestors are visible even before the first VM start creates
 // their physical placeholders in Root.
 type run9MountedReadFilesystem struct {
-	root    *fs.FileSystem
+	root    run9ReadFilesystem
 	volumes []run9ReadMount
 }
 
 type run9ReadMount struct {
-	data     *fs.FileSystem
+	data     run9ReadFilesystem
 	mount    string
 	dataRoot *fs.FileStat
 }
 
-func newRun9MountedReadFilesystem(ctx meta.Context, root *fs.FileSystem, volumes []run9ReadMount) (*run9MountedReadFilesystem, error) {
+func newRun9MountedReadFilesystem(ctx meta.Context, root run9ReadFilesystem, volumes []run9ReadMount) (*run9MountedReadFilesystem, error) {
 	for i := range volumes {
 		volume := &volumes[i]
 		mountPath := volume.mount
@@ -48,7 +48,7 @@ func newRun9MountedReadFilesystem(ctx meta.Context, root *fs.FileSystem, volumes
 				return nil, fmt.Errorf("data mount paths overlap")
 			}
 		}
-		if err := checkRun9EmptyDirectoryMetadata(ctx, root.Meta(), mountPath); err != nil {
+		if err := checkReadViewMountTarget(ctx, root, mountPath); err != nil {
 			return nil, err
 		}
 		stat, errno := volume.data.Lstat(ctx, run9ReadViewRoot)
@@ -64,7 +64,7 @@ func newRun9MountedReadFilesystem(ctx meta.Context, root *fs.FileSystem, volumes
 }
 
 // backing selects storage only after the caller resolves guest symlinks.
-func (m *run9MountedReadFilesystem) backing(name string) (*fs.FileSystem, string) {
+func (m *run9MountedReadFilesystem) backing(name string) (run9ReadFilesystem, string) {
 	for _, volume := range m.volumes {
 		if name == volume.mount || strings.HasPrefix(name, volume.mount+"/") {
 			return volume.data, run9ReadViewRoot + strings.TrimPrefix(name, volume.mount)
@@ -84,17 +84,15 @@ func (m *run9MountedReadFilesystem) Lstat(ctx meta.Context, name string) (*fs.Fi
 	return stat, errno
 }
 
-// GetXattr reads the same inode Lstat reports, including a virtual mount
-// ancestor that stands for its Volume's root.
-func (m *run9MountedReadFilesystem) GetXattr(ctx meta.Context, name string, key string) ([]byte, syscall.Errno) {
-	backing, physical := m.backing(name)
-	value, errno := backing.GetXattr(ctx, physical, key)
+// metadataBacking returns the inode's reader and physical path. A synthetic
+// mount ancestor is a renamed copy of the exact Volume root stat from Lstat.
+func (m *run9MountedReadFilesystem) metadataBacking(name string, stat *fs.FileStat) (run9ReadFilesystem, string) {
 	for _, volume := range m.volumes {
-		if errno == syscall.ENOENT && strings.HasPrefix(volume.mount, name+"/") {
-			return volume.data.GetXattr(ctx, run9ReadViewRoot, key)
+		if stat.Attr() == volume.dataRoot.Attr() {
+			return volume.data, run9ReadViewRoot
 		}
 	}
-	return value, errno
+	return m.backing(name)
 }
 
 func (m *run9MountedReadFilesystem) Readlink(ctx meta.Context, name string) ([]byte, syscall.Errno) {
@@ -102,9 +100,9 @@ func (m *run9MountedReadFilesystem) Readlink(ctx meta.Context, name string) ([]b
 	return backing.Readlink(ctx, physical)
 }
 
-func (m *run9MountedReadFilesystem) Open(ctx meta.Context, name string, flags uint32) (*fs.File, syscall.Errno) {
+func (m *run9MountedReadFilesystem) OpenRead(ctx meta.Context, name string) (io.ReadSeekCloser, syscall.Errno) {
 	backing, physical := m.backing(name)
-	return backing.Open(ctx, physical, flags)
+	return backing.OpenRead(ctx, physical)
 }
 
 func (m *run9MountedReadFilesystem) ReadDirPage(ctx meta.Context, name string, limit int, cursor string) ([]*fs.FileStat, string, syscall.Errno) {
@@ -163,6 +161,38 @@ func (h *run9ReadViewHandler) fileETag(name string, stat *fs.FileStat) string {
 		return strings.TrimSuffix(etag, "\"") + fmt.Sprintf("-data%d\"", i)
 	}
 	return etag
+}
+
+func checkReadViewMountTarget(ctx meta.Context, root run9ReadFilesystem, target string) error {
+	name := run9ReadViewRoot
+	rootStat, errno := root.Lstat(ctx, name)
+	if errno != 0 {
+		return errno
+	}
+	if !rootStat.IsDir() {
+		return fmt.Errorf("filesystem root is not a directory")
+	}
+	for _, part := range strings.Split(strings.TrimPrefix(target, "/"), "/") {
+		name = path.Join(name, part)
+		info, errno := root.Lstat(ctx, name)
+		if errno == syscall.ENOENT {
+			return nil
+		}
+		if errno != 0 {
+			return errno
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("mount path %q has a non-directory or symlink component", target)
+		}
+	}
+	page, _, errno := root.ReadDirPage(ctx, name, 1, "")
+	if errno != 0 {
+		return errno
+	}
+	if len(page) > 0 {
+		return fmt.Errorf("mount path %q is not empty", target)
+	}
+	return nil
 }
 
 // dataMountIndex returns which Volume of a composed view holds the resolved
